@@ -19,6 +19,18 @@ import einops
 import torch
 
 
+def _to_pinned_cpu(x: torch.Tensor) -> torch.Tensor:
+    if x.device.type == "cpu":
+        return x
+    cpu = torch.empty_like(x, device="cpu", pin_memory=True)
+    cpu.copy_(x, non_blocking=True)
+    return cpu
+
+
+def _to_cpu_list(x: torch.Tensor) -> list[int]:
+    return _to_pinned_cpu(x).tolist()
+
+
 def flatten(
     hid: list[torch.FloatTensor],  # List of (*** c)
 ) -> tuple[
@@ -26,7 +38,15 @@ def flatten(
     torch.LongTensor,  # (b n)
 ]:
     assert len(hid) > 0
-    shape = torch.stack([torch.tensor(x.shape[:-1], device=hid[0].device) for x in hid])
+    shape = torch.stack(
+        [
+            torch.tensor(x.shape[:-1], device="cpu", pin_memory=True).to(
+                device=hid[0].device,
+                non_blocking=True,
+            )
+            for x in hid
+        ]
+    )
     hid = torch.cat([x.flatten(0, -2) for x in hid])
     return hid, shape
 
@@ -35,9 +55,10 @@ def unflatten(
     hid: torch.FloatTensor,  # (L c) or (L ... c)
     hid_shape: torch.LongTensor,  # (b n)
 ) -> list[torch.Tensor]:  # List of (*** c) or (*** ... c)
-    hid_len = hid_shape.prod(-1)
-    hid = hid.split(hid_len.tolist())
-    hid = [x.unflatten(0, s.tolist()) for x, s in zip(hid, hid_shape)]
+    hid_shape_cpu = _to_pinned_cpu(hid_shape)
+    hid_len = hid_shape_cpu.prod(-1)
+    hid = hid.split(_to_cpu_list(hid_len))
+    hid = [x.unflatten(0, s.tolist()) for x, s in zip(hid, hid_shape_cpu)]
     return hid
 
 
@@ -47,8 +68,8 @@ def concat(
     vid_len: torch.LongTensor,  # (b)
     txt_len: torch.LongTensor,  # (b)
 ) -> torch.FloatTensor:  # (L ... c)
-    vid = torch.split(vid, vid_len.tolist())
-    txt = torch.split(txt, txt_len.tolist())
+    vid = torch.split(vid, _to_cpu_list(vid_len))
+    txt = torch.split(txt, _to_cpu_list(txt_len))
     return torch.cat(list(chain(*zip(vid, txt))))
 
 
@@ -80,7 +101,9 @@ def unconcat(
     torch.FloatTensor,  # (VL ... c)
     torch.FloatTensor,  # (TL ... c)
 ]:
-    interleave_len = list(chain(*zip(vid_len.tolist(), txt_len.tolist())))
+    vid_len_list = _to_cpu_list(vid_len)
+    txt_len_list = _to_cpu_list(txt_len)
+    interleave_len = list(chain(*zip(vid_len_list, txt_len_list)))
     all = all.split(interleave_len)
     vid = torch.cat(all[0::2])
     txt = torch.cat(all[1::2])
@@ -94,8 +117,8 @@ def repeat_concat(
     txt_len: torch.LongTensor,  # (b)
     txt_repeat: list,  # (n)
 ) -> torch.FloatTensor:  # (L ... c)
-    vid = torch.split(vid, vid_len.tolist())
-    txt = torch.split(txt, txt_len.tolist())
+    vid = torch.split(vid, _to_cpu_list(vid_len))
+    txt = torch.split(txt, _to_cpu_list(txt_len))
     txt = [[x] * n for x, n in zip(txt, txt_repeat)]
     txt = list(chain(*txt))
     return torch.cat(list(chain(*zip(vid, txt))))
@@ -105,18 +128,51 @@ def repeat_concat_idx(
     vid_len: torch.LongTensor,  # (n*b)
     txt_len: torch.LongTensor,  # (b)
     txt_repeat: torch.LongTensor,  # (n)
+    vid_total_len: int | None = None,
+    txt_total_len: int | None = None,
 ) -> tuple[
     Callable,
     Callable,
 ]:
     device = vid_len.device
-    vid_idx = torch.arange(vid_len.sum(), device=device)
-    txt_idx = torch.arange(len(vid_idx), len(vid_idx) + txt_len.sum(), device=device)
-    txt_repeat_list = txt_repeat.tolist()
-    tgt_idx = repeat_concat(vid_idx, txt_idx, vid_len, txt_len, txt_repeat)
+    if vid_total_len is None:
+        vid_total_len = int(_to_pinned_cpu(vid_len.sum()).item())
+    if txt_total_len is None:
+        txt_total_len = int(_to_pinned_cpu(txt_len.sum()).item())
+
+    # Map each video window chunk to its source text chunk.
+    txt_chunk_ids = torch.repeat_interleave(
+        torch.arange(txt_len.numel(), device=device),
+        txt_repeat,
+        output_size=vid_len.numel(),
+    )
+    txt_len_win = txt_len[txt_chunk_ids]
+
+    vid_chunk_starts = torch.cat([vid_len.new_zeros(1), vid_len.cumsum(0)[:-1]])
+    txt_chunk_starts = torch.cat([txt_len.new_zeros(1), txt_len.cumsum(0)[:-1]])
+    txt_chunk_starts_win = txt_chunk_starts[txt_chunk_ids]
+
+    # Build interleaved chunk ids: [vid_0, txt_0, vid_1, txt_1, ...].
+    interleave_lens = torch.stack([vid_len, txt_len_win], dim=1).reshape(-1)
+    out_chunk_ids = torch.repeat_interleave(
+        torch.arange(interleave_lens.numel(), device=device),
+        interleave_lens,
+    )
+    out_chunk_starts = torch.cat(
+        [interleave_lens.new_zeros(1), interleave_lens.cumsum(0)[:-1]]
+    )
+    local_pos = torch.arange(out_chunk_ids.numel(), device=device) - out_chunk_starts[
+        out_chunk_ids
+    ]
+    pair_ids = out_chunk_ids // 2
+    is_txt = (out_chunk_ids & 1).bool()
+    source_starts = torch.where(
+        is_txt,
+        vid_total_len + txt_chunk_starts_win[pair_ids],
+        vid_chunk_starts[pair_ids],
+    )
+    tgt_idx = source_starts + local_pos
     src_idx = torch.argsort(tgt_idx)
-    txt_idx_len = len(tgt_idx) - len(vid_idx)
-    repeat_txt_len = (txt_len * txt_repeat).tolist()
 
     def unconcat_coalesce(all):
         """
@@ -128,12 +184,36 @@ def repeat_concat_idx(
                            split ==> vid_out [0 1 2 3 4 5 6 7 8] txt_out [9 9 9 10 10 10]
              2. reshape & mean for each sample to coalesce the repeated txt.
         """
-        vid_out, txt_out = all[src_idx].split([len(vid_idx), txt_idx_len])
-        txt_out_coalesced = []
-        for txt, repeat_time in zip(txt_out.split(repeat_txt_len), txt_repeat_list):
-            txt = txt.reshape(-1, repeat_time, *txt.shape[1:]).mean(1)
-            txt_out_coalesced.append(txt)
-        return vid_out, torch.cat(txt_out_coalesced)
+        all = all[src_idx]
+        vid_out = all[:vid_total_len]
+        txt_out_repeat = all[vid_total_len:]
+
+        # Build mapping from repeated txt tokens to original txt token ids.
+        # all[src_idx] makes txt_out_repeat token-major, so mapping must match that order.
+        token_repeats = torch.repeat_interleave(
+            txt_repeat,
+            txt_len,
+            output_size=txt_total_len,
+        )
+        txt_src_idx = torch.repeat_interleave(
+            torch.arange(txt_total_len, device=device),
+            token_repeats,
+            output_size=txt_out_repeat.shape[0],
+        )
+
+        txt_out = torch.zeros(
+            (txt_total_len, *txt_out_repeat.shape[1:]),
+            dtype=txt_out_repeat.dtype,
+            device=txt_out_repeat.device,
+        )
+        txt_out.index_add_(0, txt_src_idx, txt_out_repeat)
+
+        txt_cnt = token_repeats.to(
+            device=txt_out_repeat.device,
+            dtype=txt_out_repeat.dtype,
+        ).clamp_min(1)
+        txt_out = txt_out / txt_cnt.view(-1, *([1] * (txt_out.ndim - 1)))
+        return vid_out, txt_out
 
     # Note: Backward of torch.index_select is non-deterministic when existing repeated index,
     # the difference may cumulative like torch.repeat_interleave, so we use vanilla index here.
@@ -160,11 +240,12 @@ def rearrange(
 def rearrange_idx(
     hid_shape: torch.LongTensor,  # (b n)
     pattern: str,
+    total_len: int | None = None,
     **kwargs: dict[str, int],
 ) -> tuple[Callable, Callable, torch.LongTensor]:
-    hid_idx = torch.arange(hid_shape.prod(-1).sum(), device=hid_shape.device).unsqueeze(
-        -1
-    )
+    if total_len is None:
+        total_len = int(_to_pinned_cpu(hid_shape.prod(-1).sum()).item())
+    hid_idx = torch.arange(total_len, device=hid_shape.device).unsqueeze(-1)
     tgt_idx, tgt_shape = rearrange(hid_idx, hid_shape, pattern, **kwargs)
     tgt_idx = tgt_idx.squeeze(-1)
     src_idx = torch.argsort(tgt_idx)
@@ -185,7 +266,8 @@ def repeat(
     torch.LongTensor,
 ]:
     hid = unflatten(hid, hid_shape)
-    kwargs = [{k: v[i].item() for k, v in kwargs.items()} for i in range(len(hid))]
+    kwargs_cpu = {k: _to_pinned_cpu(v) for k, v in kwargs.items()}
+    kwargs = [{k: v[i].item() for k, v in kwargs_cpu.items()} for i in range(len(hid))]
     return flatten([einops.repeat(h, pattern, **a) for h, a in zip(hid, kwargs)])
 
 
@@ -227,7 +309,10 @@ def window(
 ):
     hid = unflatten(hid, hid_shape)
     hid = list(map(window_fn, hid))
-    hid_windows = torch.tensor(list(map(len, hid)), device=hid_shape.device)
+    hid_windows = torch.tensor(list(map(len, hid)), device="cpu", pin_memory=True).to(
+        device=hid_shape.device,
+        non_blocking=True,
+    )
     hid, hid_shape = flatten(list(chain(*hid)))
     return hid, hid_shape, hid_windows
 
@@ -235,10 +320,11 @@ def window(
 def window_idx(
     hid_shape: torch.LongTensor,  # (b n)
     window_fn: Callable[[torch.Tensor], list[torch.Tensor]],
+    total_len: int | None = None,
 ):
-    hid_idx = torch.arange(hid_shape.prod(-1).sum(), device=hid_shape.device).unsqueeze(
-        -1
-    )
+    if total_len is None:
+        total_len = int(_to_pinned_cpu(hid_shape.prod(-1).sum()).item())
+    hid_idx = torch.arange(total_len, device=hid_shape.device).unsqueeze(-1)
     tgt_idx, tgt_shape, tgt_windows = window(hid_idx, hid_shape, window_fn)
     tgt_idx = tgt_idx.squeeze(-1)
     src_idx = torch.argsort(tgt_idx)

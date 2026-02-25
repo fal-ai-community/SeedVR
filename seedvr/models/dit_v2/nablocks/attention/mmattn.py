@@ -190,7 +190,7 @@ class NaSwinAttention(NaMMAttention):
 
         window_partition, window_reverse, window_shape, window_count = cache_win(
             "win_transform",
-            lambda: na.window_idx(vid_shape, make_window),
+            lambda: na.window_idx(vid_shape, make_window, total_len=vid_qkv.shape[0]),
         )
         vid_qkv_win = window_partition(vid_qkv)
 
@@ -206,10 +206,22 @@ class NaSwinAttention(NaMMAttention):
         txt_len = cache("txt_len", lambda: txt_shape.prod(-1))
 
         vid_len_win = cache_win("vid_len", lambda: window_shape.prod(-1))
-        txt_len_win = cache_win("txt_len", lambda: txt_len.repeat_interleave(window_count))
+        txt_len_win = cache_win(
+            "txt_len",
+            lambda: txt_len.repeat_interleave(
+                window_count, output_size=vid_len_win.numel()
+            ),
+        )
         all_len_win = cache_win("all_len", lambda: vid_len_win + txt_len_win)
         concat_win, unconcat_win = cache_win(
-            "mm_pnp", lambda: na.repeat_concat_idx(vid_len_win, txt_len, window_count)
+            "mm_pnp",
+            lambda: na.repeat_concat_idx(
+                vid_len_win,
+                txt_len,
+                window_count,
+                vid_total_len=vid_q.shape[0],
+                txt_total_len=txt_q.shape[0],
+            ),
         )
 
         # window rope

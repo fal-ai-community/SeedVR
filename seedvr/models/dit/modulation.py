@@ -83,8 +83,10 @@ class AdaSingle(nn.Module):
             emb = cache(
                 f"emb_repeat_{idx}_{branch_tag}",
                 lambda: slice_inputs(
-                    torch.cat(
-                        [e.repeat(l, *([1] * e.ndim)) for e, l in zip(emb, hid_len)]
+                    torch.repeat_interleave(
+                        emb,
+                        repeats=hid_len.to(device=emb.device, non_blocking=True),
+                        dim=0,
                     ),
                     dim=0,
                 ),
