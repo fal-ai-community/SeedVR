@@ -23,7 +23,7 @@ def _to_pinned_cpu(x: torch.Tensor) -> torch.Tensor:
     if x.device.type == "cpu":
         return x
     cpu = torch.empty_like(x, device="cpu", pin_memory=True)
-    cpu.copy_(x, non_blocking=True)
+    cpu.copy_(x)
     return cpu
 
 

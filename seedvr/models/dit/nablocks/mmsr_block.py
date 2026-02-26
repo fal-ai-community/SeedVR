@@ -105,7 +105,7 @@ class NaSwinAttention(MMWindowAttention):
 
         window_partition, window_reverse, window_shape, window_count = cache_win(
             "win_transform",
-            lambda: na.window_idx(vid_shape, make_window, total_len=vid_qkv.shape[0]),
+            lambda: na.window_idx(vid_shape, make_window),
         )
         vid_qkv_win = window_partition(vid_qkv)
 
