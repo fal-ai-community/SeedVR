@@ -283,10 +283,6 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
         latents, latents_shapes = flatten(noises)
         latents_cond, _ = flatten(conditions)
 
-        # Enter eval mode.
-        was_training = self.dit.training
-        self.dit.eval()
-
         # Sampling.
         latents = self.sampler.sample(
             x=latents,
@@ -309,9 +305,6 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
                 rescale=cfg_rescale,
             ),
         )
-
-        # Exit eval mode.
-        self.dit.train(was_training)
 
         # Unflatten.
         latents = unflatten(latents, latents_shapes)
