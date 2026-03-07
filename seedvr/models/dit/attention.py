@@ -14,21 +14,8 @@
 
 import torch
 import torch.nn.functional as F
-
-try:
-    from flash_attn_interface import flash_attn_varlen_func
-
-    print("Using FlashAttention3")
-except ImportError:
-    try:
-        from flash_attn import flash_attn_varlen_func
-
-        print("Using FlashAttention2")
-    except ImportError:
-        print("Using PyTorch Attention")
-        flash_attn_varlen_func = None
-
 from torch import nn
+from torch.nn.attention.varlen import varlen_attn
 
 
 class TorchAttention(nn.Module):
@@ -56,7 +43,7 @@ class TorchAttention(nn.Module):
         )
 
 
-class FlashAttentionVarlen(nn.Module):
+class VarlenAttention(nn.Module):
     def tflops(self, args, kwargs, output) -> float:
         cu_seqlens_q = kwargs["cu_seqlens_q"]
         cu_seqlens_k = kwargs["cu_seqlens_k"]
@@ -66,7 +53,26 @@ class FlashAttentionVarlen(nn.Module):
         return h * (4 * d * (seqlens_q * seqlens_k).sum())
 
     def forward(self, *args, **kwargs):
-        kwargs["deterministic"] = torch.are_deterministic_algorithms_enabled()
-        if flash_attn_varlen_func is None:
-            return TorchAttention()(*args, **kwargs)
-        return flash_attn_varlen_func(*args, **kwargs)
+        query = kwargs.pop("query", kwargs.pop("q", None))
+        key = kwargs.pop("key", kwargs.pop("k", None))
+        value = kwargs.pop("value", kwargs.pop("v", None))
+        if query is None and len(args) > 0:
+            query = args[0]
+        if key is None and len(args) > 1:
+            key = args[1]
+        if value is None and len(args) > 2:
+            value = args[2]
+        if query is None or key is None or value is None:
+            raise ValueError("query, key, value must be provided")
+
+        return varlen_attn(
+            query=query,
+            key=key,
+            value=value,
+            cu_seq_q=kwargs.pop("cu_seqlens_q"),
+            cu_seq_k=kwargs.pop("cu_seqlens_k"),
+            max_q=kwargs.pop("max_seqlen_q"),
+            max_k=kwargs.pop("max_seqlen_k"),
+            is_causal=kwargs.pop("is_causal", False),
+            return_aux=kwargs.pop("return_aux", None),
+        )

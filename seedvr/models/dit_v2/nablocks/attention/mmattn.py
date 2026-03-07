@@ -23,7 +23,7 @@ from seedvr.common.cache import Cache
 from seedvr.common.distributed.ops import gather_heads_scatter_seq, gather_seq_scatter_heads_qkv
 from seedvr.common.utils import safe_pad_operation
 from ... import na
-from ...attention import FlashAttentionVarlen
+from ...attention import VarlenAttention
 from ...mm import MMArg, MMModule
 from ...normalization import norm_layer_type
 from ...rope import get_na_rope
@@ -71,7 +71,7 @@ class NaMMAttention(nn.Module):
         )
 
         self.rope = get_na_rope(rope_type=rope_type, dim=rope_dim)
-        self.attn = FlashAttentionVarlen()
+        self.attn = VarlenAttention()
 
     def forward(
         self,

@@ -25,7 +25,7 @@ from seedvr.common.distributed.ops import (
 from seedvr.common.utils import get_torch_dtype, safe_pad_operation
 
 from .. import na
-from ..attention import FlashAttentionVarlen
+from ..attention import VarlenAttention
 from ..blocks.mmdit_window_block import MMWindowAttention, MMWindowTransformerBlock
 from ..mm import MMArg
 from ..modulation import ada_layer_type
@@ -65,7 +65,7 @@ class NaSwinAttention(MMWindowAttention):
             shared_qkv=shared_qkv,
         )
         self.rope = NaRotaryEmbedding3d(dim=head_dim // 2) if qk_rope else None
-        self.attn = FlashAttentionVarlen()
+        self.attn = VarlenAttention()
         self.window_op = get_window_op(window_method)
         self.rope.to(get_torch_dtype(dtype))
 
