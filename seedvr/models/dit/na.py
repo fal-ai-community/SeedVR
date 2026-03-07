@@ -26,7 +26,15 @@ def flatten(
     torch.LongTensor,  # (b n)
 ]:
     assert len(hid) > 0
-    shape = torch.stack([torch.tensor(x.shape[:-1], device=hid[0].device) for x in hid])
+    shape = torch.stack(
+        [
+            torch.tensor(x.shape[:-1], device="cpu", pin_memory=True).to(
+                device=hid[0].device,
+                non_blocking=True,
+            )
+            for x in hid
+        ]
+    )
     hid = torch.cat([x.flatten(0, -2) for x in hid])
     return hid, shape
 
