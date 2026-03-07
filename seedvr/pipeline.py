@@ -523,7 +523,9 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
             samples = [sample.unsqueeze(1) if sample.ndim == 3 else sample for sample in samples]
 
             batch_media = rearrange(batch_media, "c t h w -> t c h w").to(
-                self.wavelet_kernel.device, dtype=self.wavelet_kernel.dtype
+                self.wavelet_kernel.device,
+                dtype=self.wavelet_kernel.dtype,
+                non_blocking=True,
             )
             samples = [
                 rearrange(sample, "c t h w -> t c h w").to(
