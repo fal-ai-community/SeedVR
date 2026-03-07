@@ -375,7 +375,11 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
         Add noise to the input.
         """
         t = torch.tensor([self.sampler.timesteps.T], device=x.device) * cond_noise_scale
-        shape = torch.tensor(x.shape[1:], device=x.device).unsqueeze(0)
+        shape = (
+            torch.tensor(x.shape[1:], device="cpu", pin_memory=True)
+            .to(device=x.device, non_blocking=True)
+            .unsqueeze(0)
+        )
         t = self.timestep_transform(t, shape)
         x = self.sampler.schedule.forward(x, aug_noise, t)
         return x
