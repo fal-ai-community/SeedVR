@@ -144,9 +144,15 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
             shift = getattr(self.vae.config, "shifting_factor", 0.0)
 
             if isinstance(scale, ListConfig):
-                scale = torch.tensor(scale, device=device, dtype=dtype)
+                scale = torch.tensor(scale, device="cpu", dtype=dtype, pin_memory=True).to(
+                    device=device,
+                    non_blocking=True,
+                )
             if isinstance(shift, ListConfig):
-                shift = torch.tensor(shift, device=device, dtype=dtype)
+                shift = torch.tensor(shift, device="cpu", dtype=dtype, pin_memory=True).to(
+                    device=device,
+                    non_blocking=True,
+                )
 
             # Group samples of the same shape to batches if enabled.
             if self.vae.grouping:
@@ -210,9 +216,15 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
             shift = getattr(self.vae.config, "shifting_factor", 0.0)
 
             if isinstance(scale, ListConfig):
-                scale = torch.tensor(scale, device=device, dtype=dtype)
+                scale = torch.tensor(scale, device="cpu", dtype=dtype, pin_memory=True).to(
+                    device=device,
+                    non_blocking=True,
+                )
             if isinstance(shift, ListConfig):
-                shift = torch.tensor(shift, device=device, dtype=dtype)
+                shift = torch.tensor(shift, device="cpu", dtype=dtype, pin_memory=True).to(
+                    device=device,
+                    non_blocking=True,
+                )
 
             # Group latents of the same shape to batches if enabled.
             if self.vae.grouping:
@@ -374,7 +386,11 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
         """
         Add noise to the input.
         """
-        t = torch.tensor([self.sampler.timesteps.T], device=x.device) * cond_noise_scale
+        t = (
+            torch.tensor([self.sampler.timesteps.T], device="cpu", pin_memory=True)
+            .to(device=x.device, non_blocking=True)
+            * cond_noise_scale
+        )
         shape = (
             torch.tensor(x.shape[1:], device="cpu", pin_memory=True)
             .to(device=x.device, non_blocking=True)
