@@ -1606,13 +1606,9 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
         else:
             local_tasks = tasks
 
-        # Use GPU for distributed processing, CPU for non-distributed
-        if is_distributed:
-            data_device = device
-            computation_device = device
-        else:
-            data_device = torch.device("cpu")
-            computation_device = device
+        # Keep encode accumulation on GPU to avoid per-tile device-to-host copies.
+        data_device = device
+        computation_device = device
 
         out_T = (T + 3) // 4
         weight = torch.zeros(
@@ -1644,8 +1640,8 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
             local_tasks, desc="Encoding", use_tqdm=use_tqdm and rank == 0
         ):
             hidden_states_batch = video[:, :, :, h:h_, w:w_].to(computation_device)
-            hidden_states_batch = self._encode(hidden_states_batch, memory_state=memory_state).to(
-                data_device
+            hidden_states_batch = self._encode(
+                hidden_states_batch, memory_state=memory_state
             )
 
             mask = self.build_mask(
@@ -1655,7 +1651,9 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
                     (size_h - stride_h) // self.spatial_downsample_factor,
                     (size_w - stride_w) // self.spatial_downsample_factor,
                 ),
-            ).to(dtype=video.dtype, device=data_device)
+                device=data_device,
+                dtype=video.dtype,
+            )
 
             target_h = h // self.spatial_downsample_factor
             target_w = w // self.spatial_downsample_factor
@@ -1694,7 +1692,7 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
         else:
             # Non-distributed case
             values = values / weight
-            return values.to(device)
+            return values
 
     def build_1d_mask(
         self,
