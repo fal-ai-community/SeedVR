@@ -522,7 +522,9 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
             )
             samples = [
                 rearrange(sample, "c t h w -> t c h w").to(
-                    self.wavelet_kernel.device, dtype=self.wavelet_kernel.dtype
+                    self.wavelet_kernel.device,
+                    dtype=self.wavelet_kernel.dtype,
+                    non_blocking=True,
                 )
                 for sample in samples
             ]
