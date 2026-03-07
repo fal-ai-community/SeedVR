@@ -105,7 +105,7 @@ class NaSwinAttention(MMWindowAttention):
 
         window_partition, window_reverse, window_shape, window_count = cache_win(
             "win_transform",
-            lambda: na.window_idx(vid_shape, make_window),
+            lambda: na.window_idx(vid_shape, make_window, device=vid_qkv.device),
         )
         vid_qkv_win = window_partition(vid_qkv)
 
@@ -128,7 +128,13 @@ class NaSwinAttention(MMWindowAttention):
         )
         all_len_win = cache_win("all_len", lambda: vid_len_win + txt_len_win)
         concat_win, unconcat_win = cache_win(
-            "mm_pnp", lambda: na.repeat_concat_idx(vid_len_win, txt_len, window_count)
+            "mm_pnp",
+            lambda: na.repeat_concat_idx(
+                vid_len_win,
+                txt_len,
+                window_count,
+                device=vid_q.device,
+            ),
         )
 
         # window rope
@@ -141,11 +147,17 @@ class NaSwinAttention(MMWindowAttention):
             v=concat_win(vid_v, txt_v).bfloat16(),
             cu_seqlens_q=cache_win(
                 "vid_seqlens_q",
-                lambda: safe_pad_operation(all_len_win.cumsum(0), (1, 0)).int(),
+                lambda: safe_pad_operation(all_len_win.cumsum(0), (1, 0))
+                .int()
+                .pin_memory()
+                .to(device=vid_q.device, non_blocking=True),
             ),
             cu_seqlens_k=cache_win(
                 "vid_seqlens_k",
-                lambda: safe_pad_operation(all_len_win.cumsum(0), (1, 0)).int(),
+                lambda: safe_pad_operation(all_len_win.cumsum(0), (1, 0))
+                .int()
+                .pin_memory()
+                .to(device=vid_q.device, non_blocking=True),
             ),
             max_seqlen_q=cache_win(
                 "vid_max_seqlen_q", lambda: all_len_win.max().item()

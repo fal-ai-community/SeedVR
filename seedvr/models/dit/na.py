@@ -28,13 +28,10 @@ def flatten(
     assert len(hid) > 0
     shape = torch.stack(
         [
-            torch.tensor(x.shape[:-1], device="cpu", pin_memory=True).to(
-                device=hid[0].device,
-                non_blocking=True,
-            )
+            torch.tensor(x.shape[:-1], device="cpu", pin_memory=True)
             for x in hid
         ]
-    )
+    ).pin_memory()
     hid = torch.cat([x.flatten(0, -2) for x in hid])
     return hid, shape
 
@@ -63,13 +60,17 @@ def concat(
 def concat_idx(
     vid_len: torch.LongTensor,  # (b)
     txt_len: torch.LongTensor,  # (b)
+    device: torch.device,
 ) -> tuple[
     Callable,
     Callable,
 ]:
-    device = vid_len.device
-    vid_idx = torch.arange(vid_len.sum(), device=device)
-    txt_idx = torch.arange(len(vid_idx), len(vid_idx) + txt_len.sum(), device=device)
+    vid_idx = torch.arange(int(vid_len.sum()), device=device)
+    txt_idx = torch.arange(
+        len(vid_idx),
+        len(vid_idx) + int(txt_len.sum()),
+        device=device,
+    )
     tgt_idx = concat(vid_idx, txt_idx, vid_len, txt_len)
     src_idx = torch.argsort(tgt_idx)
     return (
@@ -113,13 +114,17 @@ def repeat_concat_idx(
     vid_len: torch.LongTensor,  # (n*b)
     txt_len: torch.LongTensor,  # (b)
     txt_repeat: torch.LongTensor,  # (n)
+    device: torch.device,
 ) -> tuple[
     Callable,
     Callable,
 ]:
-    device = vid_len.device
-    vid_idx = torch.arange(vid_len.sum(), device=device)
-    txt_idx = torch.arange(len(vid_idx), len(vid_idx) + txt_len.sum(), device=device)
+    vid_idx = torch.arange(int(vid_len.sum()), device=device)
+    txt_idx = torch.arange(
+        len(vid_idx),
+        len(vid_idx) + int(txt_len.sum()),
+        device=device,
+    )
     txt_repeat_list = txt_repeat.tolist()
     tgt_idx = repeat_concat(vid_idx, txt_idx, vid_len, txt_len, txt_repeat)
     src_idx = torch.argsort(tgt_idx)
@@ -168,11 +173,10 @@ def rearrange(
 def rearrange_idx(
     hid_shape: torch.LongTensor,  # (b n)
     pattern: str,
+    device: torch.device,
     **kwargs: dict[str, int],
 ) -> tuple[Callable, Callable, torch.LongTensor]:
-    hid_idx = torch.arange(hid_shape.prod(-1).sum(), device=hid_shape.device).unsqueeze(
-        -1
-    )
+    hid_idx = torch.arange(int(hid_shape.prod(-1).sum()), device=device).unsqueeze(-1)
     tgt_idx, tgt_shape = rearrange(hid_idx, hid_shape, pattern, **kwargs)
     tgt_idx = tgt_idx.squeeze(-1)
     src_idx = torch.argsort(tgt_idx)
@@ -235,7 +239,7 @@ def window(
 ):
     hid = unflatten(hid, hid_shape)
     hid = list(map(window_fn, hid))
-    hid_windows = torch.tensor(list(map(len, hid)), device=hid_shape.device)
+    hid_windows = torch.tensor(list(map(len, hid)), device="cpu", pin_memory=True)
     hid, hid_shape = flatten(list(chain(*hid)))
     return hid, hid_shape, hid_windows
 
@@ -243,10 +247,9 @@ def window(
 def window_idx(
     hid_shape: torch.LongTensor,  # (b n)
     window_fn: Callable[[torch.Tensor], list[torch.Tensor]],
+    device: torch.device,
 ):
-    hid_idx = torch.arange(hid_shape.prod(-1).sum(), device=hid_shape.device).unsqueeze(
-        -1
-    )
+    hid_idx = torch.arange(int(hid_shape.prod(-1).sum()), device=device).unsqueeze(-1)
     tgt_idx, tgt_shape, tgt_windows = window(hid_idx, hid_shape, window_fn)
     tgt_idx = tgt_idx.squeeze(-1)
     src_idx = torch.argsort(tgt_idx)
