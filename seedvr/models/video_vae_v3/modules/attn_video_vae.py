@@ -1446,9 +1446,13 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
         else:
             local_tasks = tasks
 
-        # Keep decode accumulation on GPU to avoid per-tile device-to-host copies.
-        data_device = device
-        computation_device = device
+        # Use GPU for distributed processing, CPU for non-distributed
+        if is_distributed:
+            data_device = device
+            computation_device = device
+        else:
+            data_device = torch.device("cpu")
+            computation_device = device
 
         out_T = T * 4 - 3
         weight = torch.zeros(
@@ -1479,8 +1483,8 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
             local_tasks, desc="Decoding", use_tqdm=use_tqdm and rank == 0
         ):
             hidden_states_batch = hidden_states[:, :, :, h:h_, w:w_].to(computation_device)
-            hidden_states_batch = self._decode(
-                hidden_states_batch, memory_state=memory_state
+            hidden_states_batch = self._decode(hidden_states_batch, memory_state=memory_state).to(
+                data_device
             )
             hidden_states_batch.clamp_(-1, 1)
             hidden_states_batch = hidden_states_batch[:, :, :out_T]
@@ -1492,9 +1496,7 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
                     (size_h - stride_h) * self.spatial_downsample_factor,
                     (size_w - stride_w) * self.spatial_downsample_factor,
                 ),
-                device=data_device,
-                dtype=hidden_states.dtype,
-            )
+            ).to(dtype=hidden_states.dtype, device=data_device)
 
             target_h = h * self.spatial_downsample_factor
             target_w = w * self.spatial_downsample_factor
@@ -1529,13 +1531,13 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
                 # Distributed case, only return values on rank 0
                 values = values / weight
                 values = values.float().clamp_(-1, 1)
-                return values
+                return values.to("cpu")
             return None
         else:
             # Non-distributed case
             values = values / weight
             values = values.float().clamp_(-1, 1)
-            return values
+            return values.to("cpu")
 
     @torch.no_grad()
     def tiled_encode(
@@ -1606,9 +1608,13 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
         else:
             local_tasks = tasks
 
-        # Keep encode accumulation on GPU to avoid per-tile device-to-host copies.
-        data_device = device
-        computation_device = device
+        # Use GPU for distributed processing, CPU for non-distributed
+        if is_distributed:
+            data_device = device
+            computation_device = device
+        else:
+            data_device = torch.device("cpu")
+            computation_device = device
 
         out_T = (T + 3) // 4
         weight = torch.zeros(
@@ -1640,8 +1646,8 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
             local_tasks, desc="Encoding", use_tqdm=use_tqdm and rank == 0
         ):
             hidden_states_batch = video[:, :, :, h:h_, w:w_].to(computation_device)
-            hidden_states_batch = self._encode(
-                hidden_states_batch, memory_state=memory_state
+            hidden_states_batch = self._encode(hidden_states_batch, memory_state=memory_state).to(
+                data_device
             )
 
             mask = self.build_mask(
@@ -1651,9 +1657,7 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
                     (size_h - stride_h) // self.spatial_downsample_factor,
                     (size_w - stride_w) // self.spatial_downsample_factor,
                 ),
-                device=data_device,
-                dtype=video.dtype,
-            )
+            ).to(dtype=video.dtype, device=data_device)
 
             target_h = h // self.spatial_downsample_factor
             target_w = w // self.spatial_downsample_factor
@@ -1692,16 +1696,10 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
         else:
             # Non-distributed case
             values = values / weight
-            return values
+            return values.to(device)
 
     def build_1d_mask(
-        self,
-        length: int,
-        left_bound: bool,
-        right_bound: bool,
-        border_width: int,
-        device: torch.device | None = None,
-        dtype: torch.dtype | None = None,
+        self, length: int, left_bound: bool, right_bound: bool, border_width: int
     ) -> torch.Tensor:
         """
         Builds a 1D mask.
@@ -1712,17 +1710,13 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
         :param border_width: border width
         :return: mask
         """
-        x = torch.ones((length,), device=device, dtype=dtype)
+        x = torch.ones((length,))
 
         if not left_bound:
-            x[:border_width] = (
-                torch.arange(border_width, device=device, dtype=dtype) + 1
-            ) / border_width
+            x[:border_width] = (torch.arange(border_width) + 1) / border_width
         if not right_bound:
             x[-border_width:] = torch.flip(
-                (torch.arange(border_width, device=device, dtype=dtype) + 1)
-                / border_width,
-                dims=(0,),
+                (torch.arange(border_width) + 1) / border_width, dims=(0,)
             )
 
         return x
@@ -1732,8 +1726,6 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
         data: torch.Tensor,
         is_bound: tuple[bool, bool, bool, bool],
         border_width: tuple[int, int],
-        device: torch.device | None = None,
-        dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
         """
         :param data: data tensor [B, C, T, H, W]
@@ -1742,22 +1734,8 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
         :return: mask tensor [1, 1, 1, H, W]
         """
         _, _, _, H, W = data.shape
-        h = self.build_1d_mask(
-            H,
-            is_bound[0],
-            is_bound[1],
-            border_width[0],
-            device=device,
-            dtype=dtype,
-        )
-        w = self.build_1d_mask(
-            W,
-            is_bound[2],
-            is_bound[3],
-            border_width[1],
-            device=device,
-            dtype=dtype,
-        )
+        h = self.build_1d_mask(H, is_bound[0], is_bound[1], border_width[0])
+        w = self.build_1d_mask(W, is_bound[2], is_bound[3], border_width[1])
 
         h = repeat(h, "H -> H W", H=H, W=W)
         w = repeat(w, "W -> H W", H=H, W=W)
