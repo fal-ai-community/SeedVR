@@ -597,7 +597,7 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
         )
 
         # Process each window
-        for top, bottom, left, right in windows:
+        for top, bottom, left, right in maybe_use_tqdm(windows, desc="Seamless diffusion", use_tqdm=True):
             # Extract window with wrap-around
             win_latent = self._slice_latent_2d(latent, top, bottom, left, right, h_lat, w_lat)
             win_noise = self._slice_latent_2d(noise, top, bottom, left, right, h_lat, w_lat)
@@ -642,6 +642,8 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
         tile_stride_pixel: tuple[int, int] = (256, 256),
         seamless: bool = False,
         seamless_pad: int = 256,
+        tile_size_diffuse: tuple[int, int] = (48, 48),
+        tile_stride_diffuse: tuple[int, int] = (32, 32),
     ) -> torch.Tensor:
         """
         Generate a video from a media.
@@ -727,8 +729,8 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
                         cond_noise_scale=cond_noise_scale,
                         cfg_scale=cfg_scale,
                         cfg_rescale=cfg_rescale,
-                        tile_size=tile_size_latent,
-                        tile_stride=tile_stride_latent,
+                        tile_size=tile_size_diffuse,
+                        tile_stride=tile_stride_diffuse,
                     )
                     output_latents.append(out)
 
