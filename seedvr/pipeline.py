@@ -135,6 +135,7 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
         use_tqdm: bool = True,
         tile_size: tuple[int, int] = DEFAULT_PIXEL_TILE_SIZE,
         tile_stride: tuple[int, int] = DEFAULT_PIXEL_TILE_STRIDE,
+        seamless: bool = False,
     ) -> list[Tensor]:
         latents = []
         if len(samples) > 0:
@@ -166,6 +167,7 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
                         use_tqdm=use_tqdm,
                         tile_size=tile_size,
                         tile_stride=tile_stride,
+                        seamless=seamless,
                     ).latent
                 else:
                     # Deterministic vae encode, only used for i2v inference (optionally)
@@ -176,6 +178,7 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
                             use_tqdm=use_tqdm,
                             tile_size=tile_size,
                             tile_stride=tile_stride,
+                            seamless=seamless,
                         )
                         .posterior.mode()
                         .squeeze(2)
@@ -201,6 +204,7 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
         use_tqdm: bool = True,
         tile_size: tuple[int, int] = DEFAULT_LATENT_TILE_SIZE,
         tile_stride: tuple[int, int] = DEFAULT_LATENT_TILE_STRIDE,
+        seamless: bool = False,
     ) -> list[Tensor]:
         samples = []
         if len(latents) > 0:
@@ -232,6 +236,7 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
                     use_tqdm=use_tqdm,
                     tile_size=tile_size,
                     tile_stride=tile_stride,
+                    seamless=seamless,
                 ).sample
                 if hasattr(self.vae, "postprocess"):
                     sample = self.vae.postprocess(sample)
@@ -453,13 +458,13 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
         Generate a video from a media.
 
         Args:
-            seamless: If True, produce seamlessly tileable output. All circular
-                padding is done in latent space (after VAE encode, before diffusion,
-                cropped before VAE decode) so the VAE's tiled encode/decode never
-                sees padding and can't introduce asymmetric seam artifacts.
-            seamless_pad: Padding amount in pixels (converted to latent units
-                internally). Must be a multiple of the VAE's spatial downsample
-                factor (typically 8). Default 256 (~32 latent pixels).
+            seamless: If True, produce seamlessly tileable output. The VAE's tiled
+                encode/decode use circular padding so tiles wrap around edges
+                (no boundary artifacts). The diffusion noise is also circular-padded
+                in latent space so all components are seamless.
+            seamless_pad: Padding amount in latent pixels for the diffusion circular
+                pad. The VAE handles its own circular padding via tile overlap.
+                Default 256 pixels (~32 latent pixels at 8x downsample).
         """
         assert media.ndim == 4, "Media must be in CFHW format"
         c, f, h, w = media.shape
@@ -479,12 +484,12 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
 
         generator = torch.Generator(device=get_device()).manual_seed(seed)
 
-        # Prepare media for inference — NO pixel-space padding for seamless.
+        # Prepare media for inference.
         media_area = h * w
         scale = math.sqrt(target_area / media_area)
         media = area_resize(media, scale)
 
-        # Compute latent-space padding for seamless mode.
+        # Compute latent-space padding for seamless diffusion.
         if seamless:
             sdf = self.vae.spatial_downsample_factor
             assert seamless_pad % sdf == 0, (
@@ -520,24 +525,25 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
                     [batch_media] + [batch_media[:, -1:]] * num_padded_frames, dim=1
                 )
 
-            # VAE encode the UNPADDED media — no pixel-space circular padding.
+            # VAE encode — seamless flag enables circular tiling in the VAE.
             latents = self.vae_encode(
                 [batch_media],
                 use_tiling=use_tiling,
                 use_tqdm=use_tqdm and num_batches == 1,
                 tile_size=tile_size_pixel,
                 tile_stride=tile_stride_pixel,
+                seamless=seamless,
             )
             latents = [latent.to(self.dit.dtype) for latent in latents]
 
             if seamless:
-                # Circular-pad latents in latent space — this is exact and symmetric.
-                latents = [self._circular_pad_latent(lat, latent_pad_h, latent_pad_w) for lat in latents]
+                # Circular-pad latents for diffusion context.
+                latents_padded = [self._circular_pad_latent(lat, latent_pad_h, latent_pad_w) for lat in latents]
 
                 # Generate noise at the UNPADDED size, then circular-pad.
                 noises = []
                 aug_noises = []
-                for latent in latents:
+                for latent in latents_padded:
                     t_dim, h_lat, w_lat, c_lat = latent.shape
                     inner_h = h_lat - 2 * latent_pad_h
                     inner_w = w_lat - 2 * latent_pad_w
@@ -563,7 +569,7 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
                         self.add_noise(latent, aug_noise, cond_noise_scale),
                         task="sr",
                     )
-                    for noise, aug_noise, latent in zip(noises, aug_noises, latents)
+                    for noise, aug_noise, latent in zip(noises, aug_noises, latents_padded)
                 ]
 
                 # Diffusion only (no VAE decode yet).
@@ -573,13 +579,14 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
                 output_latents = [self._crop_latent(lat, latent_pad_h, latent_pad_w) for lat in output_latents]
                 output_latents = [lat.to(self.vae.dtype) for lat in output_latents]
 
-                # VAE decode the UNPADDED latent — clean, no tile boundary issues.
+                # VAE decode with seamless circular tiling.
                 samples = self.vae_decode(
                     output_latents,
                     use_tiling=use_tiling,
                     use_tqdm=use_tqdm and num_batches == 1,
                     tile_size=tile_size_latent,
                     tile_stride=tile_stride_latent,
+                    seamless=seamless,
                 )
             else:
                 noises = [self.random_seeded_like(latent, generator) for latent in latents]
