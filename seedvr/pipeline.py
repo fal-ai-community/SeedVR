@@ -782,7 +782,7 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
                 batch_media = batch_media[:-num_padded_frames]
                 samples = [sample[:-num_padded_frames] for sample in samples]
             samples = [
-                wavelet_reconstruction(sample, batch_media, self.wavelet_kernel)
+                wavelet_reconstruction(sample, batch_media, self.wavelet_kernel, seamless=seamless)
                 for sample in samples
             ]
             samples = [

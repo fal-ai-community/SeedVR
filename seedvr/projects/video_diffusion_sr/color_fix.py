@@ -87,7 +87,9 @@ def adaptive_instance_normalization(content_feat: Tensor, style_feat: Tensor):
     return normalized_feat * style_std.expand(size) + style_mean.expand(size)
 
 
-def wavelet_blur(image: Tensor, radius: int, kernel: Tensor):
+def wavelet_blur(
+    image: Tensor, radius: int, kernel: Tensor, padding_mode: str = "replicate"
+):
     """
     Apply wavelet blur to the input tensor.
     """
@@ -97,7 +99,7 @@ def wavelet_blur(image: Tensor, radius: int, kernel: Tensor):
     # repeat the kernel across all input channels
     kernel = kernel.repeat(3, 1, 1, 1)
     image = safe_pad_operation(
-        image, (radius, radius, radius, radius), mode="replicate"
+        image, (radius, radius, radius, radius), mode=padding_mode
     )
     # apply convolution
     output = F.conv2d(image, kernel, groups=3, dilation=radius)
@@ -108,6 +110,7 @@ def wavelet_decomposition(
     image: Tensor,
     kernel: torch.Tensor,
     levels=5,
+    padding_mode: str = "replicate",
 ):
     """
     Apply wavelet decomposition to the input tensor.
@@ -116,7 +119,7 @@ def wavelet_decomposition(
     high_freq = torch.zeros_like(image)
     for i in range(levels):
         radius = 2**i
-        low_freq = wavelet_blur(image, radius, kernel=kernel)
+        low_freq = wavelet_blur(image, radius, kernel=kernel, padding_mode=padding_mode)
         high_freq += image - low_freq
         image = low_freq
 
@@ -124,7 +127,10 @@ def wavelet_decomposition(
 
 
 def wavelet_reconstruction(
-    content_feat: Tensor, style_feat: Tensor, wavelet_kernel: Tensor
+    content_feat: Tensor,
+    style_feat: Tensor,
+    wavelet_kernel: Tensor,
+    seamless: bool = False,
 ):
     """
     Apply wavelet decomposition, so that the content will have the same color as the style.
@@ -143,13 +149,17 @@ def wavelet_reconstruction(
                 align_corners=False,
             )
 
+    padding_mode = "circular" if seamless else "replicate"
+
     # calculate the wavelet decomposition of the content feature
     content_high_freq, content_low_freq = wavelet_decomposition(
-        content_feat, wavelet_kernel
+        content_feat, wavelet_kernel, padding_mode=padding_mode
     )
     del content_low_freq
     # calculate the wavelet decomposition of the style feature
-    style_high_freq, style_low_freq = wavelet_decomposition(style_feat, wavelet_kernel)
+    style_high_freq, style_low_freq = wavelet_decomposition(
+        style_feat, wavelet_kernel, padding_mode=padding_mode
+    )
     del style_high_freq
 
     if content_high_freq.shape != style_low_freq.shape:
