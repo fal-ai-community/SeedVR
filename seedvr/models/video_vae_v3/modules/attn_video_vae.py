@@ -1895,6 +1895,7 @@ class VideoAutoencoderKLWrapper(
         use_tqdm: bool = True,
         tile_size: tuple[int, int] = DEFAULT_LATENT_TILE_SIZE,
         tile_stride: tuple[int, int] = DEFAULT_LATENT_TILE_STRIDE,
+        seamless: bool = False,
     ) -> CausalEncoderOutput:
         if x.ndim == 4:
             x = x.unsqueeze(2)
@@ -1906,6 +1907,7 @@ class VideoAutoencoderKLWrapper(
                 use_tqdm=use_tqdm,
                 tile_size=tile_size,
                 tile_stride=tile_stride,
+                seamless=seamless,
             )
             .latent_dist
         )
@@ -1919,6 +1921,7 @@ class VideoAutoencoderKLWrapper(
         use_tqdm: bool = True,
         tile_size: tuple[int, int] = DEFAULT_LATENT_TILE_SIZE,
         tile_stride: tuple[int, int] = DEFAULT_LATENT_TILE_STRIDE,
+        seamless: bool = False,
     ) -> CausalDecoderOutput:
         if z.ndim == 4:
             z = z.unsqueeze(2)
@@ -1930,6 +1933,7 @@ class VideoAutoencoderKLWrapper(
                 use_tqdm=use_tqdm,
                 tile_size=tile_size,
                 tile_stride=tile_stride,
+                seamless=seamless,
             )
             .sample.squeeze(2)
         )
