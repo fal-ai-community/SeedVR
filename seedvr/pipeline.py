@@ -144,15 +144,9 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
             shift = getattr(self.vae.config, "shifting_factor", 0.0)
 
             if isinstance(scale, ListConfig):
-                scale = torch.tensor(scale, device="cpu", dtype=dtype, pin_memory=True).to(
-                    device=device,
-                    non_blocking=True,
-                )
+                scale = torch.tensor(scale, device=device, dtype=dtype)
             if isinstance(shift, ListConfig):
-                shift = torch.tensor(shift, device="cpu", dtype=dtype, pin_memory=True).to(
-                    device=device,
-                    non_blocking=True,
-                )
+                shift = torch.tensor(shift, device=device, dtype=dtype)
 
             # Group samples of the same shape to batches if enabled.
             if self.vae.grouping:
@@ -216,15 +210,9 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
             shift = getattr(self.vae.config, "shifting_factor", 0.0)
 
             if isinstance(scale, ListConfig):
-                scale = torch.tensor(scale, device="cpu", dtype=dtype, pin_memory=True).to(
-                    device=device,
-                    non_blocking=True,
-                )
+                scale = torch.tensor(scale, device=device, dtype=dtype)
             if isinstance(shift, ListConfig):
-                shift = torch.tensor(shift, device="cpu", dtype=dtype, pin_memory=True).to(
-                    device=device,
-                    non_blocking=True,
-                )
+                shift = torch.tensor(shift, device=device, dtype=dtype)
 
             # Group latents of the same shape to batches if enabled.
             if self.vae.grouping:
@@ -258,24 +246,17 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
         return samples
 
     @torch.no_grad()
-    def inference(
+    def diffuse(
         self,
         noises: list[Tensor],
         conditions: list[Tensor],
         cfg_scale: float,
         cfg_rescale: float = 0.0,
-        dit_offload: bool = False,
-        use_tiling: bool = True,
-        use_tqdm: bool = True,
-        tile_size_pixel: tuple[int, int] = DEFAULT_PIXEL_TILE_SIZE,
-        tile_stride_pixel: tuple[int, int] = DEFAULT_PIXEL_TILE_STRIDE,
-        tile_size_latent: tuple[int, int] = DEFAULT_LATENT_TILE_SIZE,
-        tile_stride_latent: tuple[int, int] = DEFAULT_LATENT_TILE_STRIDE,
     ) -> list[Tensor]:
+        """Run diffusion sampling only, returning output latents in (T,H,W,C) format."""
         assert len(noises) == len(conditions)
         batch_size = len(noises)
 
-        # Return if empty.
         if batch_size == 0:
             return []
 
@@ -283,7 +264,9 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
         latents, latents_shapes = flatten(noises)
         latents_cond, _ = flatten(conditions)
 
-        # Sampling.
+        was_training = self.dit.training
+        self.dit.eval()
+
         latents = self.sampler.sample(
             x=latents,
             f=lambda args: classifier_free_guidance_dispatcher(
@@ -306,11 +289,29 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
             ),
         )
 
-        # Unflatten.
-        latents = unflatten(latents, latents_shapes)
+        self.dit.train(was_training)
+
+        return unflatten(latents, latents_shapes)
+
+    @torch.no_grad()
+    def inference(
+        self,
+        noises: list[Tensor],
+        conditions: list[Tensor],
+        cfg_scale: float,
+        cfg_rescale: float = 0.0,
+        dit_offload: bool = False,
+        use_tiling: bool = True,
+        use_tqdm: bool = True,
+        tile_size_pixel: tuple[int, int] = DEFAULT_PIXEL_TILE_SIZE,
+        tile_stride_pixel: tuple[int, int] = DEFAULT_PIXEL_TILE_STRIDE,
+        tile_size_latent: tuple[int, int] = DEFAULT_LATENT_TILE_SIZE,
+        tile_stride_latent: tuple[int, int] = DEFAULT_LATENT_TILE_STRIDE,
+    ) -> list[Tensor]:
+        """Run diffusion + VAE decode in one step (used for non-seamless path)."""
+        latents = self.diffuse(noises, conditions, cfg_scale, cfg_rescale)
         latents = [latent.to(self.vae.dtype) for latent in latents]
 
-        # Vae decode.
         samples = self.vae_decode(
             latents,
             use_tiling=use_tiling,
@@ -379,16 +380,8 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
         """
         Add noise to the input.
         """
-        t = (
-            torch.tensor([self.sampler.timesteps.T], device="cpu", pin_memory=True)
-            .to(device=x.device, non_blocking=True)
-            * cond_noise_scale
-        )
-        shape = (
-            torch.tensor(x.shape[1:], device="cpu", pin_memory=True)
-            .to(device=x.device, non_blocking=True)
-            .unsqueeze(0)
-        )
+        t = torch.tensor([self.sampler.timesteps.T], device=x.device) * cond_noise_scale
+        shape = torch.tensor(x.shape[1:], device=x.device).unsqueeze(0)
         t = self.timestep_transform(t, shape)
         x = self.sampler.schedule.forward(x, aug_noise, t)
         return x
@@ -415,18 +408,6 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
         self._clear_module_memory(self.vae)
 
     @staticmethod
-    def _circular_pad_2d(tensor: torch.Tensor, pad_h: int, pad_w: int) -> torch.Tensor:
-        """
-        Circular-pad a tensor along the last two spatial dimensions.
-        Expects tensor shape (..., H, W).
-        """
-        # Pad width (left, right), then height (top, bottom) using circular wrapping.
-        # F.pad order is (left, right, top, bottom) for last two dims.
-        import torch.nn.functional as F
-
-        return F.pad(tensor, (pad_w, pad_w, pad_h, pad_h), mode="circular")
-
-    @staticmethod
     def _circular_pad_latent(latent: torch.Tensor, pad_h: int, pad_w: int) -> torch.Tensor:
         """
         Circular-pad a latent tensor along spatial dimensions.
@@ -434,12 +415,19 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
         """
         import torch.nn.functional as F
 
-        # Rearrange to (..., H, W) for F.pad, then back
         # (T, H, W, C) -> (T, C, H, W) -> pad -> (T, C, H', W') -> (T, H', W', C)
         t, h, w, c = latent.shape
         x = latent.permute(0, 3, 1, 2)  # T, C, H, W
         x = F.pad(x, (pad_w, pad_w, pad_h, pad_h), mode="circular")
         return x.permute(0, 2, 3, 1)  # T, H', W', C
+
+    @staticmethod
+    def _crop_latent(latent: torch.Tensor, pad_h: int, pad_w: int) -> torch.Tensor:
+        """
+        Crop circular padding from a latent tensor.
+        Expects latent shape (T, H, W, C).
+        """
+        return latent[:, pad_h:-pad_h, pad_w:-pad_w, :]
 
     @torch.no_grad()
     def __call__(
@@ -465,12 +453,13 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
         Generate a video from a media.
 
         Args:
-            seamless: If True, produce seamlessly tileable output by circular-padding
-                the input so that edge regions have full context from wrapped edges.
-                Best suited for single-image super-resolution of tileable textures.
-            seamless_pad: Padding amount in pixels (after area_resize) added to each
-                edge. Must be a multiple of 16. Larger values give better seam quality
-                at the cost of more computation. Default 256 (~32 latent pixels).
+            seamless: If True, produce seamlessly tileable output. All circular
+                padding is done in latent space (after VAE encode, before diffusion,
+                cropped before VAE decode) so the VAE's tiled encode/decode never
+                sees padding and can't introduce asymmetric seam artifacts.
+            seamless_pad: Padding amount in pixels (converted to latent units
+                internally). Must be a multiple of the VAE's spatial downsample
+                factor (typically 8). Default 256 (~32 latent pixels).
         """
         assert media.ndim == 4, "Media must be in CFHW format"
         c, f, h, w = media.shape
@@ -489,17 +478,21 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
             seed = random.randint(0, 2**32 - 1)
 
         generator = torch.Generator(device=get_device()).manual_seed(seed)
-        # Prepare media for inference.
+
+        # Prepare media for inference — NO pixel-space padding for seamless.
         media_area = h * w
         scale = math.sqrt(target_area / media_area)
         media = area_resize(media, scale)
 
-        # Apply seamless circular padding after area_resize.
+        # Compute latent-space padding for seamless mode.
         if seamless:
-            assert seamless_pad % 16 == 0, "seamless_pad must be a multiple of 16"
-            # media shape: (C, F, H, W) — pad the spatial dims (H, W)
-            _, _, resized_h, resized_w = media.shape
-            media = self._circular_pad_2d(media, seamless_pad, seamless_pad)
+            sdf = self.vae.spatial_downsample_factor
+            assert seamless_pad % sdf == 0, (
+                f"seamless_pad ({seamless_pad}) must be a multiple of "
+                f"spatial_downsample_factor ({sdf})"
+            )
+            latent_pad_h = seamless_pad // sdf
+            latent_pad_w = seamless_pad // sdf
 
         # Update h, w
         h, w = media.shape[2:]
@@ -527,6 +520,7 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
                     [batch_media] + [batch_media[:, -1:]] * num_padded_frames, dim=1
                 )
 
+            # VAE encode the UNPADDED media — no pixel-space circular padding.
             latents = self.vae_encode(
                 [batch_media],
                 use_tiling=use_tiling,
@@ -537,15 +531,13 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
             latents = [latent.to(self.dit.dtype) for latent in latents]
 
             if seamless:
-                # Generate noise at the UNPADDED latent size, then circular-pad it.
-                # This ensures noise wraps at the edges, so the diffusion output is
-                # seamless after cropping (not just the condition).
-                latent_pad_h = seamless_pad // self.vae.spatial_downsample_factor
-                latent_pad_w = seamless_pad // self.vae.spatial_downsample_factor
+                # Circular-pad latents in latent space — this is exact and symmetric.
+                latents = [self._circular_pad_latent(lat, latent_pad_h, latent_pad_w) for lat in latents]
+
+                # Generate noise at the UNPADDED size, then circular-pad.
                 noises = []
                 aug_noises = []
                 for latent in latents:
-                    # latent shape: (T, H, W, C) — crop to unpadded size for noise gen
                     t_dim, h_lat, w_lat, c_lat = latent.shape
                     inner_h = h_lat - 2 * latent_pad_h
                     inner_w = w_lat - 2 * latent_pad_w
@@ -563,42 +555,64 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
                     )
                     noises.append(self._circular_pad_latent(noise_inner, latent_pad_h, latent_pad_w))
                     aug_noises.append(self._circular_pad_latent(aug_inner, latent_pad_h, latent_pad_w))
+
+                # Build conditions on padded latents + padded noise.
+                conditions = [
+                    self.get_condition(
+                        noise,
+                        self.add_noise(latent, aug_noise, cond_noise_scale),
+                        task="sr",
+                    )
+                    for noise, aug_noise, latent in zip(noises, aug_noises, latents)
+                ]
+
+                # Diffusion only (no VAE decode yet).
+                output_latents = self.diffuse(noises, conditions, cfg_scale, cfg_rescale)
+
+                # Crop back to unpadded latent size.
+                output_latents = [self._crop_latent(lat, latent_pad_h, latent_pad_w) for lat in output_latents]
+                output_latents = [lat.to(self.vae.dtype) for lat in output_latents]
+
+                # VAE decode the UNPADDED latent — clean, no tile boundary issues.
+                samples = self.vae_decode(
+                    output_latents,
+                    use_tiling=use_tiling,
+                    use_tqdm=use_tqdm and num_batches == 1,
+                    tile_size=tile_size_latent,
+                    tile_stride=tile_stride_latent,
+                )
             else:
                 noises = [self.random_seeded_like(latent, generator) for latent in latents]
                 aug_noises = [self.random_seeded_like(latent, generator) for latent in latents]
-
-            conditions = [
-                self.get_condition(
-                    noise,
-                    self.add_noise(latent, aug_noise, cond_noise_scale),
-                    task="sr",
+                conditions = [
+                    self.get_condition(
+                        noise,
+                        self.add_noise(latent, aug_noise, cond_noise_scale),
+                        task="sr",
+                    )
+                    for noise, aug_noise, latent in zip(noises, aug_noises, latents)
+                ]
+                samples = self.inference(
+                    noises,
+                    conditions,
+                    cfg_scale,
+                    cfg_rescale,
+                    use_tiling=use_tiling,
+                    use_tqdm=use_tqdm and num_batches == 1,
+                    tile_size_pixel=tile_size_pixel,
+                    tile_stride_pixel=tile_stride_pixel,
+                    tile_size_latent=tile_size_latent,
+                    tile_stride_latent=tile_stride_latent,
                 )
-                for noise, aug_noise, latent in zip(noises, aug_noises, latents)
-            ]
-            samples = self.inference(
-                noises,
-                conditions,
-                cfg_scale,
-                cfg_rescale,
-                use_tiling=use_tiling,
-                use_tqdm=use_tqdm and num_batches == 1,
-                tile_size_pixel=tile_size_pixel,
-                tile_stride_pixel=tile_stride_pixel,
-                tile_size_latent=tile_size_latent,
-                tile_stride_latent=tile_stride_latent,
-            )
+
             samples = [sample.unsqueeze(1) if sample.ndim == 3 else sample for sample in samples]
 
             batch_media = rearrange(batch_media, "c t h w -> t c h w").to(
-                self.wavelet_kernel.device,
-                dtype=self.wavelet_kernel.dtype,
-                non_blocking=True,
+                self.wavelet_kernel.device, dtype=self.wavelet_kernel.dtype
             )
             samples = [
                 rearrange(sample, "c t h w -> t c h w").to(
-                    self.wavelet_kernel.device,
-                    dtype=self.wavelet_kernel.dtype,
-                    non_blocking=True,
+                    self.wavelet_kernel.device, dtype=self.wavelet_kernel.dtype
                 )
                 for sample in samples
             ]
@@ -620,18 +634,12 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
                 .cpu()
                 for sample in samples
             ]
-            # if batch_idx > 0 and overlap > 0:
-            #    samples = [sample[overlap:] for sample in samples]
 
             output_samples.append(samples)
             self._clear_vae_memory()
 
         if len(output_samples) == 0 or len(output_samples[0]) == 0:
             return []
-
-        # output_samples = [torch.cat(samples, dim=0) for samples in zip(*output_samples)]
-        # torch.cuda.empty_cache()
-        # return output_samples[0].permute(1, 0, 2, 3)
 
         # Simple approach: just concatenate all frames, skipping overlaps after the first batch
         all_frames = []
@@ -658,16 +666,5 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
 
         # t c h w -> c t h w
         result = combined_video.permute(1, 0, 2, 3)
-
-        # Crop out the circular padding from seamless mode.
-        # The output spatial resolution matches the input (VAE encode/decode are inverse),
-        # so we crop by the same pixel amount we padded.
-        if seamless:
-            result = result[
-                :,
-                :,
-                seamless_pad : seamless_pad + resized_h,
-                seamless_pad : seamless_pad + resized_w,
-            ]
 
         return result
