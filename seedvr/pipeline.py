@@ -504,13 +504,13 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
 
     @staticmethod
     def _make_bilinear_mask_thwc(
-        t_dim: int, tile_h: int, tile_w: int, c_dim: int,
+        t_dim: int, tile_h: int, tile_w: int,
         feather_ratio: float = 0.25,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
     ) -> torch.Tensor:
         """
-        Create a bilinear feathering mask in (T, H, W, C) format.
+        Create a bilinear feathering mask in (T, H, W, 1) format.
         Feathers all spatial edges (for seamless tiling).
         """
         mask_h = torch.ones(tile_h, device=device, dtype=dtype)
@@ -533,8 +533,8 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
             mask_h.unsqueeze(1).expand(tile_h, tile_w),
             mask_w.unsqueeze(0).expand(tile_h, tile_w),
         )
-        # Expand to (T, H, W, C)
-        return mask_2d.unsqueeze(0).unsqueeze(-1).expand(t_dim, tile_h, tile_w, c_dim)
+        # Expand to (T, H, W, 1) — broadcasts across channels
+        return mask_2d.unsqueeze(0).unsqueeze(-1).expand(t_dim, tile_h, tile_w, 1)
 
     @torch.no_grad()
     def diffuse_seamless(
@@ -592,7 +592,7 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
             (t_dim, h_lat, w_lat, 1), device=latent.device, dtype=latent.dtype
         )
         blend_mask = self._make_bilinear_mask_thwc(
-            t_dim, tile_h, tile_w, c_lat,
+            t_dim, tile_h, tile_w,
             device=latent.device, dtype=latent.dtype,
         )
 
