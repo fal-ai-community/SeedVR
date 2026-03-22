@@ -401,6 +401,18 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
     def _clear_vae_memory(self) -> None:
         self._clear_module_memory(self.vae)
 
+    @staticmethod
+    def _circular_pad_2d(tensor: torch.Tensor, pad_h: int, pad_w: int) -> torch.Tensor:
+        """
+        Circular-pad a tensor along the last two spatial dimensions.
+        Expects tensor shape (..., H, W).
+        """
+        # Pad width (left, right), then height (top, bottom) using circular wrapping.
+        # F.pad order is (left, right, top, bottom) for last two dims.
+        import torch.nn.functional as F
+
+        return F.pad(tensor, (pad_w, pad_w, pad_h, pad_h), mode="circular")
+
     @torch.no_grad()
     def __call__(
         self,
@@ -418,9 +430,19 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
         tile_size_pixel: tuple[int, int] = (384, 384),
         tile_stride_latent: tuple[int, int] = (32, 32),
         tile_stride_pixel: tuple[int, int] = (256, 256),
+        seamless: bool = False,
+        seamless_pad: int = 256,
     ) -> torch.Tensor:
         """
         Generate a video from a media.
+
+        Args:
+            seamless: If True, produce seamlessly tileable output by circular-padding
+                the input so that edge regions have full context from wrapped edges.
+                Best suited for single-image super-resolution of tileable textures.
+            seamless_pad: Padding amount in pixels (after area_resize) added to each
+                edge. Must be a multiple of 16. Larger values give better seam quality
+                at the cost of more computation. Default 256 (~32 latent pixels).
         """
         assert media.ndim == 4, "Media must be in CFHW format"
         c, f, h, w = media.shape
@@ -443,6 +465,13 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
         media_area = h * w
         scale = math.sqrt(target_area / media_area)
         media = area_resize(media, scale)
+
+        # Apply seamless circular padding after area_resize.
+        if seamless:
+            assert seamless_pad % 16 == 0, "seamless_pad must be a multiple of 16"
+            # media shape: (C, F, H, W) — pad the spatial dims (H, W)
+            _, _, resized_h, resized_w = media.shape
+            media = self._circular_pad_2d(media, seamless_pad, seamless_pad)
 
         # Update h, w
         h, w = media.shape[2:]
@@ -566,4 +595,17 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
             combined_video = combined_video[:f]
 
         # t c h w -> c t h w
-        return combined_video.permute(1, 0, 2, 3)
+        result = combined_video.permute(1, 0, 2, 3)
+
+        # Crop out the circular padding from seamless mode.
+        # The output spatial resolution matches the input (VAE encode/decode are inverse),
+        # so we crop by the same pixel amount we padded.
+        if seamless:
+            result = result[
+                :,
+                :,
+                seamless_pad : seamless_pad + resized_h,
+                seamless_pad : seamless_pad + resized_w,
+            ]
+
+        return result
