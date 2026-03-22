@@ -7,7 +7,7 @@ name = "seedvr"
 version = "1.0.6"
 description = "SeedVR: Seeding Infinity in Diffusion Transformer Towards Generic Video Restoration"
 readme = "readme.md"
-requires-python = ">=3.9,<3.11"
+requires-python = ">=3.9,<3.12"
 license = {text = "Apache-2.0"}
 authors = [
     {name = "Jianyi Wang", email = "iceclear@bytedance.com"},
@@ -38,6 +38,7 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Scientific/Engineering :: Image Processing",
     "Topic :: Multimedia :: Video",
@@ -97,7 +98,10 @@ Documentation = "https://iceclear.github.io/projects/seedvr/"
 "ComfyUI Integration" = "https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler"
 
 [tool.setuptools]
-packages = ["seedvr"]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["seedvr*"]
 
 [tool.setuptools.package-data]
 seedvr = [
@@ -148,6 +152,3 @@ addopts = [
     "--cov-report=term-missing",
     "--cov-report=html",
 ]
-
-
-

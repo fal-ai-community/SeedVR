@@ -144,9 +144,15 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
             shift = getattr(self.vae.config, "shifting_factor", 0.0)
 
             if isinstance(scale, ListConfig):
-                scale = torch.tensor(scale, device=device, dtype=dtype)
+                scale = torch.tensor(scale, device="cpu", dtype=dtype, pin_memory=True).to(
+                    device=device,
+                    non_blocking=True,
+                )
             if isinstance(shift, ListConfig):
-                shift = torch.tensor(shift, device=device, dtype=dtype)
+                shift = torch.tensor(shift, device="cpu", dtype=dtype, pin_memory=True).to(
+                    device=device,
+                    non_blocking=True,
+                )
 
             # Group samples of the same shape to batches if enabled.
             if self.vae.grouping:
@@ -210,9 +216,15 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
             shift = getattr(self.vae.config, "shifting_factor", 0.0)
 
             if isinstance(scale, ListConfig):
-                scale = torch.tensor(scale, device=device, dtype=dtype)
+                scale = torch.tensor(scale, device="cpu", dtype=dtype, pin_memory=True).to(
+                    device=device,
+                    non_blocking=True,
+                )
             if isinstance(shift, ListConfig):
-                shift = torch.tensor(shift, device=device, dtype=dtype)
+                shift = torch.tensor(shift, device="cpu", dtype=dtype, pin_memory=True).to(
+                    device=device,
+                    non_blocking=True,
+                )
 
             # Group latents of the same shape to batches if enabled.
             if self.vae.grouping:
@@ -271,10 +283,6 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
         latents, latents_shapes = flatten(noises)
         latents_cond, _ = flatten(conditions)
 
-        # Enter eval mode.
-        was_training = self.dit.training
-        self.dit.eval()
-
         # Sampling.
         latents = self.sampler.sample(
             x=latents,
@@ -297,9 +305,6 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
                 rescale=cfg_rescale,
             ),
         )
-
-        # Exit eval mode.
-        self.dit.train(was_training)
 
         # Unflatten.
         latents = unflatten(latents, latents_shapes)
@@ -374,8 +379,16 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
         """
         Add noise to the input.
         """
-        t = torch.tensor([self.sampler.timesteps.T], device=x.device) * cond_noise_scale
-        shape = torch.tensor(x.shape[1:], device=x.device).unsqueeze(0)
+        t = (
+            torch.tensor([self.sampler.timesteps.T], device="cpu", pin_memory=True)
+            .to(device=x.device, non_blocking=True)
+            * cond_noise_scale
+        )
+        shape = (
+            torch.tensor(x.shape[1:], device="cpu", pin_memory=True)
+            .to(device=x.device, non_blocking=True)
+            .unsqueeze(0)
+        )
         t = self.timestep_transform(t, shape)
         x = self.sampler.schedule.forward(x, aug_noise, t)
         return x
@@ -532,11 +545,15 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
             samples = [sample.unsqueeze(1) if sample.ndim == 3 else sample for sample in samples]
 
             batch_media = rearrange(batch_media, "c t h w -> t c h w").to(
-                self.wavelet_kernel.device, dtype=self.wavelet_kernel.dtype
+                self.wavelet_kernel.device,
+                dtype=self.wavelet_kernel.dtype,
+                non_blocking=True,
             )
             samples = [
                 rearrange(sample, "c t h w -> t c h w").to(
-                    self.wavelet_kernel.device, dtype=self.wavelet_kernel.dtype
+                    self.wavelet_kernel.device,
+                    dtype=self.wavelet_kernel.dtype,
+                    non_blocking=True,
                 )
                 for sample in samples
             ]
