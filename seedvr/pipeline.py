@@ -413,6 +413,21 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
 
         return F.pad(tensor, (pad_w, pad_w, pad_h, pad_h), mode="circular")
 
+    @staticmethod
+    def _circular_pad_latent(latent: torch.Tensor, pad_h: int, pad_w: int) -> torch.Tensor:
+        """
+        Circular-pad a latent tensor along spatial dimensions.
+        Expects latent shape (T, H, W, C) — the format used after vae_encode rearrange.
+        """
+        import torch.nn.functional as F
+
+        # Rearrange to (..., H, W) for F.pad, then back
+        # (T, H, W, C) -> (T, C, H, W) -> pad -> (T, C, H', W') -> (T, H', W', C)
+        t, h, w, c = latent.shape
+        x = latent.permute(0, 3, 1, 2)  # T, C, H, W
+        x = F.pad(x, (pad_w, pad_w, pad_h, pad_h), mode="circular")
+        return x.permute(0, 2, 3, 1)  # T, H', W', C
+
     @torch.no_grad()
     def __call__(
         self,
@@ -507,8 +522,38 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
                 tile_stride=tile_stride_pixel,
             )
             latents = [latent.to(self.dit.dtype) for latent in latents]
-            noises = [self.random_seeded_like(latent, generator) for latent in latents]
-            aug_noises = [self.random_seeded_like(latent, generator) for latent in latents]
+
+            if seamless:
+                # Generate noise at the UNPADDED latent size, then circular-pad it.
+                # This ensures noise wraps at the edges, so the diffusion output is
+                # seamless after cropping (not just the condition).
+                latent_pad_h = seamless_pad // self.vae.spatial_downsample_factor
+                latent_pad_w = seamless_pad // self.vae.spatial_downsample_factor
+                noises = []
+                aug_noises = []
+                for latent in latents:
+                    # latent shape: (T, H, W, C) — crop to unpadded size for noise gen
+                    t_dim, h_lat, w_lat, c_lat = latent.shape
+                    inner_h = h_lat - 2 * latent_pad_h
+                    inner_w = w_lat - 2 * latent_pad_w
+                    noise_inner = torch.randn(
+                        (t_dim, inner_h, inner_w, c_lat),
+                        device=latent.device,
+                        dtype=latent.dtype,
+                        generator=generator,
+                    )
+                    aug_inner = torch.randn(
+                        (t_dim, inner_h, inner_w, c_lat),
+                        device=latent.device,
+                        dtype=latent.dtype,
+                        generator=generator,
+                    )
+                    noises.append(self._circular_pad_latent(noise_inner, latent_pad_h, latent_pad_w))
+                    aug_noises.append(self._circular_pad_latent(aug_inner, latent_pad_h, latent_pad_w))
+            else:
+                noises = [self.random_seeded_like(latent, generator) for latent in latents]
+                aug_noises = [self.random_seeded_like(latent, generator) for latent in latents]
+
             conditions = [
                 self.get_condition(
                     noise,
