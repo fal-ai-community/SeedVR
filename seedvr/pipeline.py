@@ -641,7 +641,6 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
         tile_stride_latent: tuple[int, int] = (32, 32),
         tile_stride_pixel: tuple[int, int] = (256, 256),
         seamless: bool = False,
-        seamless_pad: int = 256,
         tile_size_diffuse: tuple[int, int] = (48, 48),
         tile_stride_diffuse: tuple[int, int] = (32, 32),
     ) -> torch.Tensor:
@@ -651,11 +650,8 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
         Args:
             seamless: If True, produce seamlessly tileable output. The VAE's tiled
                 encode/decode use circular padding so tiles wrap around edges
-                (no boundary artifacts). The diffusion noise is also circular-padded
-                in latent space so all components are seamless.
-            seamless_pad: Padding amount in latent pixels for the diffusion circular
-                pad. The VAE handles its own circular padding via tile overlap.
-                Default 256 pixels (~32 latent pixels at 8x downsample).
+                (no boundary artifacts). The diffusion step uses tiled multidiffusion
+                with wrap-around windows and bilinear blending.
         """
         assert media.ndim == 4, "Media must be in CFHW format"
         c, f, h, w = media.shape
