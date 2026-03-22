@@ -23,7 +23,7 @@ from seedvr.common.cache import Cache
 from seedvr.common.distributed.ops import gather_heads_scatter_seq, gather_seq_scatter_heads_qkv
 from seedvr.common.utils import safe_pad_operation
 from ... import na
-from ...attention import FlashAttentionVarlen
+from ...attention import VarlenAttention
 from ...mm import MMArg, MMModule
 from ...normalization import norm_layer_type
 from ...rope import get_na_rope
@@ -71,7 +71,7 @@ class NaMMAttention(nn.Module):
         )
 
         self.rope = get_na_rope(rope_type=rope_type, dim=rope_dim)
-        self.attn = FlashAttentionVarlen()
+        self.attn = VarlenAttention()
 
     def forward(
         self,
@@ -118,14 +118,29 @@ class NaMMAttention(nn.Module):
         txt_len = cache("txt_len", lambda: txt_shape.prod(-1))
         all_len = cache("all_len", lambda: vid_len + txt_len)
 
-        concat, unconcat = cache("mm_pnp", lambda: na.concat_idx(vid_len, txt_len))
+        concat, unconcat = cache(
+            "mm_pnp",
+            lambda: na.concat_idx(vid_len, txt_len, device=vid_q.device),
+        )
 
         attn = self.attn(
             q=concat(vid_q, txt_q).bfloat16(),
             k=concat(vid_k, txt_k).bfloat16(),
             v=concat(vid_v, txt_v).bfloat16(),
-            cu_seqlens_q=cache("mm_seqlens", lambda: safe_pad_operation(all_len.cumsum(0), (1, 0)).int()),
-            cu_seqlens_k=cache("mm_seqlens", lambda: safe_pad_operation(all_len.cumsum(0), (1, 0)).int()),
+            cu_seqlens_q=cache(
+                "mm_seqlens",
+                lambda: safe_pad_operation(all_len.cumsum(0), (1, 0))
+                .int()
+                .pin_memory()
+                .to(device=vid_q.device, non_blocking=True),
+            ),
+            cu_seqlens_k=cache(
+                "mm_seqlens",
+                lambda: safe_pad_operation(all_len.cumsum(0), (1, 0))
+                .int()
+                .pin_memory()
+                .to(device=vid_q.device, non_blocking=True),
+            ),
             max_seqlen_q=cache("mm_maxlen", lambda: all_len.max().item()),
             max_seqlen_k=cache("mm_maxlen", lambda: all_len.max().item()),
         ).type_as(vid_q)
@@ -190,7 +205,7 @@ class NaSwinAttention(NaMMAttention):
 
         window_partition, window_reverse, window_shape, window_count = cache_win(
             "win_transform",
-            lambda: na.window_idx(vid_shape, make_window),
+            lambda: na.window_idx(vid_shape, make_window, device=vid_qkv.device),
         )
         vid_qkv_win = window_partition(vid_qkv)
 
@@ -209,7 +224,13 @@ class NaSwinAttention(NaMMAttention):
         txt_len_win = cache_win("txt_len", lambda: txt_len.repeat_interleave(window_count))
         all_len_win = cache_win("all_len", lambda: vid_len_win + txt_len_win)
         concat_win, unconcat_win = cache_win(
-            "mm_pnp", lambda: na.repeat_concat_idx(vid_len_win, txt_len, window_count)
+            "mm_pnp",
+            lambda: na.repeat_concat_idx(
+                vid_len_win,
+                txt_len,
+                window_count,
+                device=vid_q.device,
+            ),
         )
 
         # window rope
@@ -217,16 +238,17 @@ class NaSwinAttention(NaMMAttention):
             if self.rope.mm:
                 # repeat text q and k for window mmrope
                 _, num_h, _ = txt_q.shape
+                window_count_list = window_count.tolist()
                 txt_q_repeat = rearrange(txt_q, "l h d -> l (h d)")
                 txt_q_repeat = na.unflatten(txt_q_repeat, txt_shape)
-                txt_q_repeat = [[x] * n for x, n in zip(txt_q_repeat, window_count)]
+                txt_q_repeat = [[x] * n for x, n in zip(txt_q_repeat, window_count_list)]
                 txt_q_repeat = list(chain(*txt_q_repeat))
                 txt_q_repeat, txt_shape_repeat = na.flatten(txt_q_repeat)
                 txt_q_repeat = rearrange(txt_q_repeat, "l (h d) -> l h d", h=num_h)
 
                 txt_k_repeat = rearrange(txt_k, "l h d -> l (h d)")
                 txt_k_repeat = na.unflatten(txt_k_repeat, txt_shape)
-                txt_k_repeat = [[x] * n for x, n in zip(txt_k_repeat, window_count)]
+                txt_k_repeat = [[x] * n for x, n in zip(txt_k_repeat, window_count_list)]
                 txt_k_repeat = list(chain(*txt_k_repeat))
                 txt_k_repeat, _ = na.flatten(txt_k_repeat)
                 txt_k_repeat = rearrange(txt_k_repeat, "l (h d) -> l h d", h=num_h)
@@ -242,10 +264,18 @@ class NaSwinAttention(NaMMAttention):
             k=concat_win(vid_k, txt_k).bfloat16(),
             v=concat_win(vid_v, txt_v).bfloat16(),
             cu_seqlens_q=cache_win(
-                "vid_seqlens_q", lambda: safe_pad_operation(all_len_win.cumsum(0), (1, 0)).int()
+                "vid_seqlens_q",
+                lambda: safe_pad_operation(all_len_win.cumsum(0), (1, 0))
+                .int()
+                .pin_memory()
+                .to(device=vid_q.device, non_blocking=True),
             ),
             cu_seqlens_k=cache_win(
-                "vid_seqlens_k", lambda: safe_pad_operation(all_len_win.cumsum(0), (1, 0)).int()
+                "vid_seqlens_k",
+                lambda: safe_pad_operation(all_len_win.cumsum(0), (1, 0))
+                .int()
+                .pin_memory()
+                .to(device=vid_q.device, non_blocking=True),
             ),
             max_seqlen_q=cache_win("vid_max_seqlen_q", lambda: all_len_win.max().item()),
             max_seqlen_k=cache_win("vid_max_seqlen_k", lambda: all_len_win.max().item()),
