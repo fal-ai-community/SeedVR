@@ -434,6 +434,195 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
         """
         return latent[:, pad_h:-pad_h, pad_w:-pad_w, :]
 
+    @staticmethod
+    def _slice_latent_2d(
+        latent: torch.Tensor,
+        top: int, bottom: int, left: int, right: int,
+        height: int, width: int,
+    ) -> torch.Tensor:
+        """
+        Extract a 2D spatial window from a (T, H, W, C) latent with wrap-around.
+        top/bottom/left/right may exceed height/width to indicate wrapping.
+        """
+        wrap_y = bottom > height
+        wrap_x = right > width
+
+        if not wrap_y and not wrap_x:
+            return latent[:, top:bottom, left:right, :].clone()
+
+        if wrap_y:
+            overflow_y = bottom - height
+            lat_y = torch.cat([latent[:, top:height, :, :], latent[:, :overflow_y, :, :]], dim=1)
+        else:
+            lat_y = latent[:, top:bottom, :, :]
+
+        if wrap_x:
+            overflow_x = right - width
+            return torch.cat([lat_y[:, :, left:width, :], lat_y[:, :, :overflow_x, :]], dim=2)
+        else:
+            return lat_y[:, :, left:right, :].clone()
+
+    @staticmethod
+    def _fill_latent_2d(
+        target: torch.Tensor,
+        count: torch.Tensor,
+        value: torch.Tensor,
+        mask: torch.Tensor,
+        top: int, bottom: int, left: int, right: int,
+        height: int, width: int,
+    ) -> None:
+        """
+        Write a tiled value back into the target (T, H, W, C) with bilinear mask
+        and wrap-around. count is (T, H, W, 1).
+        """
+        wrap_y = bottom > height
+        wrap_x = right > width
+
+        end_y = height if wrap_y else bottom
+        end_x = width if wrap_x else right
+        h_main = end_y - top
+        w_main = end_x - left
+
+        masked = value * mask
+
+        target[:, top:end_y, left:end_x, :] += masked[:, :h_main, :w_main, :]
+        count[:, top:end_y, left:end_x, :] += mask[:, :h_main, :w_main, :]
+
+        if wrap_x:
+            overflow_x = right - width
+            target[:, top:end_y, :overflow_x, :] += masked[:, :h_main, w_main:, :]
+            count[:, top:end_y, :overflow_x, :] += mask[:, :h_main, w_main:, :]
+            if wrap_y:
+                overflow_y = bottom - height
+                target[:, :overflow_y, :overflow_x, :] += masked[:, h_main:, w_main:, :]
+                count[:, :overflow_y, :overflow_x, :] += mask[:, h_main:, w_main:, :]
+
+        if wrap_y:
+            overflow_y = bottom - height
+            target[:, :overflow_y, left:end_x, :] += masked[:, h_main:, :w_main, :]
+            count[:, :overflow_y, left:end_x, :] += mask[:, h_main:, :w_main, :]
+
+    @staticmethod
+    def _make_bilinear_mask_thwc(
+        t_dim: int, tile_h: int, tile_w: int, c_dim: int,
+        feather_ratio: float = 0.25,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> torch.Tensor:
+        """
+        Create a bilinear feathering mask in (T, H, W, C) format.
+        Feathers all spatial edges (for seamless tiling).
+        """
+        mask_h = torch.ones(tile_h, device=device, dtype=dtype)
+        mask_w = torch.ones(tile_w, device=device, dtype=dtype)
+
+        feather_h = max(1, int(feather_ratio * tile_h))
+        feather_w = max(1, int(feather_ratio * tile_w))
+
+        for i in range(feather_h):
+            w = (i + 1) / (feather_h + 1)
+            mask_h[i] = min(mask_h[i].item(), w)
+            mask_h[tile_h - 1 - i] = min(mask_h[tile_h - 1 - i].item(), w)
+        for i in range(feather_w):
+            w = (i + 1) / (feather_w + 1)
+            mask_w[i] = min(mask_w[i].item(), w)
+            mask_w[tile_w - 1 - i] = min(mask_w[tile_w - 1 - i].item(), w)
+
+        # Outer product → (H, W), take elementwise min like z-image
+        mask_2d = torch.min(
+            mask_h.unsqueeze(1).expand(tile_h, tile_w),
+            mask_w.unsqueeze(0).expand(tile_h, tile_w),
+        )
+        # Expand to (T, H, W, C)
+        return mask_2d.unsqueeze(0).unsqueeze(-1).expand(t_dim, tile_h, tile_w, c_dim)
+
+    @torch.no_grad()
+    def diffuse_seamless(
+        self,
+        latent: torch.Tensor,
+        noise: torch.Tensor,
+        aug_noise: torch.Tensor,
+        cond_noise_scale: float,
+        cfg_scale: float,
+        cfg_rescale: float,
+        tile_size: tuple[int, int] = (32, 32),
+        tile_stride: tuple[int, int] = (16, 16),
+    ) -> torch.Tensor:
+        """
+        Tiled multidiffusion with wrap-around for seamless output.
+
+        Operates on a single latent (T, H, W, C). Extracts overlapping
+        windows with wrap-around, runs diffusion on each window, blends
+        the results with bilinear masks.
+
+        Args:
+            latent: Condition latent (T, H, W, C) — from VAE encode.
+            noise: Initial noise (T, H, W, C) — same shape as latent.
+            aug_noise: Augmentation noise (T, H, W, C).
+            cond_noise_scale: Noise scale for conditioning.
+            cfg_scale: CFG scale.
+            cfg_rescale: CFG rescale.
+            tile_size: (tile_h, tile_w) in latent pixels.
+            tile_stride: (stride_h, stride_w) in latent pixels.
+
+        Returns:
+            Output latent (T, H, W, C) — seamlessly tileable.
+        """
+        from seedvr.common.utils import sliding_2d_windows
+
+        t_dim, h_lat, w_lat, c_lat = latent.shape
+        tile_h, tile_w = tile_size
+        stride_h, stride_w = tile_stride
+
+        # Clamp tile/stride to latent size
+        tile_h = min(tile_h, h_lat)
+        tile_w = min(tile_w, w_lat)
+        stride_h = min(stride_h, tile_h)
+        stride_w = min(stride_w, tile_w)
+
+        # Generate windows with wrap-around (windows can extend past h_lat/w_lat)
+        windows: list[tuple[int, int, int, int]] = []
+        for y in range(0, h_lat, stride_h):
+            for x in range(0, w_lat, stride_w):
+                windows.append((y, y + tile_h, x, x + tile_w))
+
+        # Accumulation buffers
+        output_acc = torch.zeros_like(latent)
+        output_count = torch.zeros(
+            (t_dim, h_lat, w_lat, 1), device=latent.device, dtype=latent.dtype
+        )
+        blend_mask = self._make_bilinear_mask_thwc(
+            t_dim, tile_h, tile_w, c_lat,
+            device=latent.device, dtype=latent.dtype,
+        )
+
+        # Process each window
+        for top, bottom, left, right in windows:
+            # Extract window with wrap-around
+            win_latent = self._slice_latent_2d(latent, top, bottom, left, right, h_lat, w_lat)
+            win_noise = self._slice_latent_2d(noise, top, bottom, left, right, h_lat, w_lat)
+            win_aug = self._slice_latent_2d(aug_noise, top, bottom, left, right, h_lat, w_lat)
+
+            # Build condition for this window
+            win_cond = self.get_condition(
+                win_noise,
+                self.add_noise(win_latent, win_aug, cond_noise_scale),
+                task="sr",
+            )
+
+            # Run diffusion on this window
+            win_output = self.diffuse([win_noise], [win_cond], cfg_scale, cfg_rescale)
+            win_output = win_output[0]  # Single item list → (T, H, W, C)
+
+            # Blend into accumulation buffer with wrap-around
+            self._fill_latent_2d(
+                output_acc, output_count, win_output, blend_mask,
+                top, bottom, left, right, h_lat, w_lat,
+            )
+
+        # Normalize by blend count
+        return output_acc / output_count.clamp(min=1)
+
     @torch.no_grad()
     def __call__(
         self,
@@ -489,16 +678,6 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
         scale = math.sqrt(target_area / media_area)
         media = area_resize(media, scale)
 
-        # Compute latent-space padding for seamless diffusion.
-        if seamless:
-            sdf = self.vae.spatial_downsample_factor
-            assert seamless_pad % sdf == 0, (
-                f"seamless_pad ({seamless_pad}) must be a multiple of "
-                f"spatial_downsample_factor ({sdf})"
-            )
-            latent_pad_h = seamless_pad // sdf
-            latent_pad_w = seamless_pad // sdf
-
         # Update h, w
         h, w = media.shape[2:]
 
@@ -537,46 +716,22 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
             latents = [latent.to(self.dit.dtype) for latent in latents]
 
             if seamless:
-                # Circular-pad latents for diffusion context.
-                latents_padded = [self._circular_pad_latent(lat, latent_pad_h, latent_pad_w) for lat in latents]
-
-                # Generate noise at the UNPADDED size, then circular-pad.
-                noises = []
-                aug_noises = []
-                for latent in latents_padded:
-                    t_dim, h_lat, w_lat, c_lat = latent.shape
-                    inner_h = h_lat - 2 * latent_pad_h
-                    inner_w = w_lat - 2 * latent_pad_w
-                    noise_inner = torch.randn(
-                        (t_dim, inner_h, inner_w, c_lat),
-                        device=latent.device,
-                        dtype=latent.dtype,
-                        generator=generator,
+                # Multidiffusion with wrap-around: run diffusion on overlapping
+                # windows that wrap around edges, blend with bilinear masks.
+                output_latents = []
+                for latent in latents:
+                    noise = self.random_seeded_like(latent, generator)
+                    aug_noise = self.random_seeded_like(latent, generator)
+                    out = self.diffuse_seamless(
+                        latent, noise, aug_noise,
+                        cond_noise_scale=cond_noise_scale,
+                        cfg_scale=cfg_scale,
+                        cfg_rescale=cfg_rescale,
+                        tile_size=tile_size_latent,
+                        tile_stride=tile_stride_latent,
                     )
-                    aug_inner = torch.randn(
-                        (t_dim, inner_h, inner_w, c_lat),
-                        device=latent.device,
-                        dtype=latent.dtype,
-                        generator=generator,
-                    )
-                    noises.append(self._circular_pad_latent(noise_inner, latent_pad_h, latent_pad_w))
-                    aug_noises.append(self._circular_pad_latent(aug_inner, latent_pad_h, latent_pad_w))
+                    output_latents.append(out)
 
-                # Build conditions on padded latents + padded noise.
-                conditions = [
-                    self.get_condition(
-                        noise,
-                        self.add_noise(latent, aug_noise, cond_noise_scale),
-                        task="sr",
-                    )
-                    for noise, aug_noise, latent in zip(noises, aug_noises, latents_padded)
-                ]
-
-                # Diffusion only (no VAE decode yet).
-                output_latents = self.diffuse(noises, conditions, cfg_scale, cfg_rescale)
-
-                # Crop back to unpadded latent size.
-                output_latents = [self._crop_latent(lat, latent_pad_h, latent_pad_w) for lat in output_latents]
                 output_latents = [lat.to(self.vae.dtype) for lat in output_latents]
 
                 # VAE decode with seamless circular tiling.
