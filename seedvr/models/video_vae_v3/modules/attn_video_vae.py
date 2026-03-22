@@ -1432,7 +1432,7 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
             overlap_w = size_w - stride_w
             # Circular-pad the latent input
             hidden_states = F.pad(
-                hidden_states, (overlap_w, overlap_w, overlap_h, overlap_h), mode="circular"
+                hidden_states, (overlap_w, overlap_w, overlap_h, overlap_h, 0, 0), mode="circular"
             )
             _, _, T, H_padded, W_padded = hidden_states.shape
         else:
@@ -1610,7 +1610,7 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
 
             overlap_h = size_h - stride_h
             overlap_w = size_w - stride_w
-            video = F.pad(video, (overlap_w, overlap_w, overlap_h, overlap_h), mode="circular")
+            video = F.pad(video, (overlap_w, overlap_w, overlap_h, overlap_h, 0, 0), mode="circular")
             _, _, T, H_padded, W_padded = video.shape
         else:
             overlap_h = overlap_w = 0
