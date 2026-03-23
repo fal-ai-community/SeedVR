@@ -1206,6 +1206,7 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
         use_tqdm: bool = True,
         tile_size: tuple[int, int] = DEFAULT_LATENT_TILE_SIZE,
         tile_stride: tuple[int, int] = DEFAULT_LATENT_TILE_STRIDE,
+        seamless: bool = False,
     ) -> AutoencoderKLOutput:
         h = self.slicing_encode(
             x,
@@ -1213,6 +1214,7 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
             use_tqdm=use_tqdm,
             tile_size=tile_size,
             tile_stride=tile_stride,
+            seamless=seamless,
         )
         posterior = DiagonalGaussianDistribution(h)
 
@@ -1230,6 +1232,7 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
         use_tqdm: bool = True,
         tile_size: tuple[int, int] = DEFAULT_PIXEL_TILE_SIZE,
         tile_stride: tuple[int, int] = DEFAULT_PIXEL_TILE_STRIDE,
+        seamless: bool = False,
     ) -> DecoderOutput | torch.Tensor:
         decoded = self.slicing_decode(
             z,
@@ -1237,6 +1240,7 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
             use_tqdm=use_tqdm,
             tile_size=tile_size,
             tile_stride=tile_stride,
+            seamless=seamless,
         )
 
         if not return_dict:
@@ -1273,6 +1277,7 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
         use_tqdm: bool = True,
         tile_size: tuple[int, int] = DEFAULT_LATENT_TILE_SIZE,
         tile_stride: tuple[int, int] = DEFAULT_LATENT_TILE_STRIDE,
+        seamless: bool = False,
     ) -> torch.Tensor:
         sp_size = get_sequence_parallel_world_size()
         if self.use_slicing and (x.shape[2] - 1) > self.slicing_sample_min_size * sp_size:
@@ -1290,6 +1295,7 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
                     use_tiling=use_tiling,
                     tile_size=tile_size,
                     tile_stride=tile_stride,
+                    seamless=seamless,
                 )
             ]
             if progress_bar is not None:
@@ -1304,6 +1310,7 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
                         use_tiling=use_tiling,
                         tile_size=tile_size,
                         tile_stride=tile_stride,
+                        seamless=seamless,
                     )
                 )
                 if progress_bar is not None:
@@ -1319,6 +1326,7 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
                 use_tiling=use_tiling,
                 tile_size=tile_size,
                 tile_stride=tile_stride,
+                seamless=seamless,
             )
 
     def slicing_decode(
@@ -1328,6 +1336,7 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
         use_tqdm: bool = True,
         tile_size: tuple[int, int] = DEFAULT_PIXEL_TILE_SIZE,
         tile_stride: tuple[int, int] = DEFAULT_PIXEL_TILE_STRIDE,
+        seamless: bool = False,
     ) -> torch.Tensor:
         sp_size = get_sequence_parallel_world_size()
         if self.use_slicing and (z.shape[2] - 1) > self.slicing_latent_min_size * sp_size:
@@ -1345,6 +1354,7 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
                     use_tiling=use_tiling,
                     tile_size=tile_size,
                     tile_stride=tile_stride,
+                    seamless=seamless,
                 )
             ]
             if progress_bar is not None:
@@ -1359,6 +1369,7 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
                         use_tiling=use_tiling,
                         tile_size=tile_size,
                         tile_stride=tile_stride,
+                        seamless=seamless,
                     )
                 )
                 if progress_bar is not None:
@@ -1375,6 +1386,7 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
                 use_tqdm=use_tqdm,
                 tile_size=tile_size,
                 tile_stride=tile_stride,
+                seamless=seamless,
             )
 
     @torch.no_grad()
@@ -1388,12 +1400,14 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
         use_tqdm: bool = True,
         memory_state: MemoryState = MemoryState.DISABLED,
         use_tiling: bool = True,
+        seamless: bool = False,
     ) -> torch.Tensor | None:
         """
         :param hidden_states: hidden states tensor [B, C, T, H, W]
         :param device: device
         :param tile_size: tile size
         :param tile_stride: tile stride
+        :param seamless: if True, use circular tiling for seamless output
         :return: output tensor [B, C, T, H, W]
         """
         if not use_tiling:
@@ -1409,6 +1423,22 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
         stride_h = min(stride_h, size_h)
         stride_w = min(stride_w, size_w)
 
+        # For seamless mode: circular-pad the input by the overlap amount,
+        # tile the padded version with NO boundary flags, then crop output.
+        if seamless:
+            import torch.nn.functional as F
+
+            overlap_h = size_h - stride_h
+            overlap_w = size_w - stride_w
+            # Circular-pad the latent input
+            hidden_states = F.pad(
+                hidden_states, (overlap_w, overlap_w, overlap_h, overlap_h, 0, 0), mode="circular"
+            )
+            _, _, T, H_padded, W_padded = hidden_states.shape
+        else:
+            overlap_h = overlap_w = 0
+            H_padded, W_padded = H, W
+
         is_distributed = False
         rank = 0
         world_size = 1
@@ -1418,10 +1448,10 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
             rank = dist.get_rank()
             is_distributed = world_size > 1
 
-        # Split tasks
+        # Split tasks over the (possibly padded) spatial dims
         tasks = sliding_2d_windows(
-            height=H,
-            width=W,
+            height=H_padded,
+            width=W_padded,
             tile_size=(size_w, size_h),
             tile_stride=(stride_w, stride_h),
         )
@@ -1430,16 +1460,13 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
         if is_distributed:
             # Distribute tasks among ranks
             if len(tasks) < world_size:
-                # If fewer tasks than ranks, distribute one task per rank until we run out
                 if rank < len(tasks):
                     local_tasks = [tasks[rank]]
                 else:
                     local_tasks = []
             else:
-                # Distribute tasks evenly
                 tasks_per_rank = len(tasks) // world_size
                 remainder = len(tasks) % world_size
-
                 start_idx = rank * tasks_per_rank + min(rank, remainder)
                 end_idx = start_idx + tasks_per_rank + (1 if rank < remainder else 0)
                 local_tasks = tasks[start_idx:end_idx]
@@ -1455,25 +1482,16 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
             computation_device = device
 
         out_T = T * 4 - 3
+        sdf = self.spatial_downsample_factor
+        out_H = H_padded * sdf
+        out_W = W_padded * sdf
         weight = torch.zeros(
-            (
-                1,
-                1,
-                out_T,
-                H * self.spatial_downsample_factor,
-                W * self.spatial_downsample_factor,
-            ),
+            (1, 1, out_T, out_H, out_W),
             dtype=hidden_states.dtype,
             device=data_device,
         )
         values = torch.zeros(
-            (
-                1,
-                3,
-                out_T,
-                H * self.spatial_downsample_factor,
-                W * self.spatial_downsample_factor,
-            ),
+            (1, 3, out_T, out_H, out_W),
             dtype=hidden_states.dtype,
             device=data_device,
         )
@@ -1489,17 +1507,23 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
             hidden_states_batch.clamp_(-1, 1)
             hidden_states_batch = hidden_states_batch[:, :, :out_T]
 
+            if seamless:
+                # No boundary flags — all edges get ramp blending
+                is_bound = (False, False, False, False)
+            else:
+                is_bound = (h == 0, h_ >= H_padded, w == 0, w_ >= W_padded)
+
             mask = self.build_mask(
                 hidden_states_batch,
-                is_bound=(h == 0, h_ >= H, w == 0, w_ >= W),
+                is_bound=is_bound,
                 border_width=(
-                    (size_h - stride_h) * self.spatial_downsample_factor,
-                    (size_w - stride_w) * self.spatial_downsample_factor,
+                    (size_h - stride_h) * sdf,
+                    (size_w - stride_w) * sdf,
                 ),
             ).to(dtype=hidden_states.dtype, device=data_device)
 
-            target_h = h * self.spatial_downsample_factor
-            target_w = w * self.spatial_downsample_factor
+            target_h = h * sdf
+            target_w = w * sdf
             values[
                 :,
                 :,
@@ -1521,22 +1545,28 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
         if is_distributed:
             value_reduce = dist.reduce(values, dst=0, op=dist.ReduceOp.SUM, async_op=True)
             weight_reduce = dist.reduce(weight, dst=0, op=dist.ReduceOp.SUM, async_op=True)
-
-            # Wait for the reduction to complete
             value_reduce.wait()
             weight_reduce.wait()
             torch.cuda.synchronize() if device.type == "cuda" else None
 
             if rank == 0:
-                # Distributed case, only return values on rank 0
                 values = values / weight
                 values = values.float().clamp_(-1, 1)
+                if seamless:
+                    # Crop out the circular padding from pixel-space output
+                    crop_h = overlap_h * sdf
+                    crop_w = overlap_w * sdf
+                    values = values[:, :, :, crop_h : crop_h + H * sdf, crop_w : crop_w + W * sdf]
                 return values.to("cpu")
             return None
         else:
-            # Non-distributed case
             values = values / weight
             values = values.float().clamp_(-1, 1)
+            if seamless:
+                # Crop out the circular padding from pixel-space output
+                crop_h = overlap_h * sdf
+                crop_w = overlap_w * sdf
+                values = values[:, :, :, crop_h : crop_h + H * sdf, crop_w : crop_w + W * sdf]
             return values.to("cpu")
 
     @torch.no_grad()
@@ -1549,6 +1579,7 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
         use_tqdm: bool = True,
         memory_state: MemoryState = MemoryState.DISABLED,
         use_tiling: bool = True,
+        seamless: bool = False,
     ) -> torch.Tensor:
         """
         :param video: video tensor [B, C, T, H, W]
@@ -1558,6 +1589,7 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
         :param use_tqdm: whether to use tqdm
         :param memory_state: memory state
         :param use_tiling: whether to use tiling
+        :param seamless: if True, use circular tiling for seamless output
         :return: output tensor [B, C, T, H, W]
         """
         if not use_tiling:
@@ -1571,6 +1603,19 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
         size_h, size_w = tile_size
         stride_h, stride_w = tile_stride
 
+        # For seamless mode: circular-pad the pixel input by the overlap amount,
+        # tile the padded version with NO boundary flags, then crop the latent output.
+        if seamless:
+            import torch.nn.functional as F
+
+            overlap_h = size_h - stride_h
+            overlap_w = size_w - stride_w
+            video = F.pad(video, (overlap_w, overlap_w, overlap_h, overlap_h, 0, 0), mode="circular")
+            _, _, T, H_padded, W_padded = video.shape
+        else:
+            overlap_h = overlap_w = 0
+            H_padded, W_padded = H, W
+
         is_distributed = False
         rank = 0
         world_size = 1
@@ -1580,28 +1625,24 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
             rank = dist.get_rank()
             is_distributed = world_size > 1
 
-        # Split tasks
+        # Split tasks over the (possibly padded) spatial dims
         tasks = sliding_2d_windows(
-            height=H,
-            width=W,
+            height=H_padded,
+            width=W_padded,
             tile_size=(size_w, size_h),
             tile_stride=(stride_w, stride_h),
         )
 
         # Handle distributed processing
         if is_distributed:
-            # Distribute tasks among ranks
             if len(tasks) < world_size:
-                # If fewer tasks than ranks, distribute one task per rank until we run out
                 if rank < len(tasks):
                     local_tasks = [tasks[rank]]
                 else:
                     local_tasks = []
             else:
-                # Distribute tasks evenly
                 tasks_per_rank = len(tasks) // world_size
                 remainder = len(tasks) % world_size
-
                 start_idx = rank * tasks_per_rank + min(rank, remainder)
                 end_idx = start_idx + tasks_per_rank + (1 if rank < remainder else 0)
                 local_tasks = tasks[start_idx:end_idx]
@@ -1616,26 +1657,17 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
             data_device = torch.device("cpu")
             computation_device = device
 
+        sdf = self.spatial_downsample_factor
         out_T = (T + 3) // 4
+        out_H = H_padded // sdf
+        out_W = W_padded // sdf
         weight = torch.zeros(
-            (
-                1,
-                1,
-                out_T,
-                H // self.spatial_downsample_factor,
-                W // self.spatial_downsample_factor,
-            ),
+            (1, 1, out_T, out_H, out_W),
             dtype=video.dtype,
             device=data_device,
         )
         values = torch.zeros(
-            (
-                1,
-                self.config.latent_channels * 2,
-                out_T,
-                H // self.spatial_downsample_factor,
-                W // self.spatial_downsample_factor,
-            ),
+            (1, self.config.latent_channels * 2, out_T, out_H, out_W),
             dtype=video.dtype,
             device=data_device,
         )
@@ -1650,17 +1682,22 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
                 data_device
             )
 
+            if seamless:
+                is_bound = (False, False, False, False)
+            else:
+                is_bound = (h == 0, h_ >= H_padded, w == 0, w_ >= W_padded)
+
             mask = self.build_mask(
                 hidden_states_batch,
-                is_bound=(h == 0, h_ >= H, w == 0, w_ >= W),
+                is_bound=is_bound,
                 border_width=(
-                    (size_h - stride_h) // self.spatial_downsample_factor,
-                    (size_w - stride_w) // self.spatial_downsample_factor,
+                    (size_h - stride_h) // sdf,
+                    (size_w - stride_w) // sdf,
                 ),
             ).to(dtype=video.dtype, device=data_device)
 
-            target_h = h // self.spatial_downsample_factor
-            target_w = w // self.spatial_downsample_factor
+            target_h = h // sdf
+            target_w = w // sdf
             values[
                 :,
                 :,
@@ -1684,18 +1721,22 @@ class VideoAutoencoderKL(diffusers.AutoencoderKL):
         if is_distributed:
             value_reduce = dist.all_reduce(values, op=dist.ReduceOp.SUM, async_op=True)
             weight_reduce = dist.all_reduce(weight, op=dist.ReduceOp.SUM, async_op=True)
-
-            # Wait for the reduction to complete
             value_reduce.wait()
             weight_reduce.wait()
             torch.cuda.synchronize() if device.type == "cuda" else None
 
-            # All ranks return the same values
             values = values / weight
+            if seamless:
+                crop_h = overlap_h // sdf
+                crop_w = overlap_w // sdf
+                values = values[:, :, :, crop_h : crop_h + H // sdf, crop_w : crop_w + W // sdf]
             return values
         else:
-            # Non-distributed case
             values = values / weight
+            if seamless:
+                crop_h = overlap_h // sdf
+                crop_w = overlap_w // sdf
+                values = values[:, :, :, crop_h : crop_h + H // sdf, crop_w : crop_w + W // sdf]
             return values.to(device)
 
     def build_1d_mask(
@@ -1854,6 +1895,7 @@ class VideoAutoencoderKLWrapper(
         use_tqdm: bool = True,
         tile_size: tuple[int, int] = DEFAULT_LATENT_TILE_SIZE,
         tile_stride: tuple[int, int] = DEFAULT_LATENT_TILE_STRIDE,
+        seamless: bool = False,
     ) -> CausalEncoderOutput:
         if x.ndim == 4:
             x = x.unsqueeze(2)
@@ -1865,6 +1907,7 @@ class VideoAutoencoderKLWrapper(
                 use_tqdm=use_tqdm,
                 tile_size=tile_size,
                 tile_stride=tile_stride,
+                seamless=seamless,
             )
             .latent_dist
         )
@@ -1878,6 +1921,7 @@ class VideoAutoencoderKLWrapper(
         use_tqdm: bool = True,
         tile_size: tuple[int, int] = DEFAULT_LATENT_TILE_SIZE,
         tile_stride: tuple[int, int] = DEFAULT_LATENT_TILE_STRIDE,
+        seamless: bool = False,
     ) -> CausalDecoderOutput:
         if z.ndim == 4:
             z = z.unsqueeze(2)
@@ -1889,6 +1933,7 @@ class VideoAutoencoderKLWrapper(
                 use_tqdm=use_tqdm,
                 tile_size=tile_size,
                 tile_stride=tile_stride,
+                seamless=seamless,
             )
             .sample.squeeze(2)
         )

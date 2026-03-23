@@ -135,6 +135,7 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
         use_tqdm: bool = True,
         tile_size: tuple[int, int] = DEFAULT_PIXEL_TILE_SIZE,
         tile_stride: tuple[int, int] = DEFAULT_PIXEL_TILE_STRIDE,
+        seamless: bool = False,
     ) -> list[Tensor]:
         latents = []
         if len(samples) > 0:
@@ -144,15 +145,9 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
             shift = getattr(self.vae.config, "shifting_factor", 0.0)
 
             if isinstance(scale, ListConfig):
-                scale = torch.tensor(scale, device="cpu", dtype=dtype, pin_memory=True).to(
-                    device=device,
-                    non_blocking=True,
-                )
+                scale = torch.tensor(scale, device=device, dtype=dtype)
             if isinstance(shift, ListConfig):
-                shift = torch.tensor(shift, device="cpu", dtype=dtype, pin_memory=True).to(
-                    device=device,
-                    non_blocking=True,
-                )
+                shift = torch.tensor(shift, device=device, dtype=dtype)
 
             # Group samples of the same shape to batches if enabled.
             if self.vae.grouping:
@@ -172,6 +167,7 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
                         use_tqdm=use_tqdm,
                         tile_size=tile_size,
                         tile_stride=tile_stride,
+                        seamless=seamless,
                     ).latent
                 else:
                     # Deterministic vae encode, only used for i2v inference (optionally)
@@ -182,6 +178,7 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
                             use_tqdm=use_tqdm,
                             tile_size=tile_size,
                             tile_stride=tile_stride,
+                            seamless=seamless,
                         )
                         .posterior.mode()
                         .squeeze(2)
@@ -207,6 +204,7 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
         use_tqdm: bool = True,
         tile_size: tuple[int, int] = DEFAULT_LATENT_TILE_SIZE,
         tile_stride: tuple[int, int] = DEFAULT_LATENT_TILE_STRIDE,
+        seamless: bool = False,
     ) -> list[Tensor]:
         samples = []
         if len(latents) > 0:
@@ -216,15 +214,9 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
             shift = getattr(self.vae.config, "shifting_factor", 0.0)
 
             if isinstance(scale, ListConfig):
-                scale = torch.tensor(scale, device="cpu", dtype=dtype, pin_memory=True).to(
-                    device=device,
-                    non_blocking=True,
-                )
+                scale = torch.tensor(scale, device=device, dtype=dtype)
             if isinstance(shift, ListConfig):
-                shift = torch.tensor(shift, device="cpu", dtype=dtype, pin_memory=True).to(
-                    device=device,
-                    non_blocking=True,
-                )
+                shift = torch.tensor(shift, device=device, dtype=dtype)
 
             # Group latents of the same shape to batches if enabled.
             if self.vae.grouping:
@@ -244,6 +236,7 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
                     use_tqdm=use_tqdm,
                     tile_size=tile_size,
                     tile_stride=tile_stride,
+                    seamless=seamless,
                 ).sample
                 if hasattr(self.vae, "postprocess"):
                     sample = self.vae.postprocess(sample)
@@ -258,24 +251,17 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
         return samples
 
     @torch.no_grad()
-    def inference(
+    def diffuse(
         self,
         noises: list[Tensor],
         conditions: list[Tensor],
         cfg_scale: float,
         cfg_rescale: float = 0.0,
-        dit_offload: bool = False,
-        use_tiling: bool = True,
-        use_tqdm: bool = True,
-        tile_size_pixel: tuple[int, int] = DEFAULT_PIXEL_TILE_SIZE,
-        tile_stride_pixel: tuple[int, int] = DEFAULT_PIXEL_TILE_STRIDE,
-        tile_size_latent: tuple[int, int] = DEFAULT_LATENT_TILE_SIZE,
-        tile_stride_latent: tuple[int, int] = DEFAULT_LATENT_TILE_STRIDE,
     ) -> list[Tensor]:
+        """Run diffusion sampling only, returning output latents in (T,H,W,C) format."""
         assert len(noises) == len(conditions)
         batch_size = len(noises)
 
-        # Return if empty.
         if batch_size == 0:
             return []
 
@@ -283,7 +269,9 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
         latents, latents_shapes = flatten(noises)
         latents_cond, _ = flatten(conditions)
 
-        # Sampling.
+        was_training = self.dit.training
+        self.dit.eval()
+
         latents = self.sampler.sample(
             x=latents,
             f=lambda args: classifier_free_guidance_dispatcher(
@@ -306,11 +294,29 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
             ),
         )
 
-        # Unflatten.
-        latents = unflatten(latents, latents_shapes)
+        self.dit.train(was_training)
+
+        return unflatten(latents, latents_shapes)
+
+    @torch.no_grad()
+    def inference(
+        self,
+        noises: list[Tensor],
+        conditions: list[Tensor],
+        cfg_scale: float,
+        cfg_rescale: float = 0.0,
+        dit_offload: bool = False,
+        use_tiling: bool = True,
+        use_tqdm: bool = True,
+        tile_size_pixel: tuple[int, int] = DEFAULT_PIXEL_TILE_SIZE,
+        tile_stride_pixel: tuple[int, int] = DEFAULT_PIXEL_TILE_STRIDE,
+        tile_size_latent: tuple[int, int] = DEFAULT_LATENT_TILE_SIZE,
+        tile_stride_latent: tuple[int, int] = DEFAULT_LATENT_TILE_STRIDE,
+    ) -> list[Tensor]:
+        """Run diffusion + VAE decode in one step (used for non-seamless path)."""
+        latents = self.diffuse(noises, conditions, cfg_scale, cfg_rescale)
         latents = [latent.to(self.vae.dtype) for latent in latents]
 
-        # Vae decode.
         samples = self.vae_decode(
             latents,
             use_tiling=use_tiling,
@@ -379,16 +385,8 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
         """
         Add noise to the input.
         """
-        t = (
-            torch.tensor([self.sampler.timesteps.T], device="cpu", pin_memory=True)
-            .to(device=x.device, non_blocking=True)
-            * cond_noise_scale
-        )
-        shape = (
-            torch.tensor(x.shape[1:], device="cpu", pin_memory=True)
-            .to(device=x.device, non_blocking=True)
-            .unsqueeze(0)
-        )
+        t = torch.tensor([self.sampler.timesteps.T], device=x.device) * cond_noise_scale
+        shape = torch.tensor(x.shape[1:], device=x.device).unsqueeze(0)
         t = self.timestep_transform(t, shape)
         x = self.sampler.schedule.forward(x, aug_noise, t)
         return x
@@ -414,6 +412,217 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
     def _clear_vae_memory(self) -> None:
         self._clear_module_memory(self.vae)
 
+    @staticmethod
+    def _circular_pad_latent(latent: torch.Tensor, pad_h: int, pad_w: int) -> torch.Tensor:
+        """
+        Circular-pad a latent tensor along spatial dimensions.
+        Expects latent shape (T, H, W, C) — the format used after vae_encode rearrange.
+        """
+        import torch.nn.functional as F
+
+        # (T, H, W, C) -> (T, C, H, W) -> pad -> (T, C, H', W') -> (T, H', W', C)
+        t, h, w, c = latent.shape
+        x = latent.permute(0, 3, 1, 2)  # T, C, H, W
+        x = F.pad(x, (pad_w, pad_w, pad_h, pad_h), mode="circular")
+        return x.permute(0, 2, 3, 1)  # T, H', W', C
+
+    @staticmethod
+    def _crop_latent(latent: torch.Tensor, pad_h: int, pad_w: int) -> torch.Tensor:
+        """
+        Crop circular padding from a latent tensor.
+        Expects latent shape (T, H, W, C).
+        """
+        return latent[:, pad_h:-pad_h, pad_w:-pad_w, :]
+
+    @staticmethod
+    def _slice_latent_2d(
+        latent: torch.Tensor,
+        top: int, bottom: int, left: int, right: int,
+        height: int, width: int,
+    ) -> torch.Tensor:
+        """
+        Extract a 2D spatial window from a (T, H, W, C) latent with wrap-around.
+        top/bottom/left/right may exceed height/width to indicate wrapping.
+        """
+        wrap_y = bottom > height
+        wrap_x = right > width
+
+        if not wrap_y and not wrap_x:
+            return latent[:, top:bottom, left:right, :].clone()
+
+        if wrap_y:
+            overflow_y = bottom - height
+            lat_y = torch.cat([latent[:, top:height, :, :], latent[:, :overflow_y, :, :]], dim=1)
+        else:
+            lat_y = latent[:, top:bottom, :, :]
+
+        if wrap_x:
+            overflow_x = right - width
+            return torch.cat([lat_y[:, :, left:width, :], lat_y[:, :, :overflow_x, :]], dim=2)
+        else:
+            return lat_y[:, :, left:right, :].clone()
+
+    @staticmethod
+    def _fill_latent_2d(
+        target: torch.Tensor,
+        count: torch.Tensor,
+        value: torch.Tensor,
+        mask: torch.Tensor,
+        top: int, bottom: int, left: int, right: int,
+        height: int, width: int,
+    ) -> None:
+        """
+        Write a tiled value back into the target (T, H, W, C) with bilinear mask
+        and wrap-around. count is (T, H, W, 1).
+        """
+        wrap_y = bottom > height
+        wrap_x = right > width
+
+        end_y = height if wrap_y else bottom
+        end_x = width if wrap_x else right
+        h_main = end_y - top
+        w_main = end_x - left
+
+        masked = value * mask
+
+        target[:, top:end_y, left:end_x, :] += masked[:, :h_main, :w_main, :]
+        count[:, top:end_y, left:end_x, :] += mask[:, :h_main, :w_main, :]
+
+        if wrap_x:
+            overflow_x = right - width
+            target[:, top:end_y, :overflow_x, :] += masked[:, :h_main, w_main:, :]
+            count[:, top:end_y, :overflow_x, :] += mask[:, :h_main, w_main:, :]
+            if wrap_y:
+                overflow_y = bottom - height
+                target[:, :overflow_y, :overflow_x, :] += masked[:, h_main:, w_main:, :]
+                count[:, :overflow_y, :overflow_x, :] += mask[:, h_main:, w_main:, :]
+
+        if wrap_y:
+            overflow_y = bottom - height
+            target[:, :overflow_y, left:end_x, :] += masked[:, h_main:, :w_main, :]
+            count[:, :overflow_y, left:end_x, :] += mask[:, h_main:, :w_main, :]
+
+    @staticmethod
+    def _make_bilinear_mask_thwc(
+        t_dim: int, tile_h: int, tile_w: int,
+        feather_ratio: float = 0.25,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> torch.Tensor:
+        """
+        Create a bilinear feathering mask in (T, H, W, 1) format.
+        Feathers all spatial edges (for seamless tiling).
+        """
+        mask_h = torch.ones(tile_h, device=device, dtype=dtype)
+        mask_w = torch.ones(tile_w, device=device, dtype=dtype)
+
+        feather_h = max(1, int(feather_ratio * tile_h))
+        feather_w = max(1, int(feather_ratio * tile_w))
+
+        for i in range(feather_h):
+            w = (i + 1) / (feather_h + 1)
+            mask_h[i] = min(mask_h[i].item(), w)
+            mask_h[tile_h - 1 - i] = min(mask_h[tile_h - 1 - i].item(), w)
+        for i in range(feather_w):
+            w = (i + 1) / (feather_w + 1)
+            mask_w[i] = min(mask_w[i].item(), w)
+            mask_w[tile_w - 1 - i] = min(mask_w[tile_w - 1 - i].item(), w)
+
+        # Outer product → (H, W), take elementwise min like z-image
+        mask_2d = torch.min(
+            mask_h.unsqueeze(1).expand(tile_h, tile_w),
+            mask_w.unsqueeze(0).expand(tile_h, tile_w),
+        )
+        # Expand to (T, H, W, 1) — broadcasts across channels
+        return mask_2d.unsqueeze(0).unsqueeze(-1).expand(t_dim, tile_h, tile_w, 1)
+
+    @torch.no_grad()
+    def diffuse_seamless(
+        self,
+        latent: torch.Tensor,
+        noise: torch.Tensor,
+        aug_noise: torch.Tensor,
+        cond_noise_scale: float,
+        cfg_scale: float,
+        cfg_rescale: float,
+        tile_size: tuple[int, int] = (32, 32),
+        tile_stride: tuple[int, int] = (16, 16),
+    ) -> torch.Tensor:
+        """
+        Tiled multidiffusion with wrap-around for seamless output.
+
+        Operates on a single latent (T, H, W, C). Extracts overlapping
+        windows with wrap-around, runs diffusion on each window, blends
+        the results with bilinear masks.
+
+        Args:
+            latent: Condition latent (T, H, W, C) — from VAE encode.
+            noise: Initial noise (T, H, W, C) — same shape as latent.
+            aug_noise: Augmentation noise (T, H, W, C).
+            cond_noise_scale: Noise scale for conditioning.
+            cfg_scale: CFG scale.
+            cfg_rescale: CFG rescale.
+            tile_size: (tile_h, tile_w) in latent pixels.
+            tile_stride: (stride_h, stride_w) in latent pixels.
+
+        Returns:
+            Output latent (T, H, W, C) — seamlessly tileable.
+        """
+        from seedvr.common.utils import sliding_2d_windows
+
+        t_dim, h_lat, w_lat, c_lat = latent.shape
+        tile_h, tile_w = tile_size
+        stride_h, stride_w = tile_stride
+
+        # Clamp tile/stride to latent size
+        tile_h = min(tile_h, h_lat)
+        tile_w = min(tile_w, w_lat)
+        stride_h = min(stride_h, tile_h)
+        stride_w = min(stride_w, tile_w)
+
+        # Generate windows with wrap-around (windows can extend past h_lat/w_lat)
+        windows: list[tuple[int, int, int, int]] = []
+        for y in range(0, h_lat, stride_h):
+            for x in range(0, w_lat, stride_w):
+                windows.append((y, y + tile_h, x, x + tile_w))
+
+        # Accumulation buffers
+        output_acc = torch.zeros_like(latent)
+        output_count = torch.zeros(
+            (t_dim, h_lat, w_lat, 1), device=latent.device, dtype=latent.dtype
+        )
+        blend_mask = self._make_bilinear_mask_thwc(
+            t_dim, tile_h, tile_w,
+            device=latent.device, dtype=latent.dtype,
+        )
+
+        # Process each window
+        for top, bottom, left, right in maybe_use_tqdm(windows, desc="Seamless diffusion", use_tqdm=True):
+            # Extract window with wrap-around
+            win_latent = self._slice_latent_2d(latent, top, bottom, left, right, h_lat, w_lat)
+            win_noise = self._slice_latent_2d(noise, top, bottom, left, right, h_lat, w_lat)
+            win_aug = self._slice_latent_2d(aug_noise, top, bottom, left, right, h_lat, w_lat)
+
+            # Build condition for this window
+            win_cond = self.get_condition(
+                win_noise,
+                self.add_noise(win_latent, win_aug, cond_noise_scale),
+                task="sr",
+            )
+
+            # Run diffusion on this window
+            win_output = self.diffuse([win_noise], [win_cond], cfg_scale, cfg_rescale)
+            win_output = win_output[0]  # Single item list → (T, H, W, C)
+
+            # Blend into accumulation buffer with wrap-around
+            self._fill_latent_2d(
+                output_acc, output_count, win_output, blend_mask,
+                top, bottom, left, right, h_lat, w_lat,
+            )
+
+        # Normalize by blend count
+        return output_acc / output_count.clamp(min=1)
+
     @torch.no_grad()
     def __call__(
         self,
@@ -431,9 +640,18 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
         tile_size_pixel: tuple[int, int] = (384, 384),
         tile_stride_latent: tuple[int, int] = (32, 32),
         tile_stride_pixel: tuple[int, int] = (256, 256),
+        seamless: bool = False,
+        tile_size_diffuse: tuple[int, int] = (48, 48),
+        tile_stride_diffuse: tuple[int, int] = (32, 32),
     ) -> torch.Tensor:
         """
         Generate a video from a media.
+
+        Args:
+            seamless: If True, produce seamlessly tileable output. The VAE's tiled
+                encode/decode use circular padding so tiles wrap around edges
+                (no boundary artifacts). The diffusion step uses tiled multidiffusion
+                with wrap-around windows and bilinear blending.
         """
         assert media.ndim == 4, "Media must be in CFHW format"
         c, f, h, w = media.shape
@@ -452,6 +670,7 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
             seed = random.randint(0, 2**32 - 1)
 
         generator = torch.Generator(device=get_device()).manual_seed(seed)
+
         # Prepare media for inference.
         media_area = h * w
         scale = math.sqrt(target_area / media_area)
@@ -483,48 +702,77 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
                     [batch_media] + [batch_media[:, -1:]] * num_padded_frames, dim=1
                 )
 
+            # VAE encode — seamless flag enables circular tiling in the VAE.
             latents = self.vae_encode(
                 [batch_media],
                 use_tiling=use_tiling,
                 use_tqdm=use_tqdm and num_batches == 1,
                 tile_size=tile_size_pixel,
                 tile_stride=tile_stride_pixel,
+                seamless=seamless,
             )
             latents = [latent.to(self.dit.dtype) for latent in latents]
-            noises = [self.random_seeded_like(latent, generator) for latent in latents]
-            aug_noises = [self.random_seeded_like(latent, generator) for latent in latents]
-            conditions = [
-                self.get_condition(
-                    noise,
-                    self.add_noise(latent, aug_noise, cond_noise_scale),
-                    task="sr",
+
+            if seamless:
+                # Multidiffusion with wrap-around: run diffusion on overlapping
+                # windows that wrap around edges, blend with bilinear masks.
+                output_latents = []
+                for latent in latents:
+                    noise = self.random_seeded_like(latent, generator)
+                    aug_noise = self.random_seeded_like(latent, generator)
+                    out = self.diffuse_seamless(
+                        latent, noise, aug_noise,
+                        cond_noise_scale=cond_noise_scale,
+                        cfg_scale=cfg_scale,
+                        cfg_rescale=cfg_rescale,
+                        tile_size=tile_size_diffuse,
+                        tile_stride=tile_stride_diffuse,
+                    )
+                    output_latents.append(out)
+
+                output_latents = [lat.to(self.vae.dtype) for lat in output_latents]
+
+                # VAE decode with seamless circular tiling.
+                samples = self.vae_decode(
+                    output_latents,
+                    use_tiling=use_tiling,
+                    use_tqdm=use_tqdm and num_batches == 1,
+                    tile_size=tile_size_latent,
+                    tile_stride=tile_stride_latent,
+                    seamless=seamless,
                 )
-                for noise, aug_noise, latent in zip(noises, aug_noises, latents)
-            ]
-            samples = self.inference(
-                noises,
-                conditions,
-                cfg_scale,
-                cfg_rescale,
-                use_tiling=use_tiling,
-                use_tqdm=use_tqdm and num_batches == 1,
-                tile_size_pixel=tile_size_pixel,
-                tile_stride_pixel=tile_stride_pixel,
-                tile_size_latent=tile_size_latent,
-                tile_stride_latent=tile_stride_latent,
-            )
+            else:
+                noises = [self.random_seeded_like(latent, generator) for latent in latents]
+                aug_noises = [self.random_seeded_like(latent, generator) for latent in latents]
+                conditions = [
+                    self.get_condition(
+                        noise,
+                        self.add_noise(latent, aug_noise, cond_noise_scale),
+                        task="sr",
+                    )
+                    for noise, aug_noise, latent in zip(noises, aug_noises, latents)
+                ]
+                samples = self.inference(
+                    noises,
+                    conditions,
+                    cfg_scale,
+                    cfg_rescale,
+                    use_tiling=use_tiling,
+                    use_tqdm=use_tqdm and num_batches == 1,
+                    tile_size_pixel=tile_size_pixel,
+                    tile_stride_pixel=tile_stride_pixel,
+                    tile_size_latent=tile_size_latent,
+                    tile_stride_latent=tile_stride_latent,
+                )
+
             samples = [sample.unsqueeze(1) if sample.ndim == 3 else sample for sample in samples]
 
             batch_media = rearrange(batch_media, "c t h w -> t c h w").to(
-                self.wavelet_kernel.device,
-                dtype=self.wavelet_kernel.dtype,
-                non_blocking=True,
+                self.wavelet_kernel.device, dtype=self.wavelet_kernel.dtype
             )
             samples = [
                 rearrange(sample, "c t h w -> t c h w").to(
-                    self.wavelet_kernel.device,
-                    dtype=self.wavelet_kernel.dtype,
-                    non_blocking=True,
+                    self.wavelet_kernel.device, dtype=self.wavelet_kernel.dtype
                 )
                 for sample in samples
             ]
@@ -532,7 +780,7 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
                 batch_media = batch_media[:-num_padded_frames]
                 samples = [sample[:-num_padded_frames] for sample in samples]
             samples = [
-                wavelet_reconstruction(sample, batch_media, self.wavelet_kernel)
+                wavelet_reconstruction(sample, batch_media, self.wavelet_kernel, seamless=seamless)
                 for sample in samples
             ]
             samples = [
@@ -546,18 +794,12 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
                 .cpu()
                 for sample in samples
             ]
-            # if batch_idx > 0 and overlap > 0:
-            #    samples = [sample[overlap:] for sample in samples]
 
             output_samples.append(samples)
             self._clear_vae_memory()
 
         if len(output_samples) == 0 or len(output_samples[0]) == 0:
             return []
-
-        # output_samples = [torch.cat(samples, dim=0) for samples in zip(*output_samples)]
-        # torch.cuda.empty_cache()
-        # return output_samples[0].permute(1, 0, 2, 3)
 
         # Simple approach: just concatenate all frames, skipping overlaps after the first batch
         all_frames = []
@@ -583,4 +825,6 @@ class SeedVRPipeline(FlashPackDiffusionPipeline):
             combined_video = combined_video[:f]
 
         # t c h w -> c t h w
-        return combined_video.permute(1, 0, 2, 3)
+        result = combined_video.permute(1, 0, 2, 3)
+
+        return result
