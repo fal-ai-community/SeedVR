@@ -1,1 +1,1 @@
-Fix timestep transform device mismatch
+Make pin_memory compile-safe in DiT utilities

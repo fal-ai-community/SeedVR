@@ -19,6 +19,11 @@ import einops
 import torch
 
 
+def maybe_pin_memory(tensor: torch.Tensor) -> torch.Tensor:
+    is_compiling = getattr(torch.compiler, "is_compiling", lambda: False)
+    return tensor if is_compiling() else tensor.pin_memory()
+
+
 def flatten(
     hid: list[torch.FloatTensor],  # List of (*** c)
 ) -> tuple[
@@ -27,11 +32,9 @@ def flatten(
 ]:
     assert len(hid) > 0
     shape = torch.stack(
-        [
-            torch.tensor(x.shape[:-1], device="cpu", pin_memory=True)
-            for x in hid
-        ]
-    ).pin_memory()
+        [torch.tensor(x.shape[:-1], device="cpu") for x in hid]
+    )
+    shape = maybe_pin_memory(shape)
     hid = torch.cat([x.flatten(0, -2) for x in hid])
     return hid, shape
 
