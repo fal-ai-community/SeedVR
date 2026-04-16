@@ -1,1 +1,1 @@
-Add varlen attention compatibility fallback
+Fix sampler factory for diffusers config init

@@ -47,8 +47,23 @@ def create_sampler_from_config(config: DictConfig, **kwargs: Any) -> Sampler:
     """
     Create a sampler from configuration.
     """
+    schedule = kwargs.pop("schedule", None)
+    timesteps = kwargs.pop("timesteps", None)
+    device = kwargs.pop("device", torch.device("cpu"))
+
     if config.type == "euler":
-        return EulerSampler(prediction_type=config.prediction_type, **kwargs)
+        sampler = EulerSampler(
+            prediction_type=config.prediction_type,
+            schedule_t=schedule.T if schedule is not None else 1000.0,
+            timesteps_steps=len(timesteps) if timesteps is not None else 1000,
+            device=device,
+            **kwargs,
+        )
+        if schedule is not None:
+            sampler.schedule = schedule
+        if timesteps is not None:
+            sampler.timesteps = timesteps
+        return sampler
     raise NotImplementedError
 
 
