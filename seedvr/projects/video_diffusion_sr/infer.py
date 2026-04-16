@@ -241,6 +241,7 @@ class VideoDiffusionInfer:
             vid_shift_fn(heights * widths * frames),
             img_shift_fn(heights * widths),
         )
+        shift = shift.to(device=timesteps.device, dtype=timesteps.dtype)
 
         # Shift timesteps.
         timesteps = timesteps / self.schedule.T
