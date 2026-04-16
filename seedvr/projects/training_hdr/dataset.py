@@ -18,11 +18,14 @@ class ManifestSample:
     scene_id: str
     split: str
     input_sdr_path: str
-    compressed_target_path: str
     width: int
     height: int
     variant_id: str | None = None
     target_hdr_path: str | None = None
+    target_hdr_npy_path: str | None = None
+    target_mu_law_path: str | None = None
+    target_log_hdr_path: str | None = None
+    compressed_target_path: str | None = None
     clip_mask_path: str | None = None
     saturation_mask_path: str | None = None
     metadata_path: str | None = None
@@ -50,12 +53,11 @@ def _read_rgb_png(path: Path) -> np.ndarray:
     return image.astype(np.float32) / 255.0
 
 
-def _read_compressed_target(path: Path) -> np.ndarray:
+def _read_target_array(path: Path) -> np.ndarray:
     target = np.load(path)
     if target.ndim != 3 or target.shape[-1] != 3:
-        raise ValueError(f"Expected HWC RGB compressed target at {path}, got {target.shape}")
-    target = np.nan_to_num(target, nan=0.0, posinf=1.0, neginf=0.0)
-    return np.clip(target.astype(np.float32), 0.0, 1.0)
+        raise ValueError(f"Expected HWC RGB target at {path}, got {target.shape}")
+    return np.nan_to_num(target.astype(np.float32), nan=0.0, posinf=1.0e6, neginf=-1.0e6)
 
 
 def _resize_to_cover(
@@ -116,9 +118,18 @@ def _crop_pair(
     )
 
 
-def _to_tensor(image: np.ndarray) -> torch.Tensor:
+def _to_input_tensor(image: np.ndarray) -> torch.Tensor:
     tensor = torch.from_numpy(np.ascontiguousarray(image.transpose(2, 0, 1)))
     return tensor.mul(2.0).sub(1.0)
+
+
+def _to_target_tensor(image: np.ndarray, target_representation: str) -> torch.Tensor:
+    tensor = torch.from_numpy(np.ascontiguousarray(image.transpose(2, 0, 1)))
+    if target_representation == "mu_law_mu5000":
+        return tensor.mul(2.0).sub(1.0)
+    if target_representation in {"raw_hdr", "log_hdr"}:
+        return tensor
+    raise ValueError(f"Unsupported target_representation: {target_representation}")
 
 
 class SeedVRHDRImageDataset(Dataset):
@@ -130,6 +141,7 @@ class SeedVRHDRImageDataset(Dataset):
         train_width: int,
         random_crop: bool,
         seed: int,
+        target_representation: str,
     ) -> None:
         self.dataset_root = Path(dataset_root)
         self.samples = load_manifest(manifest_path)
@@ -137,6 +149,7 @@ class SeedVRHDRImageDataset(Dataset):
         self.train_width = train_width
         self.random_crop = random_crop
         self.seed = seed
+        self.target_representation = target_representation
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -146,9 +159,10 @@ class SeedVRHDRImageDataset(Dataset):
         rng = random.Random((self.seed * 10_000) + index)
 
         input_path = self.dataset_root / sample.input_sdr_path
-        target_path = self.dataset_root / sample.compressed_target_path
+        target_rel = self._target_path_for_sample(sample)
+        target_path = self.dataset_root / target_rel
         input_image = _read_rgb_png(input_path)
-        target_image = _read_compressed_target(target_path)
+        target_image = _read_target_array(target_path)
 
         if input_image.shape[:2] != target_image.shape[:2]:
             raise ValueError(
@@ -179,9 +193,30 @@ class SeedVRHDRImageDataset(Dataset):
         )
 
         return {
-            "input_sdr": _to_tensor(input_image),
-            "target": _to_tensor(target_image),
+            "input_sdr": _to_input_tensor(input_image),
+            "target": _to_target_tensor(target_image, self.target_representation),
             "scene_id": sample.scene_id,
             "sample_id": sample.sample_id,
             "variant_id": sample.variant_id or "",
         }
+
+    def _target_path_for_sample(self, sample: ManifestSample) -> str:
+        if self.target_representation == "raw_hdr":
+            if sample.target_hdr_npy_path:
+                return sample.target_hdr_npy_path
+            if sample.target_hdr_path and sample.target_hdr_path.endswith(".npy"):
+                return sample.target_hdr_path
+        elif self.target_representation == "mu_law_mu5000":
+            if sample.target_mu_law_path:
+                return sample.target_mu_law_path
+        elif self.target_representation == "log_hdr":
+            if sample.target_log_hdr_path:
+                return sample.target_log_hdr_path
+        else:
+            raise ValueError(f"Unsupported target_representation: {self.target_representation}")
+
+        if sample.compressed_target_path:
+            return sample.compressed_target_path
+        raise ValueError(
+            f"Sample {sample.sample_id} does not provide a target path for {self.target_representation}"
+        )

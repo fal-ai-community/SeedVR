@@ -61,6 +61,7 @@ class TrainingConfig:
     num_validation_samples: int
     compressed_target_space: str
     task_mode: str
+    target_representation: str = "mu_law_mu5000"
     checkpoint_repo_id: str | None = None
     dit_filename: str | None = None
     vae_filename: str | None = None

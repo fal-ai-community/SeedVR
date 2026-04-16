@@ -26,7 +26,7 @@ from seedvr.projects.training_hdr.losses import (
     image_reconstruction_loss,
     latent_reconstruction_loss,
 )
-from seedvr.projects.training_hdr.validation import save_triptych
+from seedvr.projects.training_hdr.validation import compute_hdr_metrics, save_triptych
 from seedvr.projects.video_diffusion_sr.infer import VideoDiffusionInfer
 
 try:
@@ -331,6 +331,7 @@ def build_dataloaders(config: TrainingConfig) -> tuple[DataLoader, DataLoader]:
         train_width=config.train_width,
         random_crop=True,
         seed=config.seed,
+        target_representation=config.target_representation,
     )
     val_dataset = SeedVRHDRImageDataset(
         dataset_root=config.dataset_root,
@@ -339,6 +340,7 @@ def build_dataloaders(config: TrainingConfig) -> tuple[DataLoader, DataLoader]:
         train_width=config.train_width,
         random_crop=False,
         seed=config.seed,
+        target_representation=config.target_representation,
     )
     train_loader = DataLoader(
         train_dataset,
@@ -388,6 +390,7 @@ def build_runner(
     runtime_info["vae_checkpoint"] = str(vae_ckpt_path)
     runtime_info["trainable_strategy"] = config.trainable_strategy
     runtime_info["num_trainable_parameters"] = num_trainable
+    runtime_info["target_representation"] = config.target_representation
 
     positive, negative = PrecomputedEmbeddings.default(
         device=device,
@@ -444,6 +447,7 @@ def run_validation(
     text_pos_embeds, text_pos_shapes = positive_embeddings
     preview_paths: list[Path] = []
     losses: list[float] = []
+    hdr_metric_rows: list[dict[str, float]] = []
     preview_dir = config.output_path / "validation"
     preview_dir.mkdir(parents=True, exist_ok=True)
 
@@ -498,11 +502,19 @@ def run_validation(
                 timesteps,
             )
             predicted_images = decode_latents_to_images(runner, pred_x0, latent_shapes)
+            hdr_metric_rows.append(
+                compute_hdr_metrics(
+                    predicted_image=predicted_images[0],
+                    target_image=target_images[0],
+                    target_representation=config.target_representation,
+                )
+            )
             preview_path = save_triptych(
                 preview_dir / f"step_{step:06d}_{idx:02d}.png",
                 input_images[0].cpu(),
                 predicted_images[0].cpu(),
                 target_images[0].cpu(),
+                target_representation=config.target_representation,
             )
             preview_paths.append(preview_path)
 
@@ -510,6 +522,10 @@ def run_validation(
     metrics = {
         "val_denoise_loss": float(np.mean(losses)) if losses else 0.0,
     }
+    if hdr_metric_rows:
+        metric_names = hdr_metric_rows[0].keys()
+        for name in metric_names:
+            metrics[f"val_{name}"] = float(np.mean([row[name] for row in hdr_metric_rows]))
     return metrics, preview_paths
 
 
