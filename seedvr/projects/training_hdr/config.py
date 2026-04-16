@@ -91,7 +91,7 @@ class TrainingConfig:
     adam_beta2: float = 0.95
     weight_decay: float = 0.01
     log_every: int = 10
-    validate_every: int = 250
+    validate_every: int = 100
     save_every: int = 500
 
     @classmethod
