@@ -1,0 +1,1 @@
+Make SeedVRPipeline import lazy for training entrypoints
