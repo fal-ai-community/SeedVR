@@ -1,1 +1,1 @@
-Run 3B DiT in bf16 during trainer setup
+Fix HDR image loss decode path for training

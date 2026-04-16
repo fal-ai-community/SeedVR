@@ -9,6 +9,8 @@ from typing import Any
 import numpy as np
 import torch
 from huggingface_hub import snapshot_download
+from omegaconf import ListConfig
+from einops import rearrange
 from torch.utils.data import DataLoader
 
 from seedvr.common.config import load_config
@@ -399,8 +401,28 @@ def decode_latents_to_images(
     latent_shapes: torch.Tensor,
 ) -> torch.Tensor:
     latents = na.unflatten(latents_flat, latent_shapes)
-    decoded = runner.vae_decode([latent.to(runner.vae.dtype) for latent in latents])
-    return torch.stack([sample.float() for sample in decoded], dim=0)
+    device = latents_flat.device
+    dtype = getattr(torch, runner.config.vae.dtype)
+    scale = runner.config.vae.scaling_factor
+    shift = runner.config.vae.get("shifting_factor", 0.0)
+
+    if isinstance(scale, ListConfig):
+        scale = torch.tensor(scale, device=device, dtype=dtype)
+    if isinstance(shift, ListConfig):
+        shift = torch.tensor(shift, device=device, dtype=dtype)
+
+    decoded: list[torch.Tensor] = []
+    for latent in latents:
+        latent = latent.to(device=device, dtype=dtype)
+        latent = latent / scale + shift
+        latent = rearrange(latent, "t h w c -> 1 c t h w")
+        latent = latent.squeeze(2)
+        sample = runner.vae.decode(latent).sample
+        if hasattr(runner.vae, "postprocess"):
+            sample = runner.vae.postprocess(sample)
+        decoded.append(sample.squeeze(0).to(device=device, dtype=torch.float32))
+
+    return torch.stack(decoded, dim=0)
 
 
 def run_validation(
@@ -569,9 +591,7 @@ def main() -> None:
         )
         denoise = denoise_loss(prediction, target)
         latent_recon = latent_reconstruction_loss(pred_x0, latents_flat)
-
-        with torch.no_grad():
-            predicted_images = decode_latents_to_images(runner, pred_x0, latent_shapes)
+        predicted_images = decode_latents_to_images(runner, pred_x0, latent_shapes)
         image_recon = image_reconstruction_loss(predicted_images, target_images)
 
         total_loss = (
