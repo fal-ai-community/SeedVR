@@ -1,1 +1,1 @@
-Tolerate extra fields in HDR training manifests
+Fix broken 3B VAE config inherit path
