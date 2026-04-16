@@ -188,6 +188,20 @@ def maybe_init_wandb(config: TrainingConfig) -> Any | None:
     return run
 
 
+def log_validation_previews_to_wandb(
+    wandb_run: Any | None,
+    preview_paths: list[Path],
+    step: int,
+) -> None:
+    if wandb_run is None or wandb is None or not preview_paths:
+        return
+    images = [
+        wandb.Image(str(path), caption=f"step={step} preview={idx}")
+        for idx, path in enumerate(preview_paths)
+    ]
+    wandb.log({"step": step, "validation_previews": images})
+
+
 def select_trainable_parameters(model: torch.nn.Module, strategy: str) -> int:
     for parameter in model.parameters():
         parameter.requires_grad_(False)
@@ -621,6 +635,11 @@ def main() -> None:
             print(f"[seedvr-hdr] validation step={step} metrics={val_metrics}")
             if wandb_run is not None:
                 wandb.log({"step": step, **val_metrics})
+                log_validation_previews_to_wandb(
+                    wandb_run=wandb_run,
+                    preview_paths=latest_preview_paths,
+                    step=step,
+                )
 
         if step % config.save_every == 0 or step == config.steps:
             checkpoint_path = save_checkpoint(
