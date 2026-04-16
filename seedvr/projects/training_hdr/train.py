@@ -147,6 +147,20 @@ def maybe_compile_dit(model: torch.nn.Module, config: TrainingConfig) -> tuple[t
     if not config.use_torch_compile or not hasattr(torch, "compile"):
         return model, False
     try:
+        try:
+            import torch._dynamo as dynamo
+
+            dynamo.config.suppress_errors = True
+        except Exception:
+            pass
+        try:
+            import torch._inductor.config as inductor_config
+
+            for attr in ("shape_padding", "comprehensive_padding", "force_shape_pad"):
+                if hasattr(inductor_config, attr):
+                    setattr(inductor_config, attr, False)
+        except Exception:
+            pass
         compiled = torch.compile(
             model,
             mode=config.torch_compile_mode,

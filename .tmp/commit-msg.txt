@@ -1,1 +1,1 @@
-Make pin_memory compile-safe in DiT utilities
+Harden torch.compile fallback for training
