@@ -15,7 +15,43 @@
 import torch
 import torch.nn.functional as F
 from torch import nn
-from torch.nn.attention.varlen import varlen_attn
+
+try:
+    from torch.nn.attention.varlen import varlen_attn
+except ImportError:
+    varlen_attn = None
+
+
+def _varlen_attn_fallback(
+    *,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    cu_seq_q: torch.Tensor,
+    cu_seq_k: torch.Tensor,
+    is_causal: bool = False,
+) -> torch.Tensor:
+    outputs = []
+    batch_size = cu_seq_q.numel() - 1
+    for index in range(batch_size):
+        q_start = int(cu_seq_q[index].item())
+        q_end = int(cu_seq_q[index + 1].item())
+        k_start = int(cu_seq_k[index].item())
+        k_end = int(cu_seq_k[index + 1].item())
+
+        q_slice = query[q_start:q_end].permute(1, 0, 2).unsqueeze(0)
+        k_slice = key[k_start:k_end].permute(1, 0, 2).unsqueeze(0)
+        v_slice = value[k_start:k_end].permute(1, 0, 2).unsqueeze(0)
+
+        attn_out = F.scaled_dot_product_attention(
+            query=q_slice,
+            key=k_slice,
+            value=v_slice,
+            is_causal=is_causal,
+        )
+        outputs.append(attn_out.squeeze(0).permute(1, 0, 2))
+
+    return torch.cat(outputs, dim=0)
 
 
 class TorchAttention(nn.Module):
@@ -55,14 +91,31 @@ class VarlenAttention(nn.Module):
         if query is None or key is None or value is None:
             raise ValueError("query, key, value must be provided")
 
-        return varlen_attn(
+        cu_seq_q = kwargs.pop("cu_seqlens_q")
+        cu_seq_k = kwargs.pop("cu_seqlens_k")
+        max_q = kwargs.pop("max_seqlen_q")
+        max_k = kwargs.pop("max_seqlen_k")
+        is_causal = kwargs.pop("is_causal", False)
+        kwargs.pop("return_aux", None)
+
+        if varlen_attn is not None:
+            return varlen_attn(
+                query=query,
+                key=key,
+                value=value,
+                cu_seq_q=cu_seq_q,
+                cu_seq_k=cu_seq_k,
+                max_q=max_q,
+                max_k=max_k,
+                is_causal=is_causal,
+                return_aux=None,
+            )
+
+        return _varlen_attn_fallback(
             query=query,
             key=key,
             value=value,
-            cu_seq_q=kwargs.pop("cu_seqlens_q"),
-            cu_seq_k=kwargs.pop("cu_seqlens_k"),
-            max_q=kwargs.pop("max_seqlen_q"),
-            max_k=kwargs.pop("max_seqlen_k"),
-            is_causal=kwargs.pop("is_causal", False),
-            return_aux=kwargs.pop("return_aux", None),
+            cu_seq_q=cu_seq_q,
+            cu_seq_k=cu_seq_k,
+            is_causal=is_causal,
         )

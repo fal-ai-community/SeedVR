@@ -1,1 +1,1 @@
-Fix 3B config module import paths
+Add varlen attention compatibility fallback
