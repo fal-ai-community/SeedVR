@@ -51,9 +51,11 @@ class TrainingConfig:
     steps: int
     learning_rate: float
     batch_size: int
-    resolution: int
+    train_width: int
+    train_height: int
     seed: int
     training_mode: str
+    trainable_strategy: str
     base_model: str
     freeze_vae: bool
     num_validation_samples: int
@@ -73,10 +75,16 @@ class TrainingConfig:
     torch_compile_fullgraph: bool = False
     use_fa3: bool = True
     allow_attention_fallback: bool = True
+    optimizer_type: str = "adamw"
+    scheduler_type: str = "cosine"
+    warmup_steps: int = 100
+    min_lr_ratio: float = 0.1
     num_workers: int = 4
     denoise_loss_weight: float = 1.0
-    latent_recon_loss_weight: float = 0.25
-    image_recon_loss_weight: float = 0.1
+    latent_recon_loss_weight: float = 0.1
+    image_recon_loss_weight: float = 0.0
+    latent_loss_warmup_steps: int = 0
+    image_loss_warmup_steps: int = 0
     grad_clip_norm: float = 1.0
     adam_beta1: float = 0.9
     adam_beta2: float = 0.95
@@ -98,6 +106,10 @@ class TrainingConfig:
     def output_path(self) -> Path:
         return Path(self.output_dir)
 
+    @property
+    def train_size(self) -> tuple[int, int]:
+        return self.train_height, self.train_width
+
     def resolve_checkpoint_spec(self) -> CheckpointSpec:
         if self.base_model not in BASE_MODEL_SPECS:
             raise ValueError(
@@ -112,4 +124,3 @@ class TrainingConfig:
             vae_filename=self.vae_filename or base.vae_filename,
             config_path=self.seedvr_config_path or base.config_path,
         )
-

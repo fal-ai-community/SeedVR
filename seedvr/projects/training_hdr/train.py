@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import random
 from pathlib import Path
 from typing import Any
@@ -175,18 +174,138 @@ def maybe_init_wandb(config: TrainingConfig) -> Any | None:
     return run
 
 
+def select_trainable_parameters(model: torch.nn.Module, strategy: str) -> int:
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+
+    def enable_if(predicate) -> None:
+        for name, parameter in model.named_parameters():
+            if predicate(name):
+                parameter.requires_grad_(True)
+
+    block_count = getattr(model, "blocks", None)
+    num_blocks = len(block_count) if block_count is not None else 0
+    top8_start = max(0, num_blocks - 8)
+    top16_start = max(0, num_blocks - 16)
+
+    if strategy == "full":
+        for parameter in model.parameters():
+            parameter.requires_grad_(True)
+    elif strategy == "top8":
+        enable_if(
+            lambda name: (
+                (name.startswith("blocks.") and int(name.split(".")[1]) >= top8_start)
+                or name.startswith(("vid_out", "vid_out_norm", "vid_out_ada", "txt_in", "emb_in"))
+            )
+        )
+    elif strategy == "top16":
+        enable_if(
+            lambda name: (
+                (name.startswith("blocks.") and int(name.split(".")[1]) >= top16_start)
+                or name.startswith(("vid_out", "vid_out_norm", "vid_out_ada", "txt_in", "emb_in"))
+            )
+        )
+    elif strategy == "emb_out":
+        enable_if(
+            lambda name: name.startswith(("vid_out", "vid_out_norm", "vid_out_ada", "txt_in", "emb_in"))
+        )
+    elif strategy == "attention_top16":
+        enable_if(
+            lambda name: (
+                name.startswith("blocks.")
+                and int(name.split(".")[1]) >= top16_start
+                and "attn" in name
+            )
+            or name.startswith(("vid_out", "vid_out_norm", "vid_out_ada", "txt_in", "emb_in"))
+        )
+    elif strategy == "mlp_top16":
+        enable_if(
+            lambda name: (
+                name.startswith("blocks.")
+                and int(name.split(".")[1]) >= top16_start
+                and "mlp" in name
+            )
+            or name.startswith(("vid_out", "vid_out_norm", "vid_out_ada", "txt_in", "emb_in"))
+        )
+    else:
+        raise ValueError(f"Unsupported trainable_strategy '{strategy}'")
+
+    num_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    if num_trainable == 0:
+        raise RuntimeError(f"Trainable strategy '{strategy}' disabled every parameter.")
+    return num_trainable
+
+
+def build_optimizer(
+    config: TrainingConfig,
+    model: torch.nn.Module,
+) -> torch.optim.Optimizer:
+    trainable_params = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    if config.optimizer_type == "adamw":
+        return torch.optim.AdamW(
+            trainable_params,
+            lr=config.learning_rate,
+            betas=(config.adam_beta1, config.adam_beta2),
+            weight_decay=config.weight_decay,
+        )
+    if config.optimizer_type == "adamw_fused":
+        return torch.optim.AdamW(
+            trainable_params,
+            lr=config.learning_rate,
+            betas=(config.adam_beta1, config.adam_beta2),
+            weight_decay=config.weight_decay,
+            fused=True,
+        )
+    raise ValueError(f"Unsupported optimizer_type '{config.optimizer_type}'")
+
+
+def build_scheduler(
+    config: TrainingConfig,
+    optimizer: torch.optim.Optimizer,
+) -> torch.optim.lr_scheduler.LRScheduler:
+    if config.scheduler_type == "constant":
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _step: 1.0)
+
+    if config.scheduler_type == "cosine":
+        def lr_lambda(step: int) -> float:
+            if config.warmup_steps > 0 and step < config.warmup_steps:
+                return max(1.0e-8, float(step + 1) / float(config.warmup_steps))
+            progress_denominator = max(1, config.steps - config.warmup_steps)
+            progress = min(
+                1.0,
+                max(0.0, float(step - config.warmup_steps) / float(progress_denominator)),
+            )
+            cosine = 0.5 * (1.0 + np.cos(np.pi * progress))
+            return config.min_lr_ratio + (1.0 - config.min_lr_ratio) * cosine
+
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+    raise ValueError(f"Unsupported scheduler_type '{config.scheduler_type}'")
+
+
+def current_loss_weight(target_weight: float, warmup_steps: int, step: int) -> float:
+    if target_weight <= 0.0:
+        return 0.0
+    if warmup_steps <= 0:
+        return target_weight
+    ramp = min(1.0, float(step) / float(warmup_steps))
+    return target_weight * ramp
+
+
 def build_dataloaders(config: TrainingConfig) -> tuple[DataLoader, DataLoader]:
     train_dataset = SeedVRHDRImageDataset(
         dataset_root=config.dataset_root,
         manifest_path=config.train_manifest,
-        resolution=config.resolution,
+        train_height=config.train_height,
+        train_width=config.train_width,
         random_crop=True,
         seed=config.seed,
     )
     val_dataset = SeedVRHDRImageDataset(
         dataset_root=config.dataset_root,
         manifest_path=config.val_manifest,
-        resolution=config.resolution,
+        train_height=config.train_height,
+        train_width=config.train_width,
         random_crop=False,
         seed=config.seed,
     )
@@ -227,6 +346,7 @@ def build_runner(
     runner.configure_diffusion()
     runner.vae.requires_grad_(False).eval()
     runner.dit.train()
+    num_trainable = select_trainable_parameters(runner.dit, config.trainable_strategy)
 
     runtime_info = configure_runtime_optimizations(config, device)
     runner.dit, compiled = maybe_compile_dit(runner.dit, config)
@@ -234,6 +354,8 @@ def build_runner(
     runtime_info["model_config_path"] = str(model_config_path)
     runtime_info["dit_checkpoint"] = str(dit_ckpt_path)
     runtime_info["vae_checkpoint"] = str(vae_ckpt_path)
+    runtime_info["trainable_strategy"] = config.trainable_strategy
+    runtime_info["num_trainable_parameters"] = num_trainable
 
     positive, negative = PrecomputedEmbeddings.default(
         device=device,
@@ -352,12 +474,8 @@ def main() -> None:
     print("[seedvr-hdr] runtime info:")
     print(json.dumps(runtime_info, indent=2))
 
-    optimizer = torch.optim.AdamW(
-        runner.dit.parameters(),
-        lr=config.learning_rate,
-        betas=(config.adam_beta1, config.adam_beta2),
-        weight_decay=config.weight_decay,
-    )
+    optimizer = build_optimizer(config, runner.dit)
+    scheduler = build_scheduler(config, optimizer)
     wandb_run = maybe_init_wandb(config)
 
     text_pos_embeds, text_pos_shapes = positive_embeddings
@@ -429,19 +547,45 @@ def main() -> None:
 
         total_loss = (
             config.denoise_loss_weight * denoise
-            + config.latent_recon_loss_weight * latent_recon
-            + config.image_recon_loss_weight * image_recon
+            + current_loss_weight(
+                config.latent_recon_loss_weight,
+                config.latent_loss_warmup_steps,
+                step,
+            )
+            * latent_recon
+            + current_loss_weight(
+                config.image_recon_loss_weight,
+                config.image_loss_warmup_steps,
+                step,
+            )
+            * image_recon
         )
         total_loss.backward()
         if config.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(runner.dit.parameters(), config.grad_clip_norm)
         optimizer.step()
+        scheduler.step()
 
         final_metrics = {
             "loss": float(total_loss.item()),
             "denoise_loss": float(denoise.item()),
             "latent_recon_loss": float(latent_recon.item()),
             "image_recon_loss": float(image_recon.item()),
+            "lr": float(optimizer.param_groups[0]["lr"]),
+            "latent_recon_weight": float(
+                current_loss_weight(
+                    config.latent_recon_loss_weight,
+                    config.latent_loss_warmup_steps,
+                    step,
+                )
+            ),
+            "image_recon_weight": float(
+                current_loss_weight(
+                    config.image_recon_loss_weight,
+                    config.image_loss_warmup_steps,
+                    step,
+                )
+            ),
         }
 
         if step % config.log_every == 0 or step == 1:

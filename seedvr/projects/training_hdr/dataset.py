@@ -51,11 +51,16 @@ def _read_compressed_target(path: Path) -> np.ndarray:
     return np.clip(target.astype(np.float32), 0.0, 1.0)
 
 
-def _resize_to_min_side(image: np.ndarray, min_side: int, interpolation: int) -> np.ndarray:
+def _resize_to_cover(
+    image: np.ndarray,
+    target_height: int,
+    target_width: int,
+    interpolation: int,
+) -> np.ndarray:
     height, width = image.shape[:2]
-    if min(height, width) >= min_side:
+    if height >= target_height and width >= target_width:
         return image
-    scale = float(min_side) / float(min(height, width))
+    scale = max(float(target_height) / float(height), float(target_width) / float(width))
     resized_width = int(round(width * scale))
     resized_height = int(round(height * scale))
     return cv2.resize(image, (resized_width, resized_height), interpolation=interpolation)
@@ -69,33 +74,35 @@ def _aligned_size(size: int, alignment: int = 16) -> int:
 def _crop_pair(
     input_image: np.ndarray,
     target_image: np.ndarray,
-    crop_size: int,
+    crop_height: int,
+    crop_width: int,
     random_crop: bool,
     rng: random.Random,
 ) -> tuple[np.ndarray, np.ndarray]:
     height, width = input_image.shape[:2]
-    crop_size = min(crop_size, height, width)
-    crop_size = _aligned_size(crop_size)
-    crop_size = min(crop_size, height, width)
-    if crop_size <= 0:
-        raise ValueError(f"Invalid crop size {crop_size} for image shape {(height, width)}")
+    crop_height = min(_aligned_size(crop_height), height)
+    crop_width = min(_aligned_size(crop_width), width)
+    if crop_height <= 0 or crop_width <= 0:
+        raise ValueError(
+            f"Invalid crop size {(crop_height, crop_width)} for image shape {(height, width)}"
+        )
 
-    if height == crop_size:
+    if height == crop_height:
         top = 0
     elif random_crop:
-        top = rng.randint(0, height - crop_size)
+        top = rng.randint(0, height - crop_height)
     else:
-        top = (height - crop_size) // 2
+        top = (height - crop_height) // 2
 
-    if width == crop_size:
+    if width == crop_width:
         left = 0
     elif random_crop:
-        left = rng.randint(0, width - crop_size)
+        left = rng.randint(0, width - crop_width)
     else:
-        left = (width - crop_size) // 2
+        left = (width - crop_width) // 2
 
-    bottom = top + crop_size
-    right = left + crop_size
+    bottom = top + crop_height
+    right = left + crop_width
     return (
         input_image[top:bottom, left:right],
         target_image[top:bottom, left:right],
@@ -112,13 +119,15 @@ class SeedVRHDRImageDataset(Dataset):
         self,
         dataset_root: str | Path,
         manifest_path: str | Path,
-        resolution: int,
+        train_height: int,
+        train_width: int,
         random_crop: bool,
         seed: int,
     ) -> None:
         self.dataset_root = Path(dataset_root)
         self.samples = load_manifest(manifest_path)
-        self.resolution = resolution
+        self.train_height = train_height
+        self.train_width = train_width
         self.random_crop = random_crop
         self.seed = seed
 
@@ -140,17 +149,24 @@ class SeedVRHDRImageDataset(Dataset):
                 f"{input_image.shape[:2]} vs {target_image.shape[:2]}"
             )
 
-        input_image = _resize_to_min_side(
-            input_image, self.resolution, interpolation=cv2.INTER_AREA
+        input_image = _resize_to_cover(
+            input_image,
+            self.train_height,
+            self.train_width,
+            interpolation=cv2.INTER_AREA,
         )
-        target_image = _resize_to_min_side(
-            target_image, self.resolution, interpolation=cv2.INTER_CUBIC
+        target_image = _resize_to_cover(
+            target_image,
+            self.train_height,
+            self.train_width,
+            interpolation=cv2.INTER_CUBIC,
         )
 
         input_image, target_image = _crop_pair(
             input_image=input_image,
             target_image=target_image,
-            crop_size=self.resolution,
+            crop_height=self.train_height,
+            crop_width=self.train_width,
             random_crop=self.random_crop,
             rng=rng,
         )
@@ -162,4 +178,3 @@ class SeedVRHDRImageDataset(Dataset):
             "sample_id": sample.sample_id,
             "variant_id": sample.variant_id or "",
         }
-
