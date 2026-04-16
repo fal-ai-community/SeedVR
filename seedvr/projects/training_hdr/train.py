@@ -356,6 +356,7 @@ def build_runner(
     model_config = load_config(str(model_config_path), root_dir=str(repo_root))
     runner = VideoDiffusionInfer(model_config)
     runner.configure_dit_model(device=str(device), checkpoint=str(dit_ckpt_path))
+    runner.dit.to(device=device, dtype=torch.bfloat16)
     runner.configure_vae_model(device=str(device), checkpoint=str(vae_ckpt_path))
     runner.configure_diffusion()
     runner.vae.requires_grad_(False).eval()

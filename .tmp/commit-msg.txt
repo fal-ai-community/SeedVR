@@ -1,1 +1,1 @@
-Harden torch.compile fallback for training
+Run 3B DiT in bf16 during trainer setup
