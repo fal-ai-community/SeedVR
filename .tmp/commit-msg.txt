@@ -1,1 +1,1 @@
-Fix broken 3B VAE config inherit path
+Fix 3B config module import paths
