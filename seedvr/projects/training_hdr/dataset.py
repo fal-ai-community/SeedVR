@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import random
+from dataclasses import fields
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -26,12 +27,18 @@ class ManifestSample:
     saturation_mask_path: str | None = None
     metadata_path: str | None = None
 
+    @classmethod
+    def from_row(cls, row: dict) -> "ManifestSample":
+        allowed = {field.name for field in fields(cls)}
+        filtered = {key: value for key, value in row.items() if key in allowed}
+        return cls(**filtered)
+
 
 def load_manifest(path: str | Path) -> list[ManifestSample]:
     rows: list[ManifestSample] = []
     with open(path) as file:
         for line in file:
-            rows.append(ManifestSample(**json.loads(line)))
+            rows.append(ManifestSample.from_row(json.loads(line)))
     return rows
 
 

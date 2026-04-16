@@ -1,1 +1,1 @@
-Make SeedVRPipeline import lazy for training entrypoints
+Tolerate extra fields in HDR training manifests
