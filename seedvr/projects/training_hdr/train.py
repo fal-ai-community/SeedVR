@@ -17,6 +17,7 @@ from seedvr.common.config import load_config
 from seedvr.common.diffusion.types import PredictionType
 from seedvr.models.dit import na
 from seedvr.models.embeds import PrecomputedEmbeddings
+from seedvr.models.video_vae_v3.modules.types import MemoryState
 from seedvr.projects.training_hdr.checkpointing import save_checkpoint, write_result_manifest
 from seedvr.projects.training_hdr.config import TrainingConfig
 from seedvr.projects.training_hdr.dataset import SeedVRHDRImageDataset
@@ -413,13 +414,20 @@ def decode_latents_to_images(
 
     decoded: list[torch.Tensor] = []
     for latent in latents:
-        latent = latent.to(device=device, dtype=dtype)
+        # Use a cloned latent tensor so the decode branch cannot mutate views
+        # that autograd is still tracking for the denoise / latent losses.
+        latent = latent.to(device=device, dtype=dtype).clone()
         latent = latent / scale + shift
         latent = rearrange(latent, "t h w c -> 1 c t h w")
-        latent = latent.squeeze(2)
-        sample = runner.vae.decode(latent).sample
-        if hasattr(runner.vae, "postprocess"):
-            sample = runner.vae.postprocess(sample)
+        # The public VAE decode path uses tiled helpers that are wrapped in
+        # @torch.no_grad() and perform in-place clamps. Bypass that path for
+        # training-time image loss so gradients stay valid.
+        if hasattr(runner.vae, "_decode"):
+            sample = runner.vae._decode(latent, memory_state=MemoryState.DISABLED)
+        else:
+            sample = runner.vae.decode(latent, use_tiling=False, use_tqdm=False).sample
+        if sample.ndim == 5 and sample.shape[2] == 1:
+            sample = sample.squeeze(2)
         decoded.append(sample.squeeze(0).to(device=device, dtype=torch.float32))
 
     return torch.stack(decoded, dim=0)
