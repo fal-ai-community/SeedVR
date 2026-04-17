@@ -93,6 +93,8 @@ class TrainingConfig:
     log_every: int = 10
     validate_every: int = 100
     save_every: int = 500
+    debug_cuda_memory: bool = True
+    cuda_cleanup_every: int = 100
 
     @classmethod
     def from_path(cls, path: str | Path) -> "TrainingConfig":

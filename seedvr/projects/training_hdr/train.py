@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import random
 from pathlib import Path
@@ -189,6 +190,35 @@ def maybe_init_wandb(config: TrainingConfig) -> Any | None:
         config=config.to_dict(),
     )
     return run
+
+
+def get_cuda_memory_stats(device: torch.device) -> dict[str, float]:
+    if device.type != "cuda":
+        return {}
+    stats = torch.cuda.memory_stats(device)
+    gib = float(1024**3)
+    return {
+        "cuda_allocated_gb": float(torch.cuda.memory_allocated(device) / gib),
+        "cuda_reserved_gb": float(torch.cuda.memory_reserved(device) / gib),
+        "cuda_max_allocated_gb": float(torch.cuda.max_memory_allocated(device) / gib),
+        "cuda_max_reserved_gb": float(torch.cuda.max_memory_reserved(device) / gib),
+        "cuda_active_gb": float(stats.get("active_bytes.all.current", 0) / gib),
+        "cuda_inactive_split_gb": float(stats.get("inactive_split_bytes.all.current", 0) / gib),
+    }
+
+
+def log_cuda_memory(prefix: str, device: torch.device, step: int | None = None) -> dict[str, float]:
+    stats = get_cuda_memory_stats(device)
+    if stats:
+        step_label = f" step={step}" if step is not None else ""
+        print(f"[seedvr-hdr] {prefix}{step_label} cuda_memory={stats}")
+    return stats
+
+
+def cleanup_cuda_memory(device: torch.device) -> None:
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
 
 
 def log_validation_previews_to_wandb(
@@ -452,6 +482,8 @@ def run_validation(
     preview_dir.mkdir(parents=True, exist_ok=True)
 
     runner.dit.eval()
+    if config.debug_cuda_memory:
+        log_cuda_memory("validation_start", device, step)
     with torch.no_grad():
         for idx, batch in enumerate(val_loader):
             if idx >= config.num_validation_samples:
@@ -517,6 +549,28 @@ def run_validation(
                 target_representation=config.target_representation,
             )
             preview_paths.append(preview_path)
+            if config.debug_cuda_memory:
+                log_cuda_memory(f"validation_sample idx={idx}", device, step)
+
+            del (
+                input_images,
+                target_images,
+                target_latents,
+                input_latents,
+                noisy_inputs,
+                conditions,
+                latents_flat,
+                latent_shapes,
+                cond_flat,
+                noise,
+                timesteps,
+                x_t,
+                target,
+                prediction,
+                pred_x0,
+                predicted_images,
+            )
+            cleanup_cuda_memory(device)
 
     runner.dit.train()
     metrics = {
@@ -526,6 +580,10 @@ def run_validation(
         metric_names = hdr_metric_rows[0].keys()
         for name in metric_names:
             metrics[f"val_{name}"] = float(np.mean([row[name] for row in hdr_metric_rows]))
+    if config.debug_cuda_memory:
+        log_cuda_memory("validation_end", device, step)
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
     return metrics, preview_paths
 
 
@@ -558,6 +616,10 @@ def main() -> None:
     final_metrics: dict[str, float] = {}
     latest_preview_paths: list[Path] = []
     checkpoint_path: Path | None = None
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+    if config.debug_cuda_memory:
+        log_cuda_memory("train_start", device)
 
     for step in range(1, config.steps + 1):
         try:
@@ -660,6 +722,8 @@ def main() -> None:
                 )
             ),
         }
+        if config.debug_cuda_memory:
+            final_metrics.update(get_cuda_memory_stats(device))
 
         if step % config.log_every == 0 or step == 1:
             print(f"[seedvr-hdr] step={step} metrics={final_metrics}")
@@ -694,6 +758,38 @@ def main() -> None:
                 metrics=final_metrics,
                 config=config.to_dict() | runtime_info,
             )
+            if config.debug_cuda_memory:
+                log_cuda_memory("checkpoint_saved", device, step)
+
+        del (
+            batch,
+            input_images,
+            target_images,
+            target_latents,
+            input_latents,
+            noisy_inputs,
+            conditions,
+            latents_flat,
+            latent_shapes,
+            cond_flat,
+            noise,
+            timesteps,
+            x_t,
+            target,
+            prediction,
+            pred_x0,
+            predicted_images,
+            denoise,
+            latent_recon,
+            image_recon,
+            total_loss,
+        )
+        if config.cuda_cleanup_every > 0 and step % config.cuda_cleanup_every == 0:
+            cleanup_cuda_memory(device)
+            if config.debug_cuda_memory:
+                log_cuda_memory("post_cleanup", device, step)
+                if device.type == "cuda":
+                    torch.cuda.reset_peak_memory_stats(device)
 
     assert checkpoint_path is not None
     write_result_manifest(
