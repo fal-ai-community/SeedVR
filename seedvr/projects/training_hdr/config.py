@@ -95,6 +95,11 @@ class TrainingConfig:
     save_every: int = 500
     debug_cuda_memory: bool = True
     cuda_cleanup_every: int = 100
+    vae_use_tiling: bool = False
+    vae_use_tqdm: bool = False
+    dataloader_prefetch_factor: int = 2
+    dataloader_persistent_workers: bool = True
+    profile_step_time: bool = True
 
     @classmethod
     def from_path(cls, path: str | Path) -> "TrainingConfig":

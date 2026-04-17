@@ -5,6 +5,7 @@ import gc
 import json
 import random
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 import numpy as np
@@ -221,6 +222,41 @@ def cleanup_cuda_memory(device: torch.device) -> None:
         torch.cuda.empty_cache()
 
 
+def encode_images_to_latents(
+    runner: VideoDiffusionInfer,
+    images: torch.Tensor,
+    *,
+    use_tiling: bool,
+    use_tqdm: bool,
+) -> list[torch.Tensor]:
+    if images.numel() == 0:
+        return []
+
+    device = images.device
+    dtype = getattr(torch, runner.config.vae.dtype)
+    scale = runner.config.vae.scaling_factor
+    shift = runner.config.vae.get("shifting_factor", 0.0)
+
+    if isinstance(scale, ListConfig):
+        scale = torch.tensor(scale, device=device, dtype=dtype)
+    if isinstance(shift, ListConfig):
+        shift = torch.tensor(shift, device=device, dtype=dtype)
+
+    sample = images.to(device=device, dtype=dtype)
+    if hasattr(runner.vae, "preprocess"):
+        sample = runner.vae.preprocess(sample)
+
+    encoded = runner.vae.encode(
+        sample,
+        use_tiling=use_tiling,
+        use_tqdm=use_tqdm,
+    ).latent
+    encoded = encoded.unsqueeze(2) if encoded.ndim == 4 else encoded
+    encoded = rearrange(encoded, "b c ... -> b ... c")
+    encoded = (encoded - shift) * scale
+    return [latent for latent in encoded]
+
+
 def log_validation_previews_to_wandb(
     wandb_run: Any | None,
     preview_paths: list[Path],
@@ -379,6 +415,10 @@ def build_dataloaders(config: TrainingConfig) -> tuple[DataLoader, DataLoader]:
         drop_last=True,
         num_workers=config.num_workers,
         pin_memory=True,
+        persistent_workers=bool(config.dataloader_persistent_workers and config.num_workers > 0),
+        prefetch_factor=(
+            config.dataloader_prefetch_factor if config.num_workers > 0 else None
+        ),
     )
     val_loader = DataLoader(
         val_dataset,
@@ -387,6 +427,10 @@ def build_dataloaders(config: TrainingConfig) -> tuple[DataLoader, DataLoader]:
         drop_last=False,
         num_workers=min(2, config.num_workers),
         pin_memory=True,
+        persistent_workers=bool(config.dataloader_persistent_workers and min(2, config.num_workers) > 0),
+        prefetch_factor=(
+            config.dataloader_prefetch_factor if min(2, config.num_workers) > 0 else None
+        ),
     )
     return train_loader, val_loader
 
@@ -435,6 +479,8 @@ def decode_latents_to_images(
     latent_shapes: torch.Tensor,
 ) -> torch.Tensor:
     latents = na.unflatten(latents_flat, latent_shapes)
+    if not latents:
+        return torch.empty(0, device=latents_flat.device, dtype=torch.float32)
     device = latents_flat.device
     dtype = getattr(torch, runner.config.vae.dtype)
     scale = runner.config.vae.scaling_factor
@@ -445,25 +491,29 @@ def decode_latents_to_images(
     if isinstance(shift, ListConfig):
         shift = torch.tensor(shift, device=device, dtype=dtype)
 
-    decoded: list[torch.Tensor] = []
-    for latent in latents:
-        # Use a cloned latent tensor so the decode branch cannot mutate views
-        # that autograd is still tracking for the denoise / latent losses.
-        latent = latent.to(device=device, dtype=dtype).clone()
-        latent = latent / scale + shift
-        latent = rearrange(latent, "t h w c -> 1 c t h w")
-        # The public VAE decode path uses tiled helpers that are wrapped in
-        # @torch.no_grad() and perform in-place clamps. Bypass that path for
-        # training-time image loss so gradients stay valid.
-        if hasattr(runner.vae, "_decode"):
-            sample = runner.vae._decode(latent, memory_state=MemoryState.DISABLED)
-        else:
-            sample = runner.vae.decode(latent, use_tiling=False, use_tqdm=False).sample
-        if sample.ndim == 5 and sample.shape[2] == 1:
-            sample = sample.squeeze(2)
-        decoded.append(sample.squeeze(0).to(device=device, dtype=torch.float32))
+    # Use a cloned batch tensor so the decode branch cannot mutate views
+    # that autograd is still tracking for the denoise / latent losses.
+    latent_batch = torch.stack([latent for latent in latents], dim=0).to(
+        device=device,
+        dtype=dtype,
+    ).clone()
+    latent_batch = latent_batch / scale + shift
+    latent_batch = rearrange(latent_batch, "b t h w c -> b c t h w")
 
-    return torch.stack(decoded, dim=0)
+    # The public VAE decode path uses tiled helpers that are wrapped in
+    # @torch.no_grad() and perform in-place clamps. Bypass that path for
+    # training-time image loss so gradients stay valid.
+    if hasattr(runner.vae, "_decode"):
+        sample = runner.vae._decode(latent_batch, memory_state=MemoryState.DISABLED)
+    else:
+        sample = runner.vae.decode(
+            latent_batch,
+            use_tiling=False,
+            use_tqdm=False,
+        ).sample
+    if sample.ndim == 5 and sample.shape[2] == 1:
+        sample = sample.squeeze(2)
+    return sample.to(device=device, dtype=torch.float32)
 
 
 def run_validation(
@@ -491,8 +541,18 @@ def run_validation(
 
             input_images = batch["input_sdr"].to(device)
             target_images = batch["target"].to(device)
-            target_latents = runner.vae_encode([sample for sample in target_images])
-            input_latents = runner.vae_encode([sample for sample in input_images])
+            target_latents = encode_images_to_latents(
+                runner,
+                target_images,
+                use_tiling=config.vae_use_tiling,
+                use_tqdm=config.vae_use_tqdm,
+            )
+            input_latents = encode_images_to_latents(
+                runner,
+                input_images,
+                use_tiling=config.vae_use_tiling,
+                use_tqdm=config.vae_use_tqdm,
+            )
             noisy_inputs = [
                 add_condition_noise(runner, latent, runner.config.condition.noise_scale)
                 for latent in input_latents
@@ -622,6 +682,7 @@ def main() -> None:
         log_cuda_memory("train_start", device)
 
     for step in range(1, config.steps + 1):
+        step_started_at = perf_counter()
         try:
             batch = next(train_iter)
         except StopIteration:
@@ -631,9 +692,20 @@ def main() -> None:
         input_images = batch["input_sdr"].to(device, non_blocking=True)
         target_images = batch["target"].to(device, non_blocking=True)
 
+        encode_started_at = perf_counter()
         with torch.no_grad():
-            target_latents = runner.vae_encode([sample for sample in target_images])
-            input_latents = runner.vae_encode([sample for sample in input_images])
+            target_latents = encode_images_to_latents(
+                runner,
+                target_images,
+                use_tiling=config.vae_use_tiling,
+                use_tqdm=config.vae_use_tqdm,
+            )
+            input_latents = encode_images_to_latents(
+                runner,
+                input_images,
+                use_tiling=config.vae_use_tiling,
+                use_tqdm=config.vae_use_tqdm,
+            )
             noisy_inputs = [
                 add_condition_noise(runner, latent, runner.config.condition.noise_scale)
                 for latent in input_latents
@@ -642,6 +714,7 @@ def main() -> None:
                 runner.get_condition(target_latent, input_latent, task="sr")
                 for target_latent, input_latent in zip(target_latents, noisy_inputs)
             ]
+        encode_finished_at = perf_counter()
 
         latents_flat, latent_shapes = na.flatten(target_latents)
         cond_flat, _ = na.flatten(conditions)
@@ -661,6 +734,7 @@ def main() -> None:
         )
 
         optimizer.zero_grad(set_to_none=True)
+        dit_started_at = perf_counter()
         prediction = runner.dit(
             vid=torch.cat([x_t, cond_flat], dim=-1),
             txt=text_pos_embeds,
@@ -677,8 +751,10 @@ def main() -> None:
         )
         denoise = denoise_loss(prediction, target)
         latent_recon = latent_reconstruction_loss(pred_x0, latents_flat)
+        decode_started_at = perf_counter()
         predicted_images = decode_latents_to_images(runner, pred_x0, latent_shapes)
         image_recon = image_reconstruction_loss(predicted_images, target_images)
+        decode_finished_at = perf_counter()
 
         total_loss = (
             config.denoise_loss_weight * denoise
@@ -700,6 +776,7 @@ def main() -> None:
             torch.nn.utils.clip_grad_norm_(runner.dit.parameters(), config.grad_clip_norm)
         optimizer.step()
         scheduler.step()
+        step_finished_at = perf_counter()
 
         final_metrics = {
             "loss": float(total_loss.item()),
@@ -722,6 +799,20 @@ def main() -> None:
                 )
             ),
         }
+        if config.profile_step_time:
+            final_metrics.update(
+                {
+                    "encode_seconds": float(encode_finished_at - encode_started_at),
+                    "decode_seconds": float(decode_finished_at - decode_started_at),
+                    "post_encode_seconds": float(
+                        step_finished_at - encode_finished_at
+                    ),
+                    "post_decode_seconds": float(
+                        step_finished_at - decode_finished_at
+                    ),
+                    "step_seconds": float(step_finished_at - step_started_at),
+                }
+            )
         if config.debug_cuda_memory:
             final_metrics.update(get_cuda_memory_stats(device))
 
