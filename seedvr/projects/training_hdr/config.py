@@ -40,6 +40,8 @@ BASE_MODEL_SPECS: dict[str, CheckpointSpec] = {
     ),
 }
 
+SUPPORTED_TARGET_REPRESENTATIONS = {"raw_hdr", "mu_law_mu5000"}
+
 
 @dataclass
 class TrainingConfig:
@@ -62,6 +64,7 @@ class TrainingConfig:
     compressed_target_space: str
     task_mode: str
     target_representation: str = "mu_law_mu5000"
+    resume_from_checkpoint: str | None = None
     checkpoint_repo_id: str | None = None
     dit_filename: str | None = None
     vae_filename: str | None = None
@@ -100,6 +103,13 @@ class TrainingConfig:
     dataloader_prefetch_factor: int = 2
     dataloader_persistent_workers: bool = True
     profile_step_time: bool = True
+
+    def __post_init__(self) -> None:
+        if self.target_representation not in SUPPORTED_TARGET_REPRESENTATIONS:
+            raise ValueError(
+                f"Unsupported target_representation '{self.target_representation}'. "
+                f"Expected one of: {sorted(SUPPORTED_TARGET_REPRESENTATIONS)}"
+            )
 
     @classmethod
     def from_path(cls, path: str | Path) -> "TrainingConfig":

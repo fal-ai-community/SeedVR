@@ -20,7 +20,11 @@ from seedvr.common.diffusion.types import PredictionType
 from seedvr.models.dit import na
 from seedvr.models.embeds import PrecomputedEmbeddings
 from seedvr.models.video_vae_v3.modules.types import MemoryState
-from seedvr.projects.training_hdr.checkpointing import save_checkpoint, write_result_manifest
+from seedvr.projects.training_hdr.checkpointing import (
+    load_checkpoint,
+    save_checkpoint,
+    write_result_manifest,
+)
 from seedvr.projects.training_hdr.config import TrainingConfig
 from seedvr.projects.training_hdr.dataset import SeedVRHDRImageDataset
 from seedvr.projects.training_hdr.losses import (
@@ -647,6 +651,38 @@ def run_validation(
     return metrics, preview_paths
 
 
+def maybe_resume_training(
+    config: TrainingConfig,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
+    device: torch.device,
+) -> tuple[int, dict[str, float]]:
+    if not config.resume_from_checkpoint:
+        return 1, {}
+
+    checkpoint = load_checkpoint(
+        checkpoint_path=config.resume_from_checkpoint,
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        device=device,
+        restore_rng=True,
+    )
+    resumed_step = int(checkpoint.get("step", 0))
+    if resumed_step >= config.steps:
+        raise ValueError(
+            f"Resume checkpoint is already at step {resumed_step}, "
+            f"which is not below requested steps={config.steps}."
+        )
+    resumed_metrics = checkpoint.get("metrics") or {}
+    print(
+        f"[seedvr-hdr] resumed from checkpoint={config.resume_from_checkpoint} "
+        f"step={resumed_step}"
+    )
+    return resumed_step + 1, resumed_metrics
+
+
 def main() -> None:
     args = parse_args()
     config = TrainingConfig.from_path(args.config)
@@ -669,11 +705,20 @@ def main() -> None:
 
     optimizer = build_optimizer(config, runner.dit)
     scheduler = build_scheduler(config, optimizer)
+    start_step, resumed_metrics = maybe_resume_training(
+        config=config,
+        model=runner.dit,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        device=device,
+    )
+    runtime_info["resume_from_checkpoint"] = config.resume_from_checkpoint
+    runtime_info["start_step"] = start_step
     wandb_run = maybe_init_wandb(config)
 
     text_pos_embeds, text_pos_shapes = positive_embeddings
     train_iter = iter(train_loader)
-    final_metrics: dict[str, float] = {}
+    final_metrics: dict[str, float] = dict(resumed_metrics)
     latest_preview_paths: list[Path] = []
     checkpoint_path: Path | None = None
     if device.type == "cuda":
@@ -681,7 +726,7 @@ def main() -> None:
     if config.debug_cuda_memory:
         log_cuda_memory("train_start", device)
 
-    for step in range(1, config.steps + 1):
+    for step in range(start_step, config.steps + 1):
         step_started_at = perf_counter()
         try:
             batch = next(train_iter)
@@ -846,6 +891,7 @@ def main() -> None:
                 step=step,
                 model=runner.dit,
                 optimizer=optimizer,
+                scheduler=scheduler,
                 metrics=final_metrics,
                 config=config.to_dict() | runtime_info,
             )
