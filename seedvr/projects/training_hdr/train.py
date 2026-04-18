@@ -362,6 +362,24 @@ def build_optimizer(
                 warmup_steps=config.warmup_steps,
                 **common_kwargs,
             )
+        if config.optimizer_type == "heavyball_soap":
+            return heavyball.SOAP(
+                trainable_params,
+                warmup_steps=config.warmup_steps,
+                **common_kwargs,
+            )
+        if config.optimizer_type == "heavyball_psgdkron":
+            return heavyball.PSGDKron(
+                trainable_params,
+                warmup_steps=config.warmup_steps,
+                **common_kwargs,
+            )
+        if config.optimizer_type == "heavyball_lather":
+            return heavyball.LATHER(
+                trainable_params,
+                warmup_steps=config.warmup_steps,
+                **common_kwargs,
+            )
 
     if config.optimizer_type == "adamw":
         return torch.optim.AdamW(
