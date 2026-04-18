@@ -342,6 +342,27 @@ def build_optimizer(
     model: torch.nn.Module,
 ) -> torch.optim.Optimizer:
     trainable_params = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    if config.optimizer_type.startswith("heavyball_"):
+        import heavyball
+
+        common_kwargs = {
+            "lr": config.learning_rate,
+            "betas": (config.adam_beta1, config.adam_beta2),
+            "weight_decay": config.weight_decay,
+        }
+        if config.optimizer_type == "heavyball_adamw":
+            return heavyball.AdamW(trainable_params, **common_kwargs)
+        if config.optimizer_type == "heavyball_laprop":
+            return heavyball.LaProp(trainable_params, **common_kwargs)
+        if config.optimizer_type == "heavyball_muonadamw":
+            return heavyball.MuonAdamW(trainable_params, **common_kwargs)
+        if config.optimizer_type == "heavyball_sfadamw":
+            return heavyball.SFAdamW(
+                trainable_params,
+                warmup_steps=config.warmup_steps,
+                **common_kwargs,
+            )
+
     if config.optimizer_type == "adamw":
         return torch.optim.AdamW(
             trainable_params,
@@ -364,6 +385,9 @@ def build_scheduler(
     config: TrainingConfig,
     optimizer: torch.optim.Optimizer,
 ) -> torch.optim.lr_scheduler.LRScheduler:
+    if config.optimizer_type == "heavyball_sfadamw":
+        return torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _step: 1.0)
+
     if config.scheduler_type == "constant":
         return torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _step: 1.0)
 
@@ -525,6 +549,7 @@ def run_validation(
     runner: VideoDiffusionInfer,
     positive_embeddings: tuple[torch.Tensor, torch.Tensor],
     val_loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
     device: torch.device,
     step: int,
 ) -> tuple[dict[str, float], list[Path]]:
@@ -536,6 +561,8 @@ def run_validation(
     preview_dir.mkdir(parents=True, exist_ok=True)
 
     runner.dit.eval()
+    if hasattr(optimizer, "eval"):
+        optimizer.eval()
     if config.debug_cuda_memory:
         log_cuda_memory("validation_start", device, step)
     with torch.no_grad():
@@ -637,6 +664,8 @@ def run_validation(
             cleanup_cuda_memory(device)
 
     runner.dit.train()
+    if hasattr(optimizer, "train"):
+        optimizer.train()
     metrics = {
         "val_denoise_loss": float(np.mean(losses)) if losses else 0.0,
     }
@@ -872,6 +901,7 @@ def main() -> None:
                 runner=runner,
                 positive_embeddings=positive_embeddings,
                 val_loader=val_loader,
+                optimizer=optimizer,
                 device=device,
                 step=step,
             )
