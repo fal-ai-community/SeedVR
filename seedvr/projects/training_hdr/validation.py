@@ -18,6 +18,13 @@ def _input_tensor_to_uint8_image(tensor: torch.Tensor) -> np.ndarray:
     return np.transpose(array, (1, 2, 0))
 
 
+def _select_preview_frame(tensor: torch.Tensor) -> torch.Tensor:
+    if tensor.ndim == 4:
+        frame_index = tensor.shape[0] // 2
+        return tensor[frame_index]
+    return tensor
+
+
 def linear_hdr_from_target_tensor(
     tensor: torch.Tensor,
     target_representation: str,
@@ -62,6 +69,9 @@ def save_triptych(
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    input_image = _select_preview_frame(input_image)
+    predicted_image = _select_preview_frame(predicted_image)
+    target_image = _select_preview_frame(target_image)
     predicted_linear = linear_hdr_from_target_tensor(predicted_image, target_representation)
     target_linear = linear_hdr_from_target_tensor(target_image, target_representation)
     canvas = np.concatenate(
@@ -89,6 +99,17 @@ def compute_hdr_metrics(
     target_image: torch.Tensor,
     target_representation: str,
 ) -> dict[str, float]:
+    if predicted_image.ndim == 4 and target_image.ndim == 4:
+        frame_metrics = [
+            compute_hdr_metrics(predicted_image[index], target_image[index], target_representation)
+            for index in range(predicted_image.shape[0])
+        ]
+        metric_names = frame_metrics[0].keys()
+        return {
+            name: float(np.mean([row[name] for row in frame_metrics]))
+            for name in metric_names
+        }
+
     predicted_linear = linear_hdr_from_target_tensor(predicted_image, target_representation)
     target_linear = linear_hdr_from_target_tensor(target_image, target_representation)
 

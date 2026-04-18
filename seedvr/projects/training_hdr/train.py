@@ -26,7 +26,10 @@ from seedvr.projects.training_hdr.checkpointing import (
     write_result_manifest,
 )
 from seedvr.projects.training_hdr.config import TrainingConfig
-from seedvr.projects.training_hdr.dataset import SeedVRHDRImageDataset
+from seedvr.projects.training_hdr.dataset import (
+    SeedVRHDRImageDataset,
+    SeedVRHDRVideoDataset,
+)
 from seedvr.projects.training_hdr.losses import (
     denoise_loss,
     image_reconstruction_loss,
@@ -247,6 +250,8 @@ def encode_images_to_latents(
         shift = torch.tensor(shift, device=device, dtype=dtype)
 
     sample = images.to(device=device, dtype=dtype)
+    if sample.ndim == 5:
+        sample = rearrange(sample, "b t c h w -> b c t h w")
     if hasattr(runner.vae, "preprocess"):
         sample = runner.vae.preprocess(sample)
 
@@ -436,7 +441,8 @@ def current_loss_weight(target_weight: float, warmup_steps: int, step: int) -> f
 
 
 def build_dataloaders(config: TrainingConfig) -> tuple[DataLoader, DataLoader]:
-    train_dataset = SeedVRHDRImageDataset(
+    dataset_cls = SeedVRHDRVideoDataset if config.data_mode == "video" else SeedVRHDRImageDataset
+    train_dataset = dataset_cls(
         dataset_root=config.dataset_root,
         manifest_path=config.train_manifest,
         train_height=config.train_height,
@@ -445,7 +451,7 @@ def build_dataloaders(config: TrainingConfig) -> tuple[DataLoader, DataLoader]:
         seed=config.seed,
         target_representation=config.target_representation,
     )
-    val_dataset = SeedVRHDRImageDataset(
+    val_dataset = dataset_cls(
         dataset_root=config.dataset_root,
         manifest_path=config.val_manifest,
         train_height=config.train_height,
@@ -511,6 +517,9 @@ def build_runner(
     runtime_info["trainable_strategy"] = config.trainable_strategy
     runtime_info["num_trainable_parameters"] = num_trainable
     runtime_info["target_representation"] = config.target_representation
+    runtime_info["data_mode"] = config.data_mode
+    runtime_info["clip_length"] = config.clip_length
+    runtime_info["frame_stride"] = config.frame_stride
 
     positive, negative = PrecomputedEmbeddings.default(
         device=device,
@@ -557,8 +566,10 @@ def decode_latents_to_images(
             use_tiling=False,
             use_tqdm=False,
         ).sample
-    if sample.ndim == 5 and sample.shape[2] == 1:
-        sample = sample.squeeze(2)
+    if sample.ndim == 5:
+        sample = rearrange(sample, "b c t h w -> b t c h w")
+        if sample.shape[1] == 1:
+            sample = sample.squeeze(1)
     return sample.to(device=device, dtype=torch.float32)
 
 

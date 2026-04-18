@@ -63,6 +63,9 @@ class TrainingConfig:
     num_validation_samples: int
     compressed_target_space: str
     task_mode: str
+    data_mode: str = "image"
+    clip_length: int = 1
+    frame_stride: int = 1
     target_representation: str = "mu_law_mu5000"
     resume_from_checkpoint: str | None = None
     checkpoint_repo_id: str | None = None
@@ -110,6 +113,14 @@ class TrainingConfig:
                 f"Unsupported target_representation '{self.target_representation}'. "
                 f"Expected one of: {sorted(SUPPORTED_TARGET_REPRESENTATIONS)}"
             )
+        if self.data_mode not in {"image", "video"}:
+            raise ValueError(
+                f"Unsupported data_mode '{self.data_mode}'. Expected 'image' or 'video'."
+            )
+        if self.clip_length < 1:
+            raise ValueError("clip_length must be >= 1")
+        if self.frame_stride < 1:
+            raise ValueError("frame_stride must be >= 1")
 
     @classmethod
     def from_path(cls, path: str | Path) -> "TrainingConfig":
