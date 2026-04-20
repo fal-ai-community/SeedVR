@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import random
 from dataclasses import dataclass
 from dataclasses import fields
@@ -11,6 +12,10 @@ import cv2
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+
+
+MU_LAW_MU = 5000.0
+LOG_HDR_EPS = 1.0e-6
 
 
 @dataclass(frozen=True)
@@ -70,6 +75,37 @@ def _read_target_array(path: Path) -> np.ndarray:
     if target.ndim != 3 or target.shape[-1] != 3:
         raise ValueError(f"Expected HWC RGB target at {path}, got {target.shape}")
     return np.nan_to_num(target.astype(np.float32), nan=0.0, posinf=1.0e6, neginf=-1.0e6)
+
+
+def _read_hdr_image(path: Path) -> np.ndarray:
+    if path.suffix.lower() == ".exr":
+        os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
+    image = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+    if image is None:
+        raise FileNotFoundError(f"Failed to read HDR image: {path}")
+    if image.ndim == 2:
+        image = np.stack([image, image, image], axis=-1)
+    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB).astype(np.float32)
+    return np.nan_to_num(image, nan=0.0, posinf=1.0e6, neginf=0.0)
+
+
+def _compress_target_from_hdr(hdr: np.ndarray, target_representation: str) -> np.ndarray:
+    hdr = np.maximum(hdr.astype(np.float32), 0.0)
+    if target_representation == "raw_hdr":
+        return hdr
+    if target_representation == "mu_law_mu5000":
+        return np.log1p(MU_LAW_MU * hdr) / np.log1p(MU_LAW_MU)
+    if target_representation == "log_hdr":
+        return np.log(hdr + LOG_HDR_EPS)
+    raise ValueError(f"Unsupported target_representation: {target_representation}")
+
+
+def _read_target_for_representation(path: Path, target_representation: str) -> np.ndarray:
+    if path.suffix.lower() == ".npy":
+        return _read_target_array(path)
+    if path.suffix.lower() in {".exr", ".hdr"}:
+        return _compress_target_from_hdr(_read_hdr_image(path), target_representation)
+    raise ValueError(f"Unsupported target file extension for {path}")
 
 
 def _resize_to_cover(
@@ -220,9 +256,9 @@ class SeedVRHDRImageDataset(Dataset):
         rng = random.Random((self.seed * 10_000) + index)
 
         input_path = self.dataset_root / self._single_path(sample, "input_sdr")
-        target_path = self.dataset_root / self._single_target_path(sample)
+        target_path = self._resolve_dataset_path(self._single_target_path(sample))
         input_image = _read_rgb_png(input_path)
-        target_image = _read_target_array(target_path)
+        target_image = _read_target_for_representation(target_path, self.target_representation)
 
         if input_image.shape[:2] != target_image.shape[:2]:
             raise ValueError(
@@ -269,14 +305,18 @@ class SeedVRHDRImageDataset(Dataset):
         if self.target_representation == "raw_hdr":
             if sample.target_hdr_npy_path:
                 return sample.target_hdr_npy_path
-            if sample.target_hdr_path and sample.target_hdr_path.endswith(".npy"):
+            if sample.target_hdr_path:
                 return sample.target_hdr_path
         elif self.target_representation == "mu_law_mu5000":
             if sample.target_mu_law_path:
                 return sample.target_mu_law_path
+            if sample.target_hdr_path:
+                return sample.target_hdr_path
         elif self.target_representation == "log_hdr":
             if sample.target_log_hdr_path:
                 return sample.target_log_hdr_path
+            if sample.target_hdr_path:
+                return sample.target_hdr_path
         else:
             raise ValueError(f"Unsupported target_representation: {self.target_representation}")
 
@@ -285,6 +325,10 @@ class SeedVRHDRImageDataset(Dataset):
         raise ValueError(
             f"Sample {sample.sample_id} does not provide a target path for {self.target_representation}"
         )
+
+    def _resolve_dataset_path(self, raw_path: str) -> Path:
+        path = Path(raw_path)
+        return path if path.is_absolute() else self.dataset_root / path
 
 
 class SeedVRHDRVideoDataset(Dataset):
@@ -316,7 +360,10 @@ class SeedVRHDRVideoDataset(Dataset):
         target_paths = self._target_path_list(sample)
 
         input_images = [_read_rgb_png(self.dataset_root / path) for path in input_paths]
-        target_images = [_read_target_array(self.dataset_root / path) for path in target_paths]
+        target_images = [
+            _read_target_for_representation(self._resolve_dataset_path(path), self.target_representation)
+            for path in target_paths
+        ]
         if len(input_images) != len(target_images):
             raise ValueError(
                 f"Input/target clip length mismatch for {sample.sample_id}: "
@@ -388,16 +435,28 @@ class SeedVRHDRVideoDataset(Dataset):
                 return sample.target_hdr_npy_paths
             if sample.target_hdr_npy_path:
                 return [sample.target_hdr_npy_path]
+            if sample.target_hdr_paths:
+                return sample.target_hdr_paths
+            if sample.target_hdr_path:
+                return [sample.target_hdr_path]
         elif self.target_representation == "mu_law_mu5000":
             if sample.target_mu_law_paths:
                 return sample.target_mu_law_paths
             if sample.target_mu_law_path:
                 return [sample.target_mu_law_path]
+            if sample.target_hdr_paths:
+                return sample.target_hdr_paths
+            if sample.target_hdr_path:
+                return [sample.target_hdr_path]
         elif self.target_representation == "log_hdr":
             if sample.target_log_hdr_paths:
                 return sample.target_log_hdr_paths
             if sample.target_log_hdr_path:
                 return [sample.target_log_hdr_path]
+            if sample.target_hdr_paths:
+                return sample.target_hdr_paths
+            if sample.target_hdr_path:
+                return [sample.target_hdr_path]
         else:
             raise ValueError(f"Unsupported target_representation: {self.target_representation}")
 
@@ -408,3 +467,7 @@ class SeedVRHDRVideoDataset(Dataset):
         raise ValueError(
             f"Sample {sample.sample_id} does not provide a target path list for {self.target_representation}"
         )
+
+    def _resolve_dataset_path(self, raw_path: str) -> Path:
+        path = Path(raw_path)
+        return path if path.is_absolute() else self.dataset_root / path
