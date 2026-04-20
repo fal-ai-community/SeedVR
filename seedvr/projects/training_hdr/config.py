@@ -82,6 +82,7 @@ class TrainingConfig:
     torch_compile_fullgraph: bool = False
     use_fa3: bool = True
     allow_attention_fallback: bool = True
+    use_mxfp8: bool = False
     optimizer_type: str = "adamw"
     scheduler_type: str = "cosine"
     warmup_steps: int = 100

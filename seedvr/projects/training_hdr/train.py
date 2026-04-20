@@ -43,6 +43,15 @@ try:
 except ImportError:  # pragma: no cover - optional at runtime
     wandb = None
 
+try:
+    from torchao.float8 import (  # type: ignore
+        Float8LinearConfig,
+        convert_to_float8_training,
+    )
+except ImportError:  # pragma: no cover - optional dependency
+    convert_to_float8_training = None  # type: ignore[assignment]
+    Float8LinearConfig = None  # type: ignore[assignment]
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train SeedVR on image-first HDR pairs.")
@@ -153,6 +162,35 @@ def configure_runtime_optimizations(config: TrainingConfig, device: torch.device
         "set_attention_backend(...) switch."
     )
     return runtime_info
+
+
+def maybe_enable_mxfp8_training(
+    model: torch.nn.Module, config: TrainingConfig
+) -> tuple[torch.nn.Module, bool]:
+    if not config.use_mxfp8:
+        return model, False
+    if convert_to_float8_training is None or Float8LinearConfig is None:
+        print("[seedvr-hdr] torchao not available; skipping MXFP8 float8 training.")
+        return model, False
+
+    def module_filter_fn(mod: torch.nn.Module, fqn: str) -> bool:
+        if isinstance(mod, torch.nn.Linear):
+            if mod.in_features % 16 != 0 or mod.out_features % 16 != 0:
+                return False
+        return True
+
+    try:
+        float8_config = Float8LinearConfig(pad_inner_dim=True)
+        model = convert_to_float8_training(
+            model,
+            module_filter_fn=module_filter_fn,
+            config=float8_config,
+        )
+    except Exception as exc:  # pragma: no cover - runtime fallback
+        print(f"[seedvr-hdr] MXFP8 float8 training disabled after failure: {exc}")
+        return model, False
+    print("[seedvr-hdr] MXFP8 float8 training enabled for DiT linear layers.")
+    return model, True
 
 
 def maybe_compile_dit(model: torch.nn.Module, config: TrainingConfig) -> tuple[torch.nn.Module, bool]:
@@ -270,14 +308,142 @@ def log_validation_previews_to_wandb(
     wandb_run: Any | None,
     preview_paths: list[Path],
     step: int,
+    preview_captions: list[str] | None = None,
 ) -> None:
     if wandb_run is None or wandb is None or not preview_paths:
         return
     images = [
-        wandb.Image(str(path), caption=f"step={step} preview={idx}")
+        wandb.Image(
+            str(path),
+            caption=(
+                preview_captions[idx]
+                if preview_captions is not None and idx < len(preview_captions)
+                else f"step={step} preview={idx}"
+            ),
+        )
         for idx, path in enumerate(preview_paths)
     ]
     wandb.log({"step": step, "validation_previews": images})
+
+
+def build_preview_indices(
+    *,
+    dataset_size: int,
+    num_previews: int,
+    step: int,
+    validate_every: int,
+) -> list[int]:
+    if dataset_size <= 0 or num_previews <= 0:
+        return []
+    count = min(dataset_size, num_previews)
+    if dataset_size <= count:
+        return list(range(dataset_size))
+
+    base_indices = [
+        min(dataset_size - 1, int((index * dataset_size) / count))
+        for index in range(count)
+    ]
+    validation_round = max(0, (max(1, step) - 1) // max(1, validate_every))
+    offset = validation_round % dataset_size
+    return [int((base_index + offset) % dataset_size) for base_index in base_indices]
+
+
+def single_sample_to_batch(sample: dict[str, Any]) -> dict[str, Any]:
+    batch: dict[str, Any] = {}
+    for key, value in sample.items():
+        if torch.is_tensor(value):
+            batch[key] = value.unsqueeze(0)
+        else:
+            batch[key] = value
+    return batch
+
+
+def evaluate_validation_batch(
+    *,
+    config: TrainingConfig,
+    runner: VideoDiffusionInfer,
+    text_pos_embeds: torch.Tensor,
+    text_pos_shapes: torch.Tensor,
+    batch: dict[str, Any],
+    device: torch.device,
+) -> tuple[float, dict[str, float], torch.Tensor, torch.Tensor, torch.Tensor]:
+    input_images = batch["input_sdr"].to(device)
+    target_images = batch["target"].to(device)
+    target_latents = encode_images_to_latents(
+        runner,
+        target_images,
+        use_tiling=config.vae_use_tiling,
+        use_tqdm=config.vae_use_tqdm,
+    )
+    input_latents = encode_images_to_latents(
+        runner,
+        input_images,
+        use_tiling=config.vae_use_tiling,
+        use_tqdm=config.vae_use_tqdm,
+    )
+    noisy_inputs = [
+        add_condition_noise(runner, latent, runner.config.condition.noise_scale)
+        for latent in input_latents
+    ]
+    conditions = [
+        runner.get_condition(target_latent, input_latent, task="sr")
+        for target_latent, input_latent in zip(target_latents, noisy_inputs)
+    ]
+
+    latents_flat, latent_shapes = na.flatten(target_latents)
+    cond_flat, _ = na.flatten(conditions)
+    noise = torch.randn_like(latents_flat)
+    timesteps = torch.full(
+        (len(target_latents),),
+        runner.schedule.T * 0.5,
+        device=device,
+        dtype=latents_flat.dtype,
+    )
+    timesteps = runner.timestep_transform(timesteps, latent_shapes).to(latents_flat.dtype)
+    x_t = runner.schedule.forward(latents_flat, noise, timesteps)
+    target = runner.schedule.convert_to_pred(
+        latents_flat,
+        noise,
+        timesteps,
+        PredictionType.v_lerp,
+    )
+    prediction = runner.dit(
+        vid=torch.cat([x_t, cond_flat], dim=-1),
+        txt=text_pos_embeds,
+        vid_shape=latent_shapes,
+        txt_shape=text_pos_shapes,
+        timestep=timesteps,
+    ).vid_sample
+    denoise = denoise_loss(prediction, target).item()
+    pred_x0, _ = runner.schedule.convert_from_pred(
+        prediction,
+        PredictionType.v_lerp,
+        x_t,
+        timesteps,
+    )
+    predicted_images = decode_latents_to_images(runner, pred_x0, latent_shapes)
+    hdr_metrics = compute_hdr_metrics(
+        predicted_image=predicted_images[0],
+        target_image=target_images[0],
+        target_representation=config.target_representation,
+    )
+
+    del (
+        target_latents,
+        input_latents,
+        noisy_inputs,
+        conditions,
+        latents_flat,
+        latent_shapes,
+        cond_flat,
+        noise,
+        timesteps,
+        x_t,
+        target,
+        prediction,
+        pred_x0,
+    )
+    return denoise, hdr_metrics, input_images, target_images, predicted_images
 
 
 def select_trainable_parameters(model: torch.nn.Module, strategy: str) -> int:
@@ -509,6 +675,9 @@ def build_runner(
     num_trainable = select_trainable_parameters(runner.dit, config.trainable_strategy)
 
     runtime_info = configure_runtime_optimizations(config, device)
+    runner.dit, mxfp8_active = maybe_enable_mxfp8_training(runner.dit, config)
+    runtime_info["mxfp8_requested"] = config.use_mxfp8
+    runtime_info["mxfp8_active"] = mxfp8_active
     runner.dit, compiled = maybe_compile_dit(runner.dit, config)
     runtime_info["torch_compile_active"] = compiled
     runtime_info["model_config_path"] = str(model_config_path)
@@ -581,13 +750,23 @@ def run_validation(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     step: int,
-) -> tuple[dict[str, float], list[Path]]:
+) -> tuple[dict[str, float], list[Path], list[str]]:
     text_pos_embeds, text_pos_shapes = positive_embeddings
     preview_paths: list[Path] = []
+    preview_captions: list[str] = []
     losses: list[float] = []
     hdr_metric_rows: list[dict[str, float]] = []
     preview_dir = config.output_path / "validation"
     preview_dir.mkdir(parents=True, exist_ok=True)
+    metric_limit = config.num_validation_samples
+    preview_index_set = set(
+        build_preview_indices(
+            dataset_size=len(val_loader.dataset),
+            num_previews=config.num_validation_samples,
+            step=step,
+            validate_every=config.validate_every,
+        )
+    )
 
     runner.dit.eval()
     if hasattr(optimizer, "eval"):
@@ -596,100 +775,101 @@ def run_validation(
         log_cuda_memory("validation_start", device, step)
     with torch.no_grad():
         for idx, batch in enumerate(val_loader):
-            if idx >= config.num_validation_samples:
+            if idx >= metric_limit:
                 break
 
-            input_images = batch["input_sdr"].to(device)
-            target_images = batch["target"].to(device)
-            target_latents = encode_images_to_latents(
-                runner,
-                target_images,
-                use_tiling=config.vae_use_tiling,
-                use_tqdm=config.vae_use_tqdm,
-            )
-            input_latents = encode_images_to_latents(
-                runner,
-                input_images,
-                use_tiling=config.vae_use_tiling,
-                use_tqdm=config.vae_use_tqdm,
-            )
-            noisy_inputs = [
-                add_condition_noise(runner, latent, runner.config.condition.noise_scale)
-                for latent in input_latents
-            ]
-            conditions = [
-                runner.get_condition(target_latent, input_latent, task="sr")
-                for target_latent, input_latent in zip(target_latents, noisy_inputs)
-            ]
-
-            latents_flat, latent_shapes = na.flatten(target_latents)
-            cond_flat, _ = na.flatten(conditions)
-            noise = torch.randn_like(latents_flat)
-            timesteps = torch.full(
-                (len(target_latents),),
-                runner.schedule.T * 0.5,
+            denoise, hdr_metrics, input_images, target_images, predicted_images = evaluate_validation_batch(
+                config=config,
+                runner=runner,
+                text_pos_embeds=text_pos_embeds,
+                text_pos_shapes=text_pos_shapes,
+                batch=batch,
                 device=device,
-                dtype=latents_flat.dtype,
             )
-            timesteps = runner.timestep_transform(timesteps, latent_shapes).to(latents_flat.dtype)
-            x_t = runner.schedule.forward(latents_flat, noise, timesteps)
-            target = runner.schedule.convert_to_pred(
-                latents_flat,
-                noise,
-                timesteps,
-                PredictionType.v_lerp,
-            )
-            prediction = runner.dit(
-                vid=torch.cat([x_t, cond_flat], dim=-1),
-                txt=text_pos_embeds,
-                vid_shape=latent_shapes,
-                txt_shape=text_pos_shapes,
-                timestep=timesteps,
-            ).vid_sample
-            losses.append(denoise_loss(prediction, target).item())
-            pred_x0, _ = runner.schedule.convert_from_pred(
-                prediction,
-                PredictionType.v_lerp,
-                x_t,
-                timesteps,
-            )
-            predicted_images = decode_latents_to_images(runner, pred_x0, latent_shapes)
-            hdr_metric_rows.append(
-                compute_hdr_metrics(
-                    predicted_image=predicted_images[0],
-                    target_image=target_images[0],
+            losses.append(denoise)
+            hdr_metric_rows.append(hdr_metrics)
+            if idx in preview_index_set:
+                preview_path = save_triptych(
+                    preview_dir / f"step_{step:06d}_{len(preview_paths):02d}.png",
+                    input_images[0].cpu(),
+                    predicted_images[0].cpu(),
+                    target_images[0].cpu(),
                     target_representation=config.target_representation,
                 )
-            )
-            preview_path = save_triptych(
-                preview_dir / f"step_{step:06d}_{idx:02d}.png",
-                input_images[0].cpu(),
-                predicted_images[0].cpu(),
-                target_images[0].cpu(),
-                target_representation=config.target_representation,
-            )
-            preview_paths.append(preview_path)
+                preview_paths.append(preview_path)
+                scene_value = batch.get("scene_id", "")
+                sample_value = batch.get("sample_id", "")
+                if isinstance(scene_value, list):
+                    scene_value = scene_value[0] if scene_value else ""
+                if isinstance(sample_value, list):
+                    sample_value = sample_value[0] if sample_value else ""
+                preview_captions.append(
+                    " ".join(
+                        part
+                        for part in [
+                            f"step={step}",
+                            f"preview={len(preview_paths) - 1}",
+                            f"scene={scene_value}",
+                            f"sample={sample_value}",
+                        ]
+                        if part
+                    )
+                )
             if config.debug_cuda_memory:
                 log_cuda_memory(f"validation_sample idx={idx}", device, step)
 
             del (
                 input_images,
                 target_images,
-                target_latents,
-                input_latents,
-                noisy_inputs,
-                conditions,
-                latents_flat,
-                latent_shapes,
-                cond_flat,
-                noise,
-                timesteps,
-                x_t,
-                target,
-                prediction,
-                pred_x0,
                 predicted_images,
             )
+            cleanup_cuda_memory(device)
+
+        dataset = val_loader.dataset
+        extra_preview_indices = [
+            index
+            for index in build_preview_indices(
+                dataset_size=len(dataset),
+                num_previews=config.num_validation_samples,
+                step=step,
+                validate_every=config.validate_every,
+            )
+            if index >= metric_limit
+        ]
+        for sample_index in extra_preview_indices:
+            sample = dataset[sample_index]
+            batch = single_sample_to_batch(sample)
+            _denoise, _hdr_metrics, input_images, target_images, predicted_images = evaluate_validation_batch(
+                config=config,
+                runner=runner,
+                text_pos_embeds=text_pos_embeds,
+                text_pos_shapes=text_pos_shapes,
+                batch=batch,
+                device=device,
+            )
+            preview_path = save_triptych(
+                preview_dir / f"step_{step:06d}_{len(preview_paths):02d}.png",
+                input_images[0].cpu(),
+                predicted_images[0].cpu(),
+                target_images[0].cpu(),
+                target_representation=config.target_representation,
+            )
+            preview_paths.append(preview_path)
+            preview_captions.append(
+                " ".join(
+                    part
+                    for part in [
+                        f"step={step}",
+                        f"preview={len(preview_paths) - 1}",
+                        f"scene={sample.get('scene_id', '')}",
+                        f"sample={sample.get('sample_id', '')}",
+                    ]
+                    if part
+                )
+            )
+            if config.debug_cuda_memory:
+                log_cuda_memory(f"validation_preview sample_index={sample_index}", device, step)
+            del input_images, target_images, predicted_images
             cleanup_cuda_memory(device)
 
     runner.dit.train()
@@ -706,7 +886,7 @@ def run_validation(
         log_cuda_memory("validation_end", device, step)
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
-    return metrics, preview_paths
+    return metrics, preview_paths, preview_captions
 
 
 def maybe_resume_training(
@@ -778,6 +958,7 @@ def main() -> None:
     train_iter = iter(train_loader)
     final_metrics: dict[str, float] = dict(resumed_metrics)
     latest_preview_paths: list[Path] = []
+    latest_preview_captions: list[str] = []
     checkpoint_path: Path | None = None
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
@@ -925,7 +1106,7 @@ def main() -> None:
                 wandb.log({"step": step, **final_metrics})
 
         if step % config.validate_every == 0 or step == config.steps:
-            val_metrics, latest_preview_paths = run_validation(
+            val_metrics, latest_preview_paths, latest_preview_captions = run_validation(
                 config=config,
                 runner=runner,
                 positive_embeddings=positive_embeddings,
@@ -942,6 +1123,7 @@ def main() -> None:
                     wandb_run=wandb_run,
                     preview_paths=latest_preview_paths,
                     step=step,
+                    preview_captions=latest_preview_captions,
                 )
 
         if step % config.save_every == 0 or step == config.steps:
