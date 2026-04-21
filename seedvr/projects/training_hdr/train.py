@@ -639,6 +639,11 @@ def build_dataloaders(config: TrainingConfig) -> tuple[DataLoader, DataLoader]:
         random_crop=True,
         seed=config.seed,
         target_representation=config.target_representation,
+        runtime_cache_root=config.runtime_cache_root,
+        download_timeout_seconds=config.remote_download_timeout_seconds,
+        download_retries=config.remote_download_retries,
+        cache_rendered_sdr_inputs=config.cache_rendered_sdr_inputs,
+        cache_compressed_targets=config.cache_compressed_targets,
     )
     val_dataset = dataset_cls(
         dataset_root=config.dataset_root,
@@ -648,6 +653,11 @@ def build_dataloaders(config: TrainingConfig) -> tuple[DataLoader, DataLoader]:
         random_crop=False,
         seed=config.seed,
         target_representation=config.target_representation,
+        runtime_cache_root=config.runtime_cache_root,
+        download_timeout_seconds=config.remote_download_timeout_seconds,
+        download_retries=config.remote_download_retries,
+        cache_rendered_sdr_inputs=config.cache_rendered_sdr_inputs,
+        cache_compressed_targets=config.cache_compressed_targets,
     )
     train_loader = DataLoader(
         train_dataset,

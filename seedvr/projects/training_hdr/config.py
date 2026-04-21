@@ -88,6 +88,11 @@ class TrainingConfig:
     warmup_steps: int = 100
     min_lr_ratio: float = 0.1
     num_workers: int = 4
+    runtime_cache_root: str = "/data/seedvr_hdr_runtime_cache"
+    remote_download_timeout_seconds: int = 120
+    remote_download_retries: int = 5
+    cache_rendered_sdr_inputs: bool = True
+    cache_compressed_targets: bool = True
     denoise_loss_weight: float = 1.0
     latent_recon_loss_weight: float = 0.1
     image_recon_loss_weight: float = 0.0
