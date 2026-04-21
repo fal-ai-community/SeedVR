@@ -1,1 +1,1 @@
-Add Falcon OCR text reconstruction loss
+Fix HDR image loss decode path for training
