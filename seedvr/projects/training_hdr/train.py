@@ -35,6 +35,7 @@ from seedvr.projects.training_hdr.losses import (
     image_reconstruction_loss,
     latent_reconstruction_loss,
 )
+from seedvr.projects.training_hdr.text_recon import FalconOCRConfig, FalconOCRTextTeacher
 from seedvr.projects.training_hdr.validation import compute_hdr_metrics, save_triptych
 from seedvr.projects.video_diffusion_sr.infer import VideoDiffusionInfer
 
@@ -236,6 +237,28 @@ def maybe_init_wandb(config: TrainingConfig) -> Any | None:
         config=config.to_dict(),
     )
     return run
+
+
+def maybe_init_text_teacher(
+    config: TrainingConfig,
+    device: torch.device,
+) -> FalconOCRTextTeacher | None:
+    if config.text_recon_loss_weight <= 0.0:
+        return None
+    try:
+        return FalconOCRTextTeacher(
+            device=device,
+            dtype=torch.bfloat16,
+            config=FalconOCRConfig(
+                model_id=config.text_recon_model_id,
+                max_new_tokens=config.text_recon_max_new_tokens,
+                min_dimension=config.text_recon_min_dimension,
+                max_dimension=config.text_recon_max_dimension,
+            ),
+        )
+    except Exception as exc:
+        print(f"[seedvr-hdr] Falcon-OCR text loss disabled after init failure: {exc}")
+        return None
 
 
 def get_cuda_memory_stats(device: torch.device) -> dict[str, float]:
@@ -952,6 +975,9 @@ def main() -> None:
     )
     runtime_info["resume_from_checkpoint"] = config.resume_from_checkpoint
     runtime_info["start_step"] = start_step
+    text_teacher = maybe_init_text_teacher(config, device)
+    runtime_info["text_recon_enabled"] = bool(text_teacher is not None)
+    runtime_info["text_recon_model_id"] = config.text_recon_model_id
     wandb_run = maybe_init_wandb(config)
 
     text_pos_embeds, text_pos_shapes = positive_embeddings
@@ -1038,6 +1064,30 @@ def main() -> None:
         decode_started_at = perf_counter()
         predicted_images = decode_latents_to_images(runner, pred_x0, latent_shapes)
         image_recon = image_reconstruction_loss(predicted_images, target_images)
+        text_recon = predicted_images.new_zeros(())
+        text_metrics = {
+            "text_recon_loss": 0.0,
+            "text_recon_active": 0.0,
+            "text_recon_tokens": 0.0,
+            "text_recon_chars": 0.0,
+        }
+        text_recon_weight = current_loss_weight(
+            config.text_recon_loss_weight,
+            config.text_loss_warmup_steps,
+            step,
+        )
+        should_run_text_recon = (
+            text_teacher is not None
+            and text_recon_weight > 0.0
+            and config.text_recon_every > 0
+            and step % config.text_recon_every == 0
+        )
+        if should_run_text_recon:
+            text_recon, text_metrics = text_teacher.compute_loss(
+                predicted_images=predicted_images,
+                target_images=target_images,
+                target_representation=config.target_representation,
+            )
         decode_finished_at = perf_counter()
 
         total_loss = (
@@ -1054,6 +1104,7 @@ def main() -> None:
                 step,
             )
             * image_recon
+            + text_recon_weight * text_recon
         )
         total_loss.backward()
         if config.grad_clip_norm > 0:
@@ -1067,6 +1118,7 @@ def main() -> None:
             "denoise_loss": float(denoise.item()),
             "latent_recon_loss": float(latent_recon.item()),
             "image_recon_loss": float(image_recon.item()),
+            "text_recon_loss": float(text_recon.item()),
             "lr": float(optimizer.param_groups[0]["lr"]),
             "latent_recon_weight": float(
                 current_loss_weight(
@@ -1082,7 +1134,9 @@ def main() -> None:
                     step,
                 )
             ),
+            "text_recon_weight": float(text_recon_weight),
         }
+        final_metrics.update(text_metrics)
         if config.profile_step_time:
             final_metrics.update(
                 {
@@ -1160,6 +1214,7 @@ def main() -> None:
             denoise,
             latent_recon,
             image_recon,
+            text_recon,
             total_loss,
         )
         if config.cuda_cleanup_every > 0 and step % config.cuda_cleanup_every == 0:

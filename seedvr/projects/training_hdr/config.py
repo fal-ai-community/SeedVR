@@ -91,8 +91,15 @@ class TrainingConfig:
     denoise_loss_weight: float = 1.0
     latent_recon_loss_weight: float = 0.1
     image_recon_loss_weight: float = 0.0
+    text_recon_loss_weight: float = 0.0
     latent_loss_warmup_steps: int = 0
     image_loss_warmup_steps: int = 0
+    text_loss_warmup_steps: int = 0
+    text_recon_every: int = 10
+    text_recon_model_id: str = "tiiuae/Falcon-OCR"
+    text_recon_max_new_tokens: int = 128
+    text_recon_min_dimension: int = 64
+    text_recon_max_dimension: int = 768
     grad_clip_norm: float = 1.0
     adam_beta1: float = 0.9
     adam_beta2: float = 0.95
