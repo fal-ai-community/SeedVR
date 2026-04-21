@@ -327,6 +327,23 @@ def _suffix_hint(value: str | None, default: str) -> str:
     return suffix or default
 
 
+def _validate_cached_asset(path: Path) -> None:
+    suffix = path.suffix.lower()
+    if suffix in {".exr", ".hdr"}:
+        _read_hdr_image(path)
+        return
+    if suffix in {".png", ".jpg", ".jpeg"}:
+        _read_rgb_png(path)
+        return
+    if suffix == ".npy":
+        _read_target_array(path)
+        return
+    if not path.exists():
+        raise FileNotFoundError(f"Cached asset does not exist: {path}")
+    if path.stat().st_size <= 0:
+        raise ValueError(f"Cached asset is empty: {path}")
+
+
 def _atomic_write_png(path: Path, image: np.ndarray) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(dir=path.parent, suffix=".png", delete=False) as tmp_file:
@@ -409,6 +426,7 @@ class _RuntimeAssetCache:
         kind: str,
         cache_key: str,
         default_suffix: str,
+        force_refresh: bool = False,
     ) -> Path:
         if raw_path:
             candidate = self.resolve_dataset_path(raw_path)
@@ -421,13 +439,18 @@ class _RuntimeAssetCache:
         suffix = _suffix_hint(raw_path or raw_url, default_suffix)
         digest = _sha1_text(f"{kind}|{cache_key}|{raw_url}")
         dest = self.runtime_cache_root / "remote" / kind / digest[:2] / f"{digest}{suffix}"
-        if dest.exists():
+        if dest.exists() and not force_refresh:
             return dest
 
         lock_path = dest.with_suffix(dest.suffix + ".lock")
         with _file_lock(lock_path):
-            if dest.exists():
+            if dest.exists() and not force_refresh:
                 return dest
+            if force_refresh:
+                try:
+                    dest.unlink()
+                except FileNotFoundError:
+                    pass
             self._download_url(raw_url, dest)
         return dest
 
@@ -449,11 +472,16 @@ class _RuntimeAssetCache:
                             break
                         output_file.write(chunk)
                 os.replace(tmp_path, dest)
+                _validate_cached_asset(dest)
                 return
             except Exception as exc:  # pragma: no cover - exercised in runner
                 last_error = exc
                 try:
                     tmp_path.unlink()
+                except FileNotFoundError:
+                    pass
+                try:
+                    dest.unlink()
                 except FileNotFoundError:
                     pass
                 if attempt >= self.download_retries:
@@ -561,6 +589,7 @@ class _SeedVRHDRDatasetBase(Dataset):
         kind: str,
         cache_key: str,
         default_suffix: str,
+        force_refresh: bool = False,
     ) -> Path:
         raw_path, raw_url = pair
         return self.asset_cache.resolve_local_or_remote(
@@ -569,14 +598,15 @@ class _SeedVRHDRDatasetBase(Dataset):
             kind=kind,
             cache_key=cache_key,
             default_suffix=default_suffix,
+            force_refresh=force_refresh,
         )
 
-    def _resolve_hdr_source_path(
+    def _hdr_source_candidates(
         self,
         sample: ManifestSample,
         *,
         frame_index: int | None = None,
-    ) -> Path:
+    ) -> list[tuple[str | None, str | None]]:
         candidates = []
         if frame_index is None:
             candidates.extend(
@@ -590,6 +620,16 @@ class _SeedVRHDRDatasetBase(Dataset):
                 pairs = self._pair_list(sample, field_name)
                 if frame_index < len(pairs):
                     candidates.append(pairs[frame_index])
+        return candidates
+
+    def _resolve_hdr_source_path(
+        self,
+        sample: ManifestSample,
+        *,
+        frame_index: int | None = None,
+        force_refresh: bool = False,
+    ) -> Path:
+        candidates = self._hdr_source_candidates(sample, frame_index=frame_index)
         for raw_path, raw_url in candidates:
             if raw_path or raw_url:
                 return self._resolve_pair(
@@ -603,7 +643,62 @@ class _SeedVRHDRDatasetBase(Dataset):
                         extra=f"{raw_path or ''}|{raw_url or ''}",
                     ),
                     default_suffix=".exr",
+                    force_refresh=force_refresh,
                 )
+        raise ValueError(f"Sample {sample.sample_id} does not provide an HDR source path/url")
+
+    def _load_hdr_source(
+        self,
+        sample: ManifestSample,
+        *,
+        frame_index: int | None = None,
+    ) -> tuple[np.ndarray, Path]:
+        candidates = self._hdr_source_candidates(sample, frame_index=frame_index)
+        last_error: Exception | None = None
+        for raw_path, raw_url in candidates:
+            if not raw_path and not raw_url:
+                continue
+            source_path = self._resolve_pair(
+                sample,
+                (raw_path, raw_url),
+                kind="hdr_source",
+                cache_key=self._cache_identity(
+                    sample,
+                    purpose="hdr_source",
+                    frame_index=frame_index,
+                    extra=f"{raw_path or ''}|{raw_url or ''}",
+                ),
+                default_suffix=".exr",
+            )
+            try:
+                return _read_hdr_image(source_path), source_path
+            except Exception as exc:
+                last_error = exc
+                if not raw_url:
+                    continue
+                refreshed_path = self._resolve_pair(
+                    sample,
+                    (raw_path, raw_url),
+                    kind="hdr_source",
+                    cache_key=self._cache_identity(
+                        sample,
+                        purpose="hdr_source",
+                        frame_index=frame_index,
+                        extra=f"{raw_path or ''}|{raw_url or ''}",
+                    ),
+                    default_suffix=".exr",
+                    force_refresh=True,
+                )
+                try:
+                    return _read_hdr_image(refreshed_path), refreshed_path
+                except Exception as refresh_exc:
+                    last_error = refresh_exc
+                    continue
+        if last_error is not None:
+            raise FileNotFoundError(
+                f"Failed to load HDR source for {sample.sample_id} "
+                f"(frame_index={frame_index}): {last_error}"
+            ) from last_error
         raise ValueError(f"Sample {sample.sample_id} does not provide an HDR source path/url")
 
     def _load_cached_or_rendered_input(
@@ -730,8 +825,7 @@ class SeedVRHDRImageDataset(_SeedVRHDRDatasetBase):
         hdr = None
         hdr_source_path = None
         if direct_target_path is None or not any(direct_input_pair):
-            hdr_source_path = self._resolve_hdr_source_path(sample)
-            hdr = _read_hdr_image(hdr_source_path)
+            hdr, hdr_source_path = self._load_hdr_source(sample)
 
         if any(direct_input_pair):
             input_path = self._resolve_pair(
@@ -914,8 +1008,7 @@ class SeedVRHDRVideoDataset(_SeedVRHDRDatasetBase):
                 )
                 input_image = _read_rgb_png(input_path)
             else:
-                hdr_source_path = self._resolve_hdr_source_path(sample, frame_index=frame_index)
-                hdr = _read_hdr_image(hdr_source_path)
+                hdr, hdr_source_path = self._load_hdr_source(sample, frame_index=frame_index)
                 input_image = self._load_cached_or_rendered_input(
                     sample,
                     hdr=hdr,
@@ -939,8 +1032,7 @@ class SeedVRHDRVideoDataset(_SeedVRHDRDatasetBase):
                 target_image = _read_target_for_representation(target_path, self.target_representation)
             else:
                 if hdr is None or hdr_source_path is None:
-                    hdr_source_path = self._resolve_hdr_source_path(sample, frame_index=frame_index)
-                    hdr = _read_hdr_image(hdr_source_path)
+                    hdr, hdr_source_path = self._load_hdr_source(sample, frame_index=frame_index)
                 target_image = self._load_cached_or_compressed_target(
                     sample,
                     hdr=hdr,
