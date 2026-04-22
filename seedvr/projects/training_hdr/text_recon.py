@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import inspect
 import importlib
 from dataclasses import dataclass
+from functools import wraps
 from typing import Any
 
 import numpy as np
@@ -11,6 +13,64 @@ from PIL import Image
 from transformers import AutoModelForCausalLM
 
 from seedvr.projects.training_hdr.validation import linear_hdr_from_target_tensor
+
+
+def _ensure_falcon_ocr_flex_attention_compat() -> None:
+    import torch.nn.attention.flex_attention as flex_attention_mod
+
+    if hasattr(flex_attention_mod, "AuxRequest"):
+        return
+
+    original_flex_attention = getattr(flex_attention_mod, "flex_attention", None)
+    if original_flex_attention is None:
+        return
+
+    signature = inspect.signature(original_flex_attention)
+    if "return_lse" not in signature.parameters:
+        return
+
+    @dataclass(frozen=True)
+    class AuxRequestCompat:
+        lse: bool = False
+        max_scores: bool = False
+
+    @dataclass(frozen=True)
+    class AuxOutputCompat:
+        lse: torch.Tensor | None = None
+        max_scores: torch.Tensor | None = None
+
+    @wraps(original_flex_attention)
+    def compat_flex_attention(*args: Any, return_aux: Any = None, **kwargs: Any) -> Any:
+        wants_aux = return_aux is not None
+        wants_lse = bool(getattr(return_aux, "lse", False))
+        if wants_aux and "return_aux" not in signature.parameters and "return_lse" not in kwargs:
+            kwargs["return_lse"] = wants_lse
+
+        result = original_flex_attention(*args, **kwargs)
+        if not wants_aux:
+            return result
+
+        if isinstance(result, tuple) and len(result) == 2:
+            output, aux_or_lse = result
+            if hasattr(aux_or_lse, "lse") or hasattr(aux_or_lse, "max_scores"):
+                return output, aux_or_lse
+            return output, AuxOutputCompat(
+                lse=aux_or_lse if wants_lse else None,
+                max_scores=None,
+            )
+
+        return result, AuxOutputCompat(
+            lse=None,
+            max_scores=None,
+        )
+
+    flex_attention_mod.AuxRequest = AuxRequestCompat
+    flex_attention_mod.AuxOutput = AuxOutputCompat
+    flex_attention_mod.flex_attention = compat_flex_attention
+    print(
+        "[seedvr-hdr] enabled Falcon-OCR flex_attention compatibility shim "
+        "for torch versions without AuxRequest"
+    )
 
 
 def _select_preview_frames(images: torch.Tensor) -> torch.Tensor:
@@ -79,6 +139,7 @@ class FalconOCRTextTeacher:
         self.config = config
         self._disabled_reason: str | None = None
 
+        _ensure_falcon_ocr_flex_attention_compat()
         model = AutoModelForCausalLM.from_pretrained(
             config.model_id,
             trust_remote_code=True,
@@ -305,4 +366,3 @@ class FalconOCRTextTeacher:
                 "text_recon_tokens": 0.0,
                 "text_recon_chars": 0.0,
             }
-

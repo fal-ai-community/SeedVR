@@ -1,1 +1,1 @@
-Fix HDR image loss decode path for training
+Fix Falcon OCR flex attention compatibility
