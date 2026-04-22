@@ -98,6 +98,7 @@ def write_result_manifest(
     config_path: str | Path,
     validation_preview_paths: list[str | Path],
     metrics: dict[str, float],
+    extra: dict[str, Any] | None = None,
 ) -> None:
     payload = {
         "checkpoint_path": str(checkpoint_path),
@@ -105,5 +106,7 @@ def write_result_manifest(
         "validation_preview_paths": [str(item) for item in validation_preview_paths],
         "metrics": metrics,
     }
+    if extra:
+        payload.update(extra)
     with open(path, "w") as file:
         json.dump(payload, file, indent=2)

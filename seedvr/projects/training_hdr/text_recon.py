@@ -138,6 +138,10 @@ class FalconOCRTextTeacher:
         self.dtype = dtype
         self.config = config
         self._disabled_reason: str | None = None
+        self._last_status: str = "init"
+        self._last_generated_texts: list[str] = []
+        self._last_valid_text_count: int = 0
+        self._last_char_count: int = 0
 
         _ensure_falcon_ocr_flex_attention_compat()
         model = AutoModelForCausalLM.from_pretrained(
@@ -174,6 +178,17 @@ class FalconOCRTextTeacher:
         if self._disabled_reason is None:
             print(f"[seedvr-hdr] disabling Falcon-OCR text reconstruction loss: {reason}")
         self._disabled_reason = reason
+        self._last_status = "disabled"
+
+    def debug_state(self) -> dict[str, Any]:
+        return {
+            "disabled": self.disabled,
+            "disabled_reason": self.disabled_reason,
+            "last_status": self._last_status,
+            "last_valid_text_count": self._last_valid_text_count,
+            "last_char_count": self._last_char_count,
+            "last_generated_texts": self._last_generated_texts[:4],
+        }
 
     @torch.no_grad()
     def generate_texts(self, target_previews: torch.Tensor) -> list[str]:
@@ -300,12 +315,21 @@ class FalconOCRTextTeacher:
                 target_representation=target_representation,
             )
             target_texts = self.generate_texts(target_previews)
+            self._last_generated_texts = [
+                text if isinstance(text, str) else repr(type(text))
+                for text in target_texts[:8]
+            ]
             valid_indices = [
                 idx
                 for idx, text in enumerate(target_texts)
                 if isinstance(text, str) and len(text.strip()) > 0
             ]
+            self._last_valid_text_count = len(valid_indices)
+            self._last_char_count = int(
+                sum(len(text.strip()) for text in target_texts if isinstance(text, str))
+            )
             if not valid_indices:
+                self._last_status = "no_text"
                 return zero, {
                     "text_recon_loss": 0.0,
                     "text_recon_active": 0.0,
@@ -343,6 +367,7 @@ class FalconOCRTextTeacher:
                 & (shift_labels != pad_token_id)
             )
             if not torch.any(valid_label_mask):
+                self._last_status = "no_label_tokens"
                 return zero, {
                     "text_recon_loss": 0.0,
                     "text_recon_active": 0.0,
@@ -352,6 +377,7 @@ class FalconOCRTextTeacher:
 
             shift_labels[~valid_label_mask] = -100
             loss = F.cross_entropy(shift_logits, shift_labels, ignore_index=-100)
+            self._last_status = "active"
             return loss, {
                 "text_recon_loss": float(loss.detach().item()),
                 "text_recon_active": 1.0,

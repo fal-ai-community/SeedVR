@@ -1,1 +1,1 @@
-Fix Falcon OCR flex attention compatibility
+Add Falcon OCR debug state to training results

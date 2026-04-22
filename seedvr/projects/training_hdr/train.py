@@ -242,11 +242,17 @@ def maybe_init_wandb(config: TrainingConfig) -> Any | None:
 def maybe_init_text_teacher(
     config: TrainingConfig,
     device: torch.device,
-) -> FalconOCRTextTeacher | None:
+) -> tuple[FalconOCRTextTeacher | None, dict[str, Any]]:
+    debug = {
+        "requested": bool(config.text_recon_loss_weight > 0.0),
+        "model_id": config.text_recon_model_id,
+        "init_ok": False,
+        "init_error": None,
+    }
     if config.text_recon_loss_weight <= 0.0:
-        return None
+        return None, debug
     try:
-        return FalconOCRTextTeacher(
+        teacher = FalconOCRTextTeacher(
             device=device,
             dtype=torch.bfloat16,
             config=FalconOCRConfig(
@@ -256,9 +262,12 @@ def maybe_init_text_teacher(
                 max_dimension=config.text_recon_max_dimension,
             ),
         )
+        debug["init_ok"] = True
+        return teacher, debug
     except Exception as exc:
+        debug["init_error"] = str(exc)
         print(f"[seedvr-hdr] Falcon-OCR text loss disabled after init failure: {exc}")
-        return None
+        return None, debug
 
 
 def get_cuda_memory_stats(device: torch.device) -> dict[str, float]:
@@ -985,7 +994,7 @@ def main() -> None:
     )
     runtime_info["resume_from_checkpoint"] = config.resume_from_checkpoint
     runtime_info["start_step"] = start_step
-    text_teacher = maybe_init_text_teacher(config, device)
+    text_teacher, text_teacher_debug = maybe_init_text_teacher(config, device)
     runtime_info["text_recon_enabled"] = bool(text_teacher is not None)
     runtime_info["text_recon_model_id"] = config.text_recon_model_id
     wandb_run = maybe_init_wandb(config)
@@ -1147,6 +1156,20 @@ def main() -> None:
             "text_recon_weight": float(text_recon_weight),
         }
         final_metrics.update(text_metrics)
+        final_metrics.update(
+            {
+                "text_recon_teacher_requested": 1.0 if text_teacher_debug["requested"] else 0.0,
+                "text_recon_teacher_init_ok": 1.0 if text_teacher_debug["init_ok"] else 0.0,
+                "text_recon_teacher_disabled": (
+                    1.0 if text_teacher is not None and text_teacher.disabled else 0.0
+                ),
+                "text_recon_teacher_has_text": (
+                    1.0
+                    if text_teacher is not None and text_teacher.debug_state()["last_valid_text_count"] > 0
+                    else 0.0
+                ),
+            }
+        )
         if config.profile_step_time:
             final_metrics.update(
                 {
@@ -1241,6 +1264,14 @@ def main() -> None:
         config_path=config_copy_path,
         validation_preview_paths=latest_preview_paths,
         metrics=final_metrics,
+        extra={
+            "text_recon_debug": (
+                {
+                    **text_teacher_debug,
+                    "teacher_state": text_teacher.debug_state() if text_teacher is not None else None,
+                }
+            ),
+        },
     )
     if wandb_run is not None:
         wandb.log(final_metrics)
