@@ -73,6 +73,21 @@ def _ensure_falcon_ocr_flex_attention_compat() -> None:
     )
 
 
+def _disable_falcon_ocr_compiled_attention(model_module: Any) -> None:
+    attention_module = importlib.import_module(
+        model_module.__name__.replace("modeling_falcon_ocr", "attention")
+    )
+    eager_flex_attention = attention_module.flex_attention
+    attention_module.compiled_flex_attn_decode = eager_flex_attention
+    attention_module.compiled_flex_attn_prefill = eager_flex_attention
+    model_module.compiled_flex_attn_decode = eager_flex_attention
+    model_module.compiled_flex_attn_prefill = eager_flex_attention
+    print(
+        "[seedvr-hdr] disabled Falcon-OCR compiled flex attention wrappers; "
+        "using eager flex_attention for trainer compatibility"
+    )
+
+
 def _select_preview_frames(images: torch.Tensor) -> torch.Tensor:
     if images.ndim == 5:
         return images[:, images.shape[1] // 2]
@@ -157,6 +172,7 @@ class FalconOCRTextTeacher:
         self.tokenizer = model._get_tokenizer() if hasattr(model, "_get_tokenizer") else None
 
         model_module = importlib.import_module(model.__class__.__module__)
+        _disable_falcon_ocr_compiled_attention(model_module)
         processing_module = importlib.import_module(
             model.__class__.__module__.replace("modeling_falcon_ocr", "processing_falcon_ocr")
         )

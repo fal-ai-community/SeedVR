@@ -1,1 +1,1 @@
-Add Falcon OCR debug state to training results
+Use eager Falcon OCR flex attention in training
