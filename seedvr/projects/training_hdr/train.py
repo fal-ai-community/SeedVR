@@ -239,6 +239,34 @@ def maybe_init_wandb(config: TrainingConfig) -> Any | None:
     return run
 
 
+def build_wandb_train_metrics(
+    *,
+    step: int,
+    final_metrics: dict[str, float],
+    include_step_timing: bool,
+    include_text_metrics: bool,
+) -> dict[str, float]:
+    metrics = {
+        "step": step,
+        "loss": float(final_metrics["loss"]),
+        "denoise_loss": float(final_metrics["denoise_loss"]),
+        "latent_recon_loss": float(final_metrics["latent_recon_loss"]),
+        "image_recon_loss": float(final_metrics["image_recon_loss"]),
+        "lr": float(final_metrics["lr"]),
+    }
+    if include_step_timing and "step_seconds" in final_metrics:
+        metrics["step_seconds"] = float(final_metrics["step_seconds"])
+    if include_text_metrics:
+        for key in (
+            "text_recon_loss",
+            "text_recon_active",
+            "text_recon_tokens",
+            "text_recon_chars",
+        ):
+            metrics[key] = float(final_metrics[key])
+    return metrics
+
+
 def maybe_init_text_teacher(
     config: TrainingConfig,
     device: torch.device,
@@ -998,6 +1026,16 @@ def main() -> None:
     runtime_info["text_recon_enabled"] = bool(text_teacher is not None)
     runtime_info["text_recon_model_id"] = config.text_recon_model_id
     wandb_run = maybe_init_wandb(config)
+    if wandb_run is not None:
+        wandb_run.summary["text_recon_teacher_requested"] = bool(text_teacher_debug["requested"])
+        wandb_run.summary["text_recon_teacher_init_ok"] = bool(text_teacher_debug["init_ok"])
+        wandb_run.summary["text_recon_teacher_disabled"] = bool(
+            text_teacher is not None and text_teacher.disabled
+        )
+        if text_teacher_debug["init_error"] is not None:
+            wandb_run.summary["text_recon_teacher_init_error"] = str(
+                text_teacher_debug["init_error"]
+            )
 
     text_pos_embeds, text_pos_shapes = positive_embeddings
     train_iter = iter(train_loader)
@@ -1156,20 +1194,6 @@ def main() -> None:
             "text_recon_weight": float(text_recon_weight),
         }
         final_metrics.update(text_metrics)
-        final_metrics.update(
-            {
-                "text_recon_teacher_requested": 1.0 if text_teacher_debug["requested"] else 0.0,
-                "text_recon_teacher_init_ok": 1.0 if text_teacher_debug["init_ok"] else 0.0,
-                "text_recon_teacher_disabled": (
-                    1.0 if text_teacher is not None and text_teacher.disabled else 0.0
-                ),
-                "text_recon_teacher_has_text": (
-                    1.0
-                    if text_teacher is not None and text_teacher.debug_state()["last_valid_text_count"] > 0
-                    else 0.0
-                ),
-            }
-        )
         if config.profile_step_time:
             final_metrics.update(
                 {
@@ -1190,7 +1214,14 @@ def main() -> None:
         if step % config.log_every == 0 or step == 1:
             print(f"[seedvr-hdr] step={step} metrics={final_metrics}")
             if wandb_run is not None:
-                wandb.log({"step": step, **final_metrics})
+                wandb.log(
+                    build_wandb_train_metrics(
+                        step=step,
+                        final_metrics=final_metrics,
+                        include_step_timing=config.profile_step_time,
+                        include_text_metrics=should_run_text_recon,
+                    )
+                )
 
         if step % config.validate_every == 0 or step == config.steps:
             val_metrics, latest_preview_paths, latest_preview_captions = run_validation(

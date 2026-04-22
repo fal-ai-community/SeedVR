@@ -112,7 +112,7 @@ class TrainingConfig:
     log_every: int = 10
     validate_every: int = 100
     save_every: int = 500
-    debug_cuda_memory: bool = True
+    debug_cuda_memory: bool = False
     cuda_cleanup_every: int = 100
     vae_use_tiling: bool = False
     vae_use_tqdm: bool = False
