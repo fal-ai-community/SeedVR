@@ -100,10 +100,12 @@ class AdaSingle(nn.Module):
             getattr(self, f"{layer}_gate", None),
         )
 
+        # Float8 training paths can return custom-function views that forbid
+        # in-place mutation, so keep modulation out-of-place here.
         if mode == "in":
-            return hid.mul_(scaleA + scaleB).add_(shiftA + shiftB)
+            return (hid * (scaleA + scaleB)) + (shiftA + shiftB)
         if mode == "out":
-            return hid.mul_(gateA + gateB)
+            return hid * (gateA + gateB)
         raise NotImplementedError
 
     def extra_repr(self) -> str:

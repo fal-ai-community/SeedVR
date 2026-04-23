@@ -1,0 +1,4 @@
+Make DiT modulation MXFP8-safe
+
+Switch AdaSingle modulation math from in-place ops to out-of-place ops so
+torchao MXFP8 custom-function outputs are not mutated in place during training.
