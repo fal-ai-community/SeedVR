@@ -78,7 +78,13 @@ def load_checkpoint(
     device: torch.device | None = None,
     restore_rng: bool = True,
 ) -> dict[str, Any]:
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    # These checkpoints are created by our own trainer and contain optimizer,
+    # scheduler, config, and RNG state objects beyond plain tensor weights.
+    checkpoint = torch.load(
+        checkpoint_path,
+        map_location="cpu",
+        weights_only=False,
+    )
     model_to_load = unwrap_compiled_module(model)
     model_to_load.load_state_dict(checkpoint["model"], strict=True)
     if optimizer is not None and checkpoint.get("optimizer") is not None:
