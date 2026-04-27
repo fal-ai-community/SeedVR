@@ -30,16 +30,7 @@ from seedvr.projects.training_hdr.dataset import (
     SeedVRHDRImageDataset,
     SeedVRHDRVideoDataset,
 )
-from seedvr.projects.training_hdr.losses import (
-    color_constancy_loss,
-    denoise_loss,
-    detail_reconstruction_loss,
-    edge_consistency_loss,
-    flat_region_smoothness_loss,
-    image_reconstruction_loss,
-    latent_reconstruction_loss,
-    low_frequency_banding_loss,
-)
+from seedvr.projects.training_hdr.losses import denoise_loss
 from seedvr.projects.training_hdr.validation import compute_hdr_metrics, save_triptych
 from seedvr.projects.video_diffusion_sr.infer import VideoDiffusionInfer
 
@@ -357,23 +348,10 @@ def build_wandb_train_metrics(
         "step": step,
         "loss": float(final_metrics["loss"]),
         "denoise_loss": float(final_metrics["denoise_loss"]),
-        "latent_recon_loss": float(final_metrics["latent_recon_loss"]),
-        "image_recon_loss": float(final_metrics["image_recon_loss"]),
         "lr": float(final_metrics["lr"]),
     }
     if include_step_timing and "step_seconds" in final_metrics:
         metrics["step_seconds"] = float(final_metrics["step_seconds"])
-    for loss_name in (
-        "banding",
-        "flat_smooth",
-        "color_constancy",
-        "detail",
-        "edge_consistency",
-    ):
-        weight_key = f"{loss_name}_weight"
-        loss_key = f"{loss_name}_loss"
-        if float(final_metrics.get(weight_key, 0.0)) > 0.0:
-            metrics[loss_key] = float(final_metrics[loss_key])
     return metrics
 
 
@@ -1525,91 +1503,9 @@ def main() -> None:
             step=step,
         ).vid_sample
 
-        pred_x0, _ = runner.schedule.convert_from_pred(
-            prediction,
-            PredictionType.v_lerp,
-            x_t,
-            diffusion_timesteps,
-        )
         denoise = denoise_loss(prediction, target)
-        latent_recon = latent_reconstruction_loss(pred_x0, latents_flat)
-        decode_started_at = perf_counter()
-        predicted_images = decode_latents_to_images(runner, pred_x0, latent_shapes)
-        image_recon = image_reconstruction_loss(predicted_images, target_images)
-        banding = predicted_images.new_zeros(())
-        banding_weight = current_loss_weight(
-            config.banding_loss_weight,
-            config.banding_loss_warmup_steps,
-            step,
-        )
-        if banding_weight > 0.0:
-            banding = low_frequency_banding_loss(
-                predicted_images,
-                target_images,
-                flat_gradient_threshold=config.banding_loss_flat_gradient_threshold,
-            )
-        flat_smooth = predicted_images.new_zeros(())
-        flat_smooth_weight = current_loss_weight(
-            config.flat_smooth_loss_weight,
-            config.flat_smooth_loss_warmup_steps,
-            step,
-        )
-        if flat_smooth_weight > 0.0:
-            flat_smooth = flat_region_smoothness_loss(
-                predicted_images,
-                target_images,
-                flat_gradient_threshold=config.banding_loss_flat_gradient_threshold,
-            )
-        color_constancy = predicted_images.new_zeros(())
-        color_constancy_weight = current_loss_weight(
-            config.color_constancy_loss_weight,
-            config.color_constancy_loss_warmup_steps,
-            step,
-        )
-        if color_constancy_weight > 0.0:
-            color_constancy = color_constancy_loss(predicted_images, target_images)
-        detail = predicted_images.new_zeros(())
-        detail_weight = current_loss_weight(
-            config.detail_loss_weight,
-            config.detail_loss_warmup_steps,
-            step,
-        )
-        if detail_weight > 0.0:
-            detail = detail_reconstruction_loss(
-                predicted_images,
-                target_images,
-                blur_kernel=config.detail_loss_blur_kernel,
-            )
-        edge_consistency = predicted_images.new_zeros(())
-        edge_consistency_weight = current_loss_weight(
-            config.edge_consistency_loss_weight,
-            config.edge_consistency_loss_warmup_steps,
-            step,
-        )
-        if edge_consistency_weight > 0.0:
-            edge_consistency = edge_consistency_loss(predicted_images, target_images)
-        decode_finished_at = perf_counter()
 
-        total_loss = (
-            config.denoise_loss_weight * denoise
-            + current_loss_weight(
-                config.latent_recon_loss_weight,
-                config.latent_loss_warmup_steps,
-                step,
-            )
-            * latent_recon
-            + current_loss_weight(
-                config.image_recon_loss_weight,
-                config.image_loss_warmup_steps,
-                step,
-            )
-            * image_recon
-            + banding_weight * banding
-            + flat_smooth_weight * flat_smooth
-            + color_constancy_weight * color_constancy
-            + detail_weight * detail
-            + edge_consistency_weight * edge_consistency
-        )
+        total_loss = denoise
         total_loss.backward()
         if config.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(runner.dit.parameters(), config.grad_clip_norm)
@@ -1620,44 +1516,14 @@ def main() -> None:
         final_metrics = {
             "loss": float(total_loss.item()),
             "denoise_loss": float(denoise.item()),
-            "latent_recon_loss": float(latent_recon.item()),
-            "image_recon_loss": float(image_recon.item()),
-            "banding_loss": float(banding.item()),
-            "banding_weight": float(banding_weight),
-            "flat_smooth_loss": float(flat_smooth.item()),
-            "flat_smooth_weight": float(flat_smooth_weight),
-            "color_constancy_loss": float(color_constancy.item()),
-            "color_constancy_weight": float(color_constancy_weight),
-            "detail_loss": float(detail.item()),
-            "detail_weight": float(detail_weight),
-            "edge_consistency_loss": float(edge_consistency.item()),
-            "edge_consistency_weight": float(edge_consistency_weight),
             "lr": float(optimizer.param_groups[0]["lr"]),
-            "latent_recon_weight": float(
-                current_loss_weight(
-                    config.latent_recon_loss_weight,
-                    config.latent_loss_warmup_steps,
-                    step,
-                )
-            ),
-            "image_recon_weight": float(
-                current_loss_weight(
-                    config.image_recon_loss_weight,
-                    config.image_loss_warmup_steps,
-                    step,
-                )
-            ),
         }
         if config.profile_step_time:
             final_metrics.update(
                 {
                     "encode_seconds": float(encode_finished_at - encode_started_at),
-                    "decode_seconds": float(decode_finished_at - decode_started_at),
                     "post_encode_seconds": float(
                         step_finished_at - encode_finished_at
-                    ),
-                    "post_decode_seconds": float(
-                        step_finished_at - decode_finished_at
                     ),
                     "step_seconds": float(step_finished_at - step_started_at),
                 }
@@ -1728,16 +1594,7 @@ def main() -> None:
             x_t,
             target,
             prediction,
-            pred_x0,
-            predicted_images,
             denoise,
-            latent_recon,
-            image_recon,
-            banding,
-            flat_smooth,
-            color_constancy,
-            detail,
-            edge_consistency,
             total_loss,
         )
         if config.cuda_cleanup_every > 0 and step % config.cuda_cleanup_every == 0:
