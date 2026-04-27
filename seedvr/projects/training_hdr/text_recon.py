@@ -139,6 +139,10 @@ class FalconOCRConfig:
     max_new_tokens: int
     min_dimension: int
     max_dimension: int
+    min_chars: int = 3
+    min_tokens: int = 8
+    loss_normalizer_min_tokens: int = 16
+    require_alnum: bool = True
 
 
 class FalconOCRTextTeacher:
@@ -319,6 +323,8 @@ class FalconOCRTextTeacher:
                 "text_recon_active": 0.0,
                 "text_recon_tokens": 0.0,
                 "text_recon_chars": 0.0,
+                "text_recon_normalizer_tokens": 0.0,
+                "text_recon_skipped_short": 0.0,
             }
 
         try:
@@ -338,7 +344,12 @@ class FalconOCRTextTeacher:
             valid_indices = [
                 idx
                 for idx, text in enumerate(target_texts)
-                if isinstance(text, str) and len(text.strip()) > 0
+                if isinstance(text, str)
+                and len(text.strip()) >= self.config.min_chars
+                and (
+                    not self.config.require_alnum
+                    or any(ch.isalnum() for ch in text.strip())
+                )
             ]
             self._last_valid_text_count = len(valid_indices)
             self._last_char_count = int(
@@ -351,6 +362,8 @@ class FalconOCRTextTeacher:
                     "text_recon_active": 0.0,
                     "text_recon_tokens": 0.0,
                     "text_recon_chars": 0.0,
+                    "text_recon_normalizer_tokens": 0.0,
+                    "text_recon_skipped_short": 0.0,
                 }
 
             predicted_previews = predicted_previews[valid_indices]
@@ -382,23 +395,51 @@ class FalconOCRTextTeacher:
                 (label_positions >= target_start.unsqueeze(1))
                 & (shift_labels != pad_token_id)
             )
+            valid_token_count = valid_label_mask.sum()
+            valid_char_count = float(sum(len(text) for text in target_texts))
             if not torch.any(valid_label_mask):
                 self._last_status = "no_label_tokens"
                 return zero, {
                     "text_recon_loss": 0.0,
                     "text_recon_active": 0.0,
                     "text_recon_tokens": 0.0,
-                    "text_recon_chars": float(sum(len(text) for text in target_texts)),
+                    "text_recon_chars": valid_char_count,
+                    "text_recon_normalizer_tokens": 0.0,
+                    "text_recon_skipped_short": 0.0,
+                }
+            if int(valid_token_count.detach().item()) < self.config.min_tokens:
+                self._last_status = "short_text"
+                return zero, {
+                    "text_recon_loss": 0.0,
+                    "text_recon_active": 0.0,
+                    "text_recon_tokens": float(valid_token_count.detach().item()),
+                    "text_recon_chars": valid_char_count,
+                    "text_recon_normalizer_tokens": float(
+                        self.config.loss_normalizer_min_tokens
+                    ),
+                    "text_recon_skipped_short": 1.0,
                 }
 
             shift_labels[~valid_label_mask] = -100
-            loss = F.cross_entropy(shift_logits, shift_labels, ignore_index=-100)
+            loss_sum = F.cross_entropy(
+                shift_logits,
+                shift_labels,
+                ignore_index=-100,
+                reduction="sum",
+            )
+            normalizer = torch.clamp(
+                valid_token_count.to(dtype=loss_sum.dtype),
+                min=float(self.config.loss_normalizer_min_tokens),
+            )
+            loss = loss_sum / normalizer
             self._last_status = "active"
             return loss, {
                 "text_recon_loss": float(loss.detach().item()),
                 "text_recon_active": 1.0,
-                "text_recon_tokens": float(valid_label_mask.sum().item()),
-                "text_recon_chars": float(sum(len(text) for text in target_texts)),
+                "text_recon_tokens": float(valid_token_count.detach().item()),
+                "text_recon_chars": valid_char_count,
+                "text_recon_normalizer_tokens": float(normalizer.detach().item()),
+                "text_recon_skipped_short": 0.0,
             }
         except Exception as exc:
             self.disable(str(exc))
@@ -407,4 +448,6 @@ class FalconOCRTextTeacher:
                 "text_recon_active": 0.0,
                 "text_recon_tokens": 0.0,
                 "text_recon_chars": 0.0,
+                "text_recon_normalizer_tokens": 0.0,
+                "text_recon_skipped_short": 0.0,
             }

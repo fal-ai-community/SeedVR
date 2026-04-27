@@ -40,7 +40,7 @@ BASE_MODEL_SPECS: dict[str, CheckpointSpec] = {
     ),
 }
 
-SUPPORTED_TARGET_REPRESENTATIONS = {"raw_hdr", "mu_law_mu5000"}
+SUPPORTED_TARGET_REPRESENTATIONS = {"raw_hdr", "mu_law_mu5000", "log_hdr", "pq_1000", "logc3"}
 
 
 @dataclass
@@ -105,6 +105,46 @@ class TrainingConfig:
     text_recon_max_new_tokens: int = 128
     text_recon_min_dimension: int = 64
     text_recon_max_dimension: int = 768
+    text_recon_min_chars: int = 3
+    text_recon_min_tokens: int = 8
+    text_recon_loss_normalizer_min_tokens: int = 16
+    text_recon_require_alnum: bool = True
+    sampler_validation_samples: int = 0
+    sampler_validation_guidance_scale: float = 1.0
+    sampler_validation_seed: int = 2079280474
+    banding_loss_weight: float = 0.0
+    banding_loss_warmup_steps: int = 0
+    banding_loss_flat_gradient_threshold: float = 0.08
+    flat_smooth_loss_weight: float = 0.0
+    flat_smooth_loss_warmup_steps: int = 0
+    color_constancy_loss_weight: float = 0.0
+    color_constancy_loss_warmup_steps: int = 0
+    detail_loss_weight: float = 0.0
+    detail_loss_warmup_steps: int = 0
+    detail_loss_blur_kernel: int = 9
+    edge_consistency_loss_weight: float = 0.0
+    edge_consistency_loss_warmup_steps: int = 0
+    text_layout_loss_weight: float = 0.0
+    text_layout_loss_warmup_steps: int = 0
+    text_layout_edge_threshold: float = 0.12
+    text_region_detail_loss_weight: float = 0.0
+    text_region_detail_loss_warmup_steps: int = 0
+    text_region_ctc_loss_weight: float = 0.0
+    text_region_ctc_loss_warmup_steps: int = 0
+    text_region_ctc_every: int = 4
+    text_region_ctc_checkpoint: str | None = None
+    text_region_max_regions: int = 4
+    text_region_max_chars: int = 32
+    text_region_min_chars: int = 3
+    text_region_crop_height: int = 32
+    text_region_crop_width: int = 128
+    text_region_alphabet: str = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ.,:;!?-_/#%&()[]+ "
+    phase_jitter: bool = False
+    phase_jitter_max_pixels: int = 15
+    size_jitter_steps: int = 0
+    jpeg_roundtrip_prob: float = 0.0
+    jpeg_roundtrip_min_quality: int = 75
+    jpeg_roundtrip_max_quality: int = 95
     grad_clip_norm: float = 1.0
     adam_beta1: float = 0.9
     adam_beta2: float = 0.95

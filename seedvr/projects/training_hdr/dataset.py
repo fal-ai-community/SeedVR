@@ -70,6 +70,9 @@ class ManifestSample:
     gamma: float | None = None
     quantization_bits: int | None = None
     jpeg_quality: int | None = None
+    text_regions: list[dict[str, Any]] | None = None
+    text_regions_path: str | None = None
+    text_regions_url: str | None = None
 
     @classmethod
     def from_row(cls, row: dict) -> "ManifestSample":
@@ -1121,3 +1124,997 @@ class SeedVRHDRVideoDataset(_SeedVRHDRDatasetBase):
             if pairs:
                 return pairs
         return []
+
+
+# FAL_SEEDVR_HDR_TRAINING_PATCH_V1
+
+import torch.nn.functional as _fal_F
+
+
+def _fal_pq_oetf(linear_nits: np.ndarray) -> np.ndarray:
+    m1 = 2610.0 / 16384.0
+    m2 = 2523.0 / 32.0
+    c1 = 3424.0 / 4096.0
+    c2 = 2413.0 / 128.0
+    c3 = 2392.0 / 128.0
+    normalized = np.maximum(linear_nits.astype(np.float32), 0.0) / 10000.0
+    powered = np.power(normalized, m1)
+    return np.clip(np.power((c1 + c2 * powered) / (1.0 + c3 * powered), m2), 0.0, 1.0)
+
+
+def _fal_logc3_encode(linear: np.ndarray) -> np.ndarray:
+    cut = 0.010591
+    a = 5.555556
+    b = 0.052272
+    c = 0.247190
+    d = 0.385537
+    e = 5.367655
+    f = 0.092809
+    linear = np.maximum(linear.astype(np.float32), 0.0)
+    return np.where(linear > cut, c * np.log10(a * linear + b) + d, e * linear + f).astype(np.float32)
+
+
+def _fal_mu_law_decode(compressed: np.ndarray) -> np.ndarray:
+    compressed = np.clip(compressed.astype(np.float32), 0.0, 1.0)
+    return np.expm1(compressed * np.log1p(MU_LAW_MU)) / MU_LAW_MU
+
+
+def _compress_target_from_hdr(hdr: np.ndarray, target_representation: str) -> np.ndarray:
+    hdr = np.maximum(hdr.astype(np.float32), 0.0)
+    if target_representation == "raw_hdr":
+        return hdr
+    if target_representation == "mu_law_mu5000":
+        return np.log1p(MU_LAW_MU * hdr) / np.log1p(MU_LAW_MU)
+    if target_representation == "log_hdr":
+        return np.log(hdr + LOG_HDR_EPS)
+    if target_representation == "pq_1000":
+        return _fal_pq_oetf(hdr * 1000.0)
+    if target_representation == "logc3":
+        return _fal_logc3_encode(hdr)
+    raise ValueError(f"Unsupported target_representation: {target_representation}")
+
+
+_fal_base_read_target_for_representation = _read_target_for_representation
+
+
+def _read_target_for_representation(path: Path, target_representation: str) -> np.ndarray:
+    if target_representation in {"pq_1000", "logc3"} and path.suffix.lower() == ".npy":
+        # Older manifests only have mu-law direct targets. Convert them through
+        # linear HDR so validation can use the newer target encodings too.
+        return _compress_target_from_hdr(
+            _fal_mu_law_decode(_read_target_array(path)),
+            target_representation,
+        )
+    return _fal_base_read_target_for_representation(path, target_representation)
+
+
+def _to_target_tensor(image: np.ndarray, target_representation: str) -> torch.Tensor:
+    tensor = torch.from_numpy(np.ascontiguousarray(image.transpose(2, 0, 1)))
+    if target_representation in {"mu_law_mu5000", "pq_1000", "logc3"}:
+        return tensor.mul(2.0).sub(1.0)
+    if target_representation in {"raw_hdr", "log_hdr"}:
+        return tensor
+    raise ValueError(f"Unsupported target_representation: {target_representation}")
+
+
+def _fal_to_nchw(tensor: torch.Tensor) -> tuple[torch.Tensor, tuple[int, ...]]:
+    original_shape = tuple(tensor.shape)
+    if tensor.ndim == 3:
+        return tensor.unsqueeze(0), original_shape
+    if tensor.ndim == 4:
+        return tensor, original_shape
+    raise ValueError(f"Expected CHW or TCHW tensor, got {original_shape}")
+
+
+def _fal_from_nchw(tensor: torch.Tensor, original_shape: tuple[int, ...]) -> torch.Tensor:
+    if len(original_shape) == 3:
+        return tensor.squeeze(0)
+    return tensor
+
+
+def _fal_resize_spatial(tensor: torch.Tensor, height: int, width: int) -> torch.Tensor:
+    nchw, original_shape = _fal_to_nchw(tensor)
+    resized = _fal_F.interpolate(
+        nchw.float(),
+        size=(height, width),
+        mode="bilinear",
+        align_corners=False,
+        antialias=True,
+    ).to(dtype=tensor.dtype)
+    return _fal_from_nchw(resized, original_shape)
+
+
+def _fal_crop_or_pad_to_shape(
+    tensor: torch.Tensor,
+    height: int,
+    width: int,
+    rng: random.Random,
+) -> torch.Tensor:
+    nchw, original_shape = _fal_to_nchw(tensor)
+    _, _, current_h, current_w = nchw.shape
+    pad_h = max(0, height - current_h)
+    pad_w = max(0, width - current_w)
+    if pad_h > 0 or pad_w > 0:
+        pad_top = pad_h // 2
+        pad_bottom = pad_h - pad_top
+        pad_left = pad_w // 2
+        pad_right = pad_w - pad_left
+        nchw = _fal_F.pad(nchw, (pad_left, pad_right, pad_top, pad_bottom), mode="reflect")
+        current_h, current_w = nchw.shape[-2:]
+    top = 0 if current_h == height else rng.randint(0, current_h - height)
+    left = 0 if current_w == width else rng.randint(0, current_w - width)
+    cropped = nchw[..., top : top + height, left : left + width]
+    return _fal_from_nchw(cropped.contiguous(), original_shape)
+
+
+def _fal_apply_spatial_jitter_pair(
+    input_tensor: torch.Tensor,
+    target_tensor: torch.Tensor,
+    *,
+    phase_jitter: bool,
+    phase_jitter_max_pixels: int,
+    size_jitter_steps: int,
+    rng: random.Random,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    height, width = input_tensor.shape[-2:]
+    if size_jitter_steps > 0:
+        delta_h = rng.randint(-size_jitter_steps, size_jitter_steps) * 16
+        delta_w = rng.randint(-size_jitter_steps, size_jitter_steps) * 16
+        jitter_h = max(32, height + delta_h)
+        jitter_w = max(32, width + delta_w)
+        input_tensor = _fal_resize_spatial(input_tensor, jitter_h, jitter_w)
+        target_tensor = _fal_resize_spatial(target_tensor, jitter_h, jitter_w)
+        input_tensor = _fal_crop_or_pad_to_shape(input_tensor, height, width, rng)
+        target_tensor = _fal_crop_or_pad_to_shape(target_tensor, height, width, rng)
+
+    if phase_jitter and phase_jitter_max_pixels > 0:
+        max_y = min(phase_jitter_max_pixels, max(0, height - 1))
+        max_x = min(phase_jitter_max_pixels, max(0, width - 1))
+        if max_y > 0 or max_x > 0:
+            pad_y = max_y
+            pad_x = max_x
+            top = rng.randint(0, pad_y * 2) if pad_y > 0 else 0
+            left = rng.randint(0, pad_x * 2) if pad_x > 0 else 0
+            def shift(tensor: torch.Tensor) -> torch.Tensor:
+                nchw, original_shape = _fal_to_nchw(tensor)
+                padded = _fal_F.pad(nchw, (pad_x, pad_x, pad_y, pad_y), mode="reflect")
+                shifted = padded[..., top : top + height, left : left + width]
+                return _fal_from_nchw(shifted.contiguous(), original_shape)
+            input_tensor = shift(input_tensor)
+            target_tensor = shift(target_tensor)
+
+    return input_tensor, target_tensor
+
+
+def _fal_apply_input_jpeg_roundtrip(
+    input_tensor: torch.Tensor,
+    *,
+    prob: float,
+    min_quality: int,
+    max_quality: int,
+    rng: random.Random,
+) -> torch.Tensor:
+    if prob <= 0.0 or rng.random() >= prob:
+        return input_tensor
+    quality = int(rng.randint(min_quality, max_quality))
+    original_shape = tuple(input_tensor.shape)
+    frames = input_tensor.unsqueeze(0) if input_tensor.ndim == 3 else input_tensor
+    output_frames = []
+    for frame in frames:
+        image = frame.detach().float().clamp(-1.0, 1.0).add(1.0).mul(127.5)
+        array = image.round().to(torch.uint8).cpu().numpy().transpose(1, 2, 0)
+        bgr = cv2.cvtColor(array, cv2.COLOR_RGB2BGR)
+        ok, encoded = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+        if not ok:
+            output_frames.append(frame)
+            continue
+        decoded = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+        decoded = cv2.cvtColor(decoded, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+        output_frames.append(torch.from_numpy(decoded.transpose(2, 0, 1)).mul(2.0).sub(1.0))
+    output = torch.stack(output_frames, dim=0).to(dtype=input_tensor.dtype)
+    if len(original_shape) == 3:
+        output = output.squeeze(0)
+    return output
+
+
+_FalBaseImageDataset = SeedVRHDRImageDataset
+_FalBaseVideoDataset = SeedVRHDRVideoDataset
+
+
+def _fal_cache_read_attempts(dataset) -> int:
+    retries = int(getattr(dataset.asset_cache, "download_retries", 3) or 1)
+    return max(2, min(retries, 3))
+
+
+def _fal_is_runtime_cache_path(dataset, path: Path) -> bool:
+    try:
+        return Path(path).resolve().is_relative_to(
+            Path(dataset.asset_cache.runtime_cache_root).resolve()
+        )
+    except Exception:
+        return False
+
+
+def _fal_invalidate_runtime_cache_path(
+    dataset,
+    path: Path,
+    *,
+    kind: str,
+    sample_id: str,
+    frame_index: int | None,
+    reason: Exception,
+) -> bool:
+    if not _fal_is_runtime_cache_path(dataset, path):
+        return False
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+    print(
+        "[seedvr-hdr][stage=lazy_cache] invalidated "
+        f"kind={kind} sample_id={sample_id} frame_index={frame_index} "
+        f"path={path} reason={reason}"
+    )
+    return True
+
+
+def _fal_read_with_cache_healing(
+    dataset,
+    *,
+    path_factory,
+    reader,
+    kind: str,
+    sample_id: str,
+    frame_index: int | None = None,
+) -> tuple[np.ndarray, Path]:
+    last_error: Exception | None = None
+    attempts = _fal_cache_read_attempts(dataset)
+    for attempt in range(attempts):
+        force_refresh = attempt > 0
+        try:
+            path = path_factory(force_refresh=force_refresh)
+        except Exception as exc:
+            last_error = exc
+            print(
+                "[seedvr-hdr][stage=lazy_cache] resolve_failed "
+                f"kind={kind} sample_id={sample_id} frame_index={frame_index} "
+                f"attempt={attempt + 1}/{attempts} force_refresh={force_refresh} "
+                f"error={exc}"
+            )
+            continue
+        try:
+            return reader(path), path
+        except Exception as exc:
+            last_error = exc
+            invalidated = _fal_invalidate_runtime_cache_path(
+                dataset,
+                path,
+                kind=kind,
+                sample_id=sample_id,
+                frame_index=frame_index,
+                reason=exc,
+            )
+            print(
+                "[seedvr-hdr][stage=lazy_cache] read_failed "
+                f"kind={kind} sample_id={sample_id} frame_index={frame_index} "
+                f"attempt={attempt + 1}/{attempts} path={path} "
+                f"invalidated={invalidated} error={exc}"
+            )
+            if not invalidated:
+                break
+    raise RuntimeError(
+        f"Failed to read {kind} for sample_id={sample_id} "
+        f"frame_index={frame_index} after {attempts} cache attempts: {last_error}"
+    ) from last_error
+
+
+def _fal_read_target_for_dataset(dataset, path: Path) -> np.ndarray:
+    return _read_target_for_representation(path, dataset.target_representation)
+
+
+def _fal_load_hdr_source(
+    self,
+    sample: ManifestSample,
+    *,
+    frame_index: int | None = None,
+) -> tuple[np.ndarray, Path]:
+    candidates = self._hdr_source_candidates(sample, frame_index=frame_index)
+    last_error: Exception | None = None
+    for raw_path, raw_url in candidates:
+        if not raw_path and not raw_url:
+            continue
+        cache_key = self._cache_identity(
+            sample,
+            purpose="hdr_source",
+            frame_index=frame_index,
+            extra=f"{raw_path or ''}|{raw_url or ''}",
+        )
+
+        def path_factory(*, force_refresh: bool) -> Path:
+            return self._resolve_pair(
+                sample,
+                (raw_path, raw_url),
+                kind="hdr_source",
+                cache_key=cache_key,
+                default_suffix=".exr",
+                force_refresh=force_refresh,
+            )
+
+        try:
+            return _fal_read_with_cache_healing(
+                self,
+                path_factory=path_factory,
+                reader=_read_hdr_image,
+                kind="hdr_source",
+                sample_id=sample.sample_id,
+                frame_index=frame_index,
+            )
+        except Exception as exc:
+            last_error = exc
+            continue
+    if last_error is not None:
+        raise FileNotFoundError(
+            f"Failed to load HDR source for {sample.sample_id} "
+            f"(frame_index={frame_index}): {last_error}"
+        ) from last_error
+    raise ValueError(f"Sample {sample.sample_id} does not provide an HDR source path/url")
+
+
+def _fal_load_cached_or_rendered_input(
+    self,
+    sample: ManifestSample,
+    *,
+    hdr: np.ndarray,
+    hdr_source_path: Path,
+    frame_index: int | None = None,
+) -> np.ndarray:
+    if sample.camera_response is None or sample.exposure_ev is None:
+        raise ValueError(
+            f"Sample {sample.sample_id} is missing camera_response/exposure_ev required for SDR synthesis"
+        )
+    gamma = sample.gamma if sample.gamma is not None else 2.2
+    quantization_bits = sample.quantization_bits if sample.quantization_bits is not None else 8
+    cache_key = self._cache_identity(
+        sample,
+        purpose="rendered_input",
+        frame_index=frame_index,
+        extra=str(hdr_source_path),
+    )
+    if self.cache_rendered_sdr_inputs:
+        cached_path = self.asset_cache.derived_path(
+            kind="rendered_input",
+            cache_key=cache_key,
+            suffix=".png",
+        )
+        if cached_path.exists():
+            try:
+                return _read_rgb_png(cached_path)
+            except Exception as exc:
+                _fal_invalidate_runtime_cache_path(
+                    self,
+                    cached_path,
+                    kind="rendered_input",
+                    sample_id=sample.sample_id,
+                    frame_index=frame_index,
+                    reason=exc,
+                )
+        lock_path = cached_path.with_suffix(".png.lock")
+        with _file_lock(lock_path):
+            if cached_path.exists():
+                try:
+                    return _read_rgb_png(cached_path)
+                except Exception as exc:
+                    _fal_invalidate_runtime_cache_path(
+                        self,
+                        cached_path,
+                        kind="rendered_input",
+                        sample_id=sample.sample_id,
+                        frame_index=frame_index,
+                        reason=exc,
+                    )
+            rendered = _render_sdr_from_hdr(
+                hdr,
+                camera_response=sample.camera_response,
+                exposure_ev=float(sample.exposure_ev),
+                gamma=float(gamma),
+                quantization_bits=int(quantization_bits),
+                jpeg_quality=sample.jpeg_quality,
+            )
+            _atomic_write_png(cached_path, rendered)
+            return rendered
+    return _render_sdr_from_hdr(
+        hdr,
+        camera_response=sample.camera_response,
+        exposure_ev=float(sample.exposure_ev),
+        gamma=float(gamma),
+        quantization_bits=int(quantization_bits),
+        jpeg_quality=sample.jpeg_quality,
+    )
+
+
+def _fal_load_cached_or_compressed_target(
+    self,
+    sample: ManifestSample,
+    *,
+    hdr: np.ndarray,
+    hdr_source_path: Path,
+    frame_index: int | None = None,
+) -> np.ndarray:
+    cache_key = self._cache_identity(
+        sample,
+        purpose="compressed_target",
+        frame_index=frame_index,
+        extra=str(hdr_source_path),
+    )
+    if self.cache_compressed_targets and self.target_representation != "raw_hdr":
+        cached_path = self.asset_cache.derived_path(
+            kind=f"target_{self.target_representation}",
+            cache_key=cache_key,
+            suffix=".npy",
+        )
+        if cached_path.exists():
+            try:
+                return _read_target_array(cached_path)
+            except Exception as exc:
+                _fal_invalidate_runtime_cache_path(
+                    self,
+                    cached_path,
+                    kind=f"target_{self.target_representation}",
+                    sample_id=sample.sample_id,
+                    frame_index=frame_index,
+                    reason=exc,
+                )
+        lock_path = cached_path.with_suffix(".npy.lock")
+        with _file_lock(lock_path):
+            if cached_path.exists():
+                try:
+                    return _read_target_array(cached_path)
+                except Exception as exc:
+                    _fal_invalidate_runtime_cache_path(
+                        self,
+                        cached_path,
+                        kind=f"target_{self.target_representation}",
+                        sample_id=sample.sample_id,
+                        frame_index=frame_index,
+                        reason=exc,
+                    )
+            compressed = _compress_target_from_hdr(hdr, self.target_representation)
+            _atomic_write_npy(cached_path, compressed)
+            return compressed
+    return _compress_target_from_hdr(hdr, self.target_representation)
+
+
+def _fal_image_dataset_getitem(self, index: int) -> dict[str, torch.Tensor | str]:
+    sample = self.samples[index]
+    rng = random.Random((self.seed * 10_000) + index)
+
+    direct_input_pair = self._optional_field_pair(sample, "input_sdr")
+    direct_target_path = self._resolve_direct_target_path(sample)
+
+    hdr = None
+    hdr_source_path = None
+    if direct_target_path is None or not any(direct_input_pair):
+        hdr, hdr_source_path = self._load_hdr_source(sample)
+
+    if any(direct_input_pair):
+        input_cache_key = self._cache_identity(
+            sample,
+            purpose="input_sdr",
+            extra="|".join(value or "" for value in direct_input_pair),
+        )
+
+        def input_path_factory(*, force_refresh: bool) -> Path:
+            return self._resolve_pair(
+                sample,
+                direct_input_pair,
+                kind="input_sdr",
+                cache_key=input_cache_key,
+                default_suffix=".png",
+                force_refresh=force_refresh,
+            )
+
+        input_image, _input_path = _fal_read_with_cache_healing(
+            self,
+            path_factory=input_path_factory,
+            reader=_read_rgb_png,
+            kind="input_sdr",
+            sample_id=sample.sample_id,
+        )
+    else:
+        assert hdr is not None and hdr_source_path is not None
+        input_image = self._load_cached_or_rendered_input(
+            sample,
+            hdr=hdr,
+            hdr_source_path=hdr_source_path,
+        )
+
+    if direct_target_path is not None:
+
+        def target_path_factory(*, force_refresh: bool) -> Path:
+            if force_refresh:
+                resolved = self._resolve_direct_target_path(sample)
+                if resolved is None:
+                    raise FileNotFoundError(
+                        f"Missing direct target after cache invalidation for {sample.sample_id}"
+                    )
+                return resolved
+            return direct_target_path
+
+        target_image, _target_path = _fal_read_with_cache_healing(
+            self,
+            path_factory=target_path_factory,
+            reader=lambda path: _fal_read_target_for_dataset(self, path),
+            kind=f"target_{self.target_representation}",
+            sample_id=sample.sample_id,
+        )
+    else:
+        assert hdr is not None and hdr_source_path is not None
+        target_image = self._load_cached_or_compressed_target(
+            sample,
+            hdr=hdr,
+            hdr_source_path=hdr_source_path,
+        )
+
+    if input_image.shape[:2] != target_image.shape[:2]:
+        raise ValueError(
+            f"Input/target shape mismatch for {sample.sample_id}: "
+            f"{input_image.shape[:2]} vs {target_image.shape[:2]}"
+        )
+
+    input_image = _resize_to_cover(
+        input_image,
+        self.train_height,
+        self.train_width,
+        interpolation=cv2.INTER_AREA,
+    )
+    target_image = _resize_to_cover(
+        target_image,
+        self.train_height,
+        self.train_width,
+        interpolation=cv2.INTER_CUBIC,
+    )
+    input_image, target_image = _crop_pair(
+        input_image=input_image,
+        target_image=target_image,
+        crop_height=self.train_height,
+        crop_width=self.train_width,
+        random_crop=self.random_crop,
+        rng=rng,
+    )
+
+    return {
+        "input_sdr": _to_input_tensor(input_image),
+        "target": _to_target_tensor(target_image, self.target_representation),
+        "scene_id": sample.scene_id,
+        "sample_id": sample.sample_id,
+        "variant_id": sample.variant_id or "",
+    }
+
+
+def _fal_video_dataset_getitem(self, index: int) -> dict[str, torch.Tensor | str]:
+    sample = self.samples[index]
+    rng = random.Random((self.seed * 10_000) + index)
+
+    input_images: list[np.ndarray] = []
+    target_images: list[np.ndarray] = []
+
+    input_pairs = self._pair_list(sample, "input_sdr")
+    target_pairs = self._direct_target_pairs(sample)
+    frame_count = max(
+        len(input_pairs),
+        len(target_pairs),
+        len(self._pair_list(sample, "source_hdr")),
+        len(self._pair_list(sample, "target_hdr")),
+    )
+    if frame_count == 0:
+        raise ValueError(f"Empty clip for {sample.sample_id}")
+
+    if not input_pairs:
+        input_pairs = [(None, None)] * frame_count
+    if not target_pairs:
+        target_pairs = [(None, None)] * frame_count
+
+    for frame_index in range(frame_count):
+        hdr = None
+        hdr_source_path = None
+
+        if any(input_pairs[frame_index]):
+            input_cache_key = self._cache_identity(
+                sample,
+                purpose="input_sdr",
+                frame_index=frame_index,
+                extra="|".join(value or "" for value in input_pairs[frame_index]),
+            )
+
+            def input_path_factory(*, force_refresh: bool) -> Path:
+                return self._resolve_pair(
+                    sample,
+                    input_pairs[frame_index],
+                    kind="input_sdr",
+                    cache_key=input_cache_key,
+                    default_suffix=".png",
+                    force_refresh=force_refresh,
+                )
+
+            input_image, _input_path = _fal_read_with_cache_healing(
+                self,
+                path_factory=input_path_factory,
+                reader=_read_rgb_png,
+                kind="input_sdr",
+                sample_id=sample.sample_id,
+                frame_index=frame_index,
+            )
+        else:
+            hdr, hdr_source_path = self._load_hdr_source(sample, frame_index=frame_index)
+            input_image = self._load_cached_or_rendered_input(
+                sample,
+                hdr=hdr,
+                hdr_source_path=hdr_source_path,
+                frame_index=frame_index,
+            )
+
+        if any(target_pairs[frame_index]):
+            target_cache_key = self._cache_identity(
+                sample,
+                purpose=f"target_{self.target_representation}",
+                frame_index=frame_index,
+                extra="|".join(value or "" for value in target_pairs[frame_index]),
+            )
+
+            def target_path_factory(*, force_refresh: bool) -> Path:
+                return self._resolve_pair(
+                    sample,
+                    target_pairs[frame_index],
+                    kind=f"target_{self.target_representation}",
+                    cache_key=target_cache_key,
+                    default_suffix=".npy",
+                    force_refresh=force_refresh,
+                )
+
+            target_image, _target_path = _fal_read_with_cache_healing(
+                self,
+                path_factory=target_path_factory,
+                reader=lambda path: _fal_read_target_for_dataset(self, path),
+                kind=f"target_{self.target_representation}",
+                sample_id=sample.sample_id,
+                frame_index=frame_index,
+            )
+        else:
+            if hdr is None or hdr_source_path is None:
+                hdr, hdr_source_path = self._load_hdr_source(sample, frame_index=frame_index)
+            target_image = self._load_cached_or_compressed_target(
+                sample,
+                hdr=hdr,
+                hdr_source_path=hdr_source_path,
+                frame_index=frame_index,
+            )
+
+        if input_image.shape[:2] != target_image.shape[:2]:
+            raise ValueError(
+                f"Frame {frame_index} mismatch for {sample.sample_id}: "
+                f"{input_image.shape[:2]} vs {target_image.shape[:2]}"
+            )
+        input_images.append(input_image)
+        target_images.append(target_image)
+
+    reference_shape = input_images[0].shape[:2]
+    for frame_index, input_image in enumerate(input_images):
+        if input_image.shape[:2] != reference_shape:
+            raise ValueError(
+                f"Inconsistent input frame size in clip {sample.sample_id}: "
+                f"{input_image.shape[:2]} vs {reference_shape}"
+            )
+
+    input_images = [
+        _resize_to_cover(
+            image,
+            self.train_height,
+            self.train_width,
+            interpolation=cv2.INTER_AREA,
+        )
+        for image in input_images
+    ]
+    target_images = [
+        _resize_to_cover(
+            image,
+            self.train_height,
+            self.train_width,
+            interpolation=cv2.INTER_CUBIC,
+        )
+        for image in target_images
+    ]
+    input_images, target_images = _crop_pair_sequence(
+        input_images=input_images,
+        target_images=target_images,
+        crop_height=self.train_height,
+        crop_width=self.train_width,
+        random_crop=self.random_crop,
+        rng=rng,
+    )
+
+    return {
+        "input_sdr": _stack_input_frames(input_images),
+        "target": _stack_target_frames(target_images, self.target_representation),
+        "scene_id": sample.scene_id,
+        "sample_id": sample.sample_id,
+        "variant_id": sample.variant_id or "",
+    }
+
+
+_SeedVRHDRDatasetBase._load_hdr_source = _fal_load_hdr_source
+_SeedVRHDRDatasetBase._load_cached_or_rendered_input = _fal_load_cached_or_rendered_input
+_SeedVRHDRDatasetBase._load_cached_or_compressed_target = _fal_load_cached_or_compressed_target
+_FalBaseImageDataset.__getitem__ = _fal_image_dataset_getitem
+_FalBaseVideoDataset.__getitem__ = _fal_video_dataset_getitem
+
+
+
+def _fal_text_region_box(region: dict, width: int, height: int) -> list[float] | None:
+    raw_box = (
+        region.get("bbox")
+        or region.get("box")
+        or region.get("xyxy")
+        or region.get("poly")
+        or region.get("polygon")
+    )
+    if raw_box is None:
+        return None
+    if isinstance(raw_box, (list, tuple)) and len(raw_box) == 4 and all(
+        isinstance(value, (int, float)) for value in raw_box
+    ):
+        x0, y0, x1, y1 = [float(value) for value in raw_box]
+    elif isinstance(raw_box, (list, tuple)) and len(raw_box) >= 4:
+        points = []
+        for point in raw_box:
+            if isinstance(point, (list, tuple)) and len(point) >= 2:
+                points.append((float(point[0]), float(point[1])))
+        if not points:
+            return None
+        xs = [point[0] for point in points]
+        ys = [point[1] for point in points]
+        x0, y0, x1, y1 = min(xs), min(ys), max(xs), max(ys)
+    else:
+        return None
+
+    if max(abs(x0), abs(y0), abs(x1), abs(y1)) > 1.5:
+        width = max(1, int(width))
+        height = max(1, int(height))
+        x0, x1 = x0 / width, x1 / width
+        y0, y1 = y0 / height, y1 / height
+    x0, x1 = sorted((max(0.0, min(1.0, x0)), max(0.0, min(1.0, x1))))
+    y0, y1 = sorted((max(0.0, min(1.0, y0)), max(0.0, min(1.0, y1))))
+    if (x1 - x0) <= 1.0e-4 or (y1 - y0) <= 1.0e-4:
+        return None
+    return [x0, y0, x1, y1]
+
+
+def _fal_text_region_text(region: dict) -> str:
+    value = region.get("text") or region.get("transcript") or region.get("label") or ""
+    return str(value).strip()
+
+
+def _fal_load_text_regions(dataset, sample: ManifestSample) -> list[dict]:
+    if sample.text_regions:
+        return list(sample.text_regions)
+    source = sample.text_regions_path or sample.text_regions_url
+    if not source:
+        return []
+    try:
+        if sample.text_regions_url:
+            path = dataset._resolve_pair(
+                sample,
+                (None, sample.text_regions_url),
+                kind="text_regions",
+                cache_key=dataset._cache_identity(sample, purpose="text_regions", extra=sample.text_regions_url),
+                default_suffix=".json",
+            )
+        else:
+            path = Path(sample.text_regions_path)
+            if not path.is_absolute():
+                path = dataset.dataset_root / path
+        with open(path) as file:
+            payload = json.load(file)
+    except Exception:
+        return []
+    if isinstance(payload, dict):
+        payload = payload.get("text_regions") or payload.get("regions") or payload.get("boxes") or []
+    return payload if isinstance(payload, list) else []
+
+
+def _fal_tokenize_text_region(text: str, char_to_idx: dict[str, int], max_chars: int) -> list[int]:
+    tokens = [char_to_idx[ch] for ch in text[:max_chars] if ch in char_to_idx]
+    return tokens[:max_chars]
+
+
+def _fal_attach_text_region_tensors(dataset, item: dict, sample: ManifestSample) -> dict:
+    target = item["target"]
+    frame_count = int(target.shape[0]) if isinstance(target, torch.Tensor) and target.ndim >= 4 else 1
+    boxes = torch.zeros(frame_count, dataset.text_region_max_regions, 4, dtype=torch.float32)
+    mask = torch.zeros(frame_count, dataset.text_region_max_regions, dtype=torch.float32)
+    tokens = torch.zeros(
+        frame_count,
+        dataset.text_region_max_regions,
+        dataset.text_region_max_chars,
+        dtype=torch.long,
+    )
+    lengths = torch.zeros(frame_count, dataset.text_region_max_regions, dtype=torch.long)
+    if dataset.text_region_max_regions <= 0:
+        item["text_boxes"] = boxes
+        item["text_mask"] = mask
+        item["text_tokens"] = tokens
+        item["text_lengths"] = lengths
+        return item
+
+    per_frame_counts = [0 for _ in range(frame_count)]
+    for region in _fal_load_text_regions(dataset, sample):
+        if not isinstance(region, dict):
+            continue
+        frame_index = int(region.get("frame_index", region.get("frame", 0)) or 0)
+        frame_index = max(0, min(frame_count - 1, frame_index))
+        slot = per_frame_counts[frame_index]
+        if slot >= dataset.text_region_max_regions:
+            continue
+        text = _fal_text_region_text(region)
+        encoded = _fal_tokenize_text_region(
+            text,
+            dataset.text_region_char_to_idx,
+            dataset.text_region_max_chars,
+        )
+        if len(encoded) < dataset.text_region_min_chars:
+            continue
+        box = _fal_text_region_box(region, width=sample.width, height=sample.height)
+        if box is None:
+            continue
+        boxes[frame_index, slot] = torch.tensor(box, dtype=torch.float32)
+        mask[frame_index, slot] = 1.0
+        tokens[frame_index, slot, : len(encoded)] = torch.tensor(encoded, dtype=torch.long)
+        lengths[frame_index, slot] = len(encoded)
+        per_frame_counts[frame_index] += 1
+    item["text_boxes"] = boxes
+    item["text_mask"] = mask
+    item["text_tokens"] = tokens
+    item["text_lengths"] = lengths
+    return item
+
+
+class SeedVRHDRImageDataset(_FalBaseImageDataset):
+    def __init__(
+        self,
+        *args,
+        phase_jitter: bool = False,
+        phase_jitter_max_pixels: int = 15,
+        size_jitter_steps: int = 0,
+        jpeg_roundtrip_prob: float = 0.0,
+        jpeg_roundtrip_min_quality: int = 75,
+        jpeg_roundtrip_max_quality: int = 95,
+        text_region_max_regions: int = 4,
+        text_region_max_chars: int = 32,
+        text_region_min_chars: int = 3,
+        text_region_alphabet: str = "",
+        **kwargs,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self.phase_jitter = phase_jitter
+        self.phase_jitter_max_pixels = phase_jitter_max_pixels
+        self.size_jitter_steps = size_jitter_steps
+        self.jpeg_roundtrip_prob = jpeg_roundtrip_prob
+        self.jpeg_roundtrip_min_quality = jpeg_roundtrip_min_quality
+        self.jpeg_roundtrip_max_quality = jpeg_roundtrip_max_quality
+        self.text_region_max_regions = text_region_max_regions
+        self.text_region_max_chars = text_region_max_chars
+        self.text_region_min_chars = text_region_min_chars
+        self.text_region_alphabet = text_region_alphabet
+        self.text_region_char_to_idx = {ch: idx + 1 for idx, ch in enumerate(text_region_alphabet)}
+
+    def _resolve_direct_target_path(self, sample: ManifestSample) -> Path | None:
+        if self.target_representation in {"pq_1000", "logc3"}:
+            candidates = [
+                self._optional_field_pair(sample, "target_mu_law"),
+                self._optional_field_pair(sample, "compressed_target"),
+            ]
+            for raw_path, raw_url in candidates:
+                if raw_path or raw_url:
+                    return self._resolve_pair(
+                        sample,
+                        (raw_path, raw_url),
+                        kind=f"target_mu_law_for_{self.target_representation}",
+                        cache_key=self._cache_identity(
+                            sample,
+                            purpose=f"target_mu_law_for_{self.target_representation}",
+                            extra=f"{raw_path or ''}|{raw_url or ''}",
+                        ),
+                        default_suffix=".npy",
+                    )
+            return None
+        return super()._resolve_direct_target_path(sample)
+
+    def __getitem__(self, index: int) -> dict[str, torch.Tensor | str]:
+        manifest_sample = self.samples[index]
+        sample = super().__getitem__(index)
+        if not self.random_crop:
+            return _fal_attach_text_region_tensors(self, sample, manifest_sample)
+        rng = random.Random((self.seed * 1_000_000) + index)
+        input_tensor, target_tensor = _fal_apply_spatial_jitter_pair(
+            sample["input_sdr"],
+            sample["target"],
+            phase_jitter=self.phase_jitter,
+            phase_jitter_max_pixels=self.phase_jitter_max_pixels,
+            size_jitter_steps=self.size_jitter_steps,
+            rng=rng,
+        )
+        input_tensor = _fal_apply_input_jpeg_roundtrip(
+            input_tensor,
+            prob=self.jpeg_roundtrip_prob,
+            min_quality=self.jpeg_roundtrip_min_quality,
+            max_quality=self.jpeg_roundtrip_max_quality,
+            rng=rng,
+        )
+        sample["input_sdr"] = input_tensor
+        sample["target"] = target_tensor
+        return _fal_attach_text_region_tensors(self, sample, manifest_sample)
+
+
+class SeedVRHDRVideoDataset(_FalBaseVideoDataset):
+    def __init__(
+        self,
+        *args,
+        phase_jitter: bool = False,
+        phase_jitter_max_pixels: int = 15,
+        size_jitter_steps: int = 0,
+        jpeg_roundtrip_prob: float = 0.0,
+        jpeg_roundtrip_min_quality: int = 75,
+        jpeg_roundtrip_max_quality: int = 95,
+        text_region_max_regions: int = 4,
+        text_region_max_chars: int = 32,
+        text_region_min_chars: int = 3,
+        text_region_alphabet: str = "",
+        **kwargs,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self.phase_jitter = phase_jitter
+        self.phase_jitter_max_pixels = phase_jitter_max_pixels
+        self.size_jitter_steps = size_jitter_steps
+        self.jpeg_roundtrip_prob = jpeg_roundtrip_prob
+        self.jpeg_roundtrip_min_quality = jpeg_roundtrip_min_quality
+        self.jpeg_roundtrip_max_quality = jpeg_roundtrip_max_quality
+        self.text_region_max_regions = text_region_max_regions
+        self.text_region_max_chars = text_region_max_chars
+        self.text_region_min_chars = text_region_min_chars
+        self.text_region_alphabet = text_region_alphabet
+        self.text_region_char_to_idx = {ch: idx + 1 for idx, ch in enumerate(text_region_alphabet)}
+
+    def _direct_target_pairs(self, sample: ManifestSample) -> list[tuple[str | None, str | None]]:
+        if self.target_representation in {"pq_1000", "logc3"}:
+            for pairs in [
+                self._pair_list(sample, "target_mu_law"),
+                self._pair_list(sample, "compressed_target"),
+            ]:
+                if pairs:
+                    return pairs
+            return []
+        return super()._direct_target_pairs(sample)
+
+    def __getitem__(self, index: int) -> dict[str, torch.Tensor | str]:
+        manifest_sample = self.samples[index]
+        sample = super().__getitem__(index)
+        if not self.random_crop:
+            return _fal_attach_text_region_tensors(self, sample, manifest_sample)
+        rng = random.Random((self.seed * 1_000_000) + index)
+        input_tensor, target_tensor = _fal_apply_spatial_jitter_pair(
+            sample["input_sdr"],
+            sample["target"],
+            phase_jitter=self.phase_jitter,
+            phase_jitter_max_pixels=self.phase_jitter_max_pixels,
+            size_jitter_steps=self.size_jitter_steps,
+            rng=rng,
+        )
+        input_tensor = _fal_apply_input_jpeg_roundtrip(
+            input_tensor,
+            prob=self.jpeg_roundtrip_prob,
+            min_quality=self.jpeg_roundtrip_min_quality,
+            max_quality=self.jpeg_roundtrip_max_quality,
+            rng=rng,
+        )
+        sample["input_sdr"] = input_tensor
+        sample["target"] = target_tensor
+        return _fal_attach_text_region_tensors(self, sample, manifest_sample)

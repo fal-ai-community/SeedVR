@@ -9,7 +9,7 @@ import torch
 
 MU_LAW_MU = 5000.0
 LOG_HDR_EPS = 1.0e-6
-HIGHLIGHT_THRESHOLD = 4.0
+# Highlight-specific validation MAE was constant on this dataset, so do not log it.
 
 
 def _input_tensor_to_uint8_image(tensor: torch.Tensor) -> np.ndarray:
@@ -37,6 +37,34 @@ def linear_hdr_from_target_tensor(
         return torch.expm1(normalized * np.log1p(MU_LAW_MU)) / MU_LAW_MU
     if target_representation == "log_hdr":
         return torch.clamp(torch.exp(tensor) - LOG_HDR_EPS, min=0.0)
+    if target_representation == "pq_1000":
+        normalized = tensor.clamp(-1.0, 1.0).add(1.0).mul(0.5)
+        m1 = 2610.0 / 16384.0
+        m2 = 2523.0 / 32.0
+        c1 = 3424.0 / 4096.0
+        c2 = 2413.0 / 128.0
+        c3 = 2392.0 / 128.0
+        powered = torch.pow(normalized, 1.0 / m2)
+        numerator = torch.clamp(powered - c1, min=0.0)
+        denominator = torch.clamp(c2 - c3 * powered, min=1.0e-8)
+        nits = torch.pow(numerator / denominator, 1.0 / m1) * 10000.0
+        return nits / 1000.0
+    if target_representation == "logc3":
+        normalized = tensor.clamp(-1.0, 1.0).add(1.0).mul(0.5)
+        cut = 0.010591
+        a = 5.555556
+        b = 0.052272
+        c = 0.247190
+        d = 0.385537
+        e = 5.367655
+        f = 0.092809
+        cut_encoded = e * cut + f
+        linear = torch.where(
+            normalized > cut_encoded,
+            (torch.pow(torch.tensor(10.0, device=normalized.device), (normalized - d) / c) - b) / a,
+            (normalized - f) / e,
+        )
+        return torch.clamp(linear, min=0.0)
     raise ValueError(f"Unsupported target_representation: {target_representation}")
 
 
@@ -119,15 +147,9 @@ def compute_hdr_metrics(
 
     preview_prediction = _robust_tonemap(predicted_linear)
     preview_target = _robust_tonemap(target_linear)
-    highlight_mask = target_linear > HIGHLIGHT_THRESHOLD
 
-    metrics = {
+    return {
         "hdr_log_mae": float(log_diff.mean().item()),
         "hdr_log_psnr": _psnr(predicted_log, target_log, data_range=max(1.0, float(target_log.max().item()))),
         "tonemap_psnr": _psnr(preview_prediction, preview_target, data_range=1.0),
     }
-    if highlight_mask.any():
-        metrics["highlight_log_mae"] = float(log_diff[highlight_mask].mean().item())
-    else:
-        metrics["highlight_log_mae"] = 0.0
-    return metrics

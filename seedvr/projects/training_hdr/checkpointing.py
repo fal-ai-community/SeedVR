@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 import random
 from pathlib import Path
 from typing import Any
@@ -26,25 +28,32 @@ def save_checkpoint(
     output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = output_dir / f"seedvr_hdr_step_{step:06d}.pt"
     model_to_save = unwrap_compiled_module(model)
-    torch.save(
-        {
-            "step": step,
-            "model": model_to_save.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "scheduler": scheduler.state_dict() if scheduler is not None else None,
-            "metrics": metrics,
-            "config": config,
-            "rng_state": {
-                "python": random.getstate(),
-                "numpy": np.random.get_state(),
-                "torch": torch.get_rng_state(),
-                "cuda": (
-                    torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
-                ),
+    with tempfile.NamedTemporaryFile(dir=output_dir, suffix=".pt", delete=False) as tmp_file:
+        tmp_path = Path(tmp_file.name)
+    try:
+        torch.save(
+            {
+                "step": step,
+                "model": model_to_save.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict() if scheduler is not None else None,
+                "metrics": metrics,
+                "config": config,
+                "rng_state": {
+                    "python": random.getstate(),
+                    "numpy": np.random.get_state(),
+                    "torch": torch.get_rng_state(),
+                    "cuda": (
+                        torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+                    ),
+                },
             },
-        },
-        checkpoint_path,
-    )
+            tmp_path,
+        )
+        os.replace(tmp_path, checkpoint_path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
     return checkpoint_path
 
 
@@ -114,5 +123,15 @@ def write_result_manifest(
     }
     if extra:
         payload.update(extra)
-    with open(path, "w") as file:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        "w", dir=path.parent, suffix=".json", delete=False
+    ) as file:
+        tmp_path = Path(file.name)
         json.dump(payload, file, indent=2)
+    try:
+        os.replace(tmp_path, path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
