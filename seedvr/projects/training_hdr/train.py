@@ -935,7 +935,7 @@ def build_optimizer(
     config: TrainingConfig,
     model: torch.nn.Module,
 ) -> torch.optim.Optimizer:
-    trainable_params = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    trainable_params = build_trainable_param_groups(config, model)
     if config.optimizer_type.startswith("heavyball_"):
         import heavyball
 
@@ -991,6 +991,54 @@ def build_optimizer(
             fused=True,
         )
     raise ValueError(f"Unsupported optimizer_type '{config.optimizer_type}'")
+
+
+def build_trainable_param_groups(
+    config: TrainingConfig,
+    model: torch.nn.Module,
+) -> list[torch.nn.Parameter] | list[dict[str, object]]:
+    trainable_named_params = [
+        (name, parameter)
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    ]
+    if config.layerwise_lr_decay > 1.0:
+        raise ValueError("layerwise_lr_decay must be <= 1.0")
+    if config.layerwise_lr_decay == 1.0:
+        return [parameter for _, parameter in trainable_named_params]
+    if config.layerwise_lr_decay <= 0.0:
+        raise ValueError("layerwise_lr_decay must be > 0.0")
+
+    blocks = getattr(model, "blocks", None)
+    num_blocks = len(blocks) if blocks is not None else 0
+    if num_blocks <= 0:
+        return [parameter for _, parameter in trainable_named_params]
+
+    grouped: dict[float, list[torch.nn.Parameter]] = {}
+    for name, parameter in trainable_named_params:
+        block_idx = _dit_block_index_from_param_name(name)
+        if block_idx is None:
+            scale = 1.0
+        else:
+            # Later DiT blocks stay closest to the base LR; earlier blocks decay.
+            depth_from_top = max(0, num_blocks - 1 - block_idx)
+            scale = config.layerwise_lr_decay ** depth_from_top
+            scale = max(float(config.layerwise_lr_min_scale), float(scale))
+        grouped.setdefault(round(float(scale), 8), []).append(parameter)
+
+    return [
+        {"params": params, "lr": config.learning_rate * scale}
+        for scale, params in sorted(grouped.items())
+    ]
+
+
+def _dit_block_index_from_param_name(name: str) -> int | None:
+    if not name.startswith("blocks."):
+        return None
+    parts = name.split(".")
+    if len(parts) < 2 or not parts[1].isdigit():
+        return None
+    return int(parts[1])
 
 
 def build_scheduler(
@@ -1440,6 +1488,15 @@ def main() -> None:
     print(json.dumps(runtime_info, indent=2))
 
     optimizer = build_optimizer(config, runner.dit)
+    optimizer_lrs = sorted(
+        {float(group["lr"]) for group in optimizer.param_groups}
+    )
+    print(
+        "[seedvr-hdr] optimizer parameter groups: "
+        f"count={len(optimizer.param_groups)} "
+        f"min_lr={optimizer_lrs[0]:.3e} max_lr={optimizer_lrs[-1]:.3e} "
+        f"layerwise_lr_decay={config.layerwise_lr_decay}"
+    )
     scheduler = build_scheduler(config, optimizer)
     start_step, resumed_metrics = maybe_resume_training(
         config=config,

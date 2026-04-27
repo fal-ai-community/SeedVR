@@ -87,6 +87,8 @@ class TrainingConfig:
     scheduler_type: str = "cosine"
     warmup_steps: int = 100
     min_lr_ratio: float = 0.1
+    layerwise_lr_decay: float = 1.0
+    layerwise_lr_min_scale: float = 0.05
     num_workers: int = 4
     runtime_cache_root: str = "/data/seedvr_hdr_runtime_cache"
     remote_download_timeout_seconds: int = 120
