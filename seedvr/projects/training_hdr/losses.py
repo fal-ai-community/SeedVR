@@ -137,93 +137,6 @@ def detail_reconstruction_loss(
     return 0.5 * rgb_loss + 0.5 * luma_loss
 
 
-def _text_region_crop_batch(
-    tensor: torch.Tensor,
-    boxes: torch.Tensor,
-    mask: torch.Tensor,
-    crop_height: int,
-    crop_width: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    images = _flatten_btchw(tensor.float())
-    b, t, c, h, w = images.shape
-    flat_images = images.reshape(b * t, c, h, w)
-    if boxes.ndim == 3:
-        boxes = boxes.unsqueeze(1)
-    if mask.ndim == 2:
-        mask = mask.unsqueeze(1)
-    boxes = boxes.to(device=tensor.device, dtype=tensor.dtype).reshape(b * t, -1, 4)
-    mask = mask.to(device=tensor.device, dtype=torch.bool).reshape(b * t, -1)
-    crops: list[torch.Tensor] = []
-    crop_masks: list[torch.Tensor] = []
-    ys = torch.linspace(-1.0, 1.0, crop_height, device=tensor.device, dtype=tensor.dtype)
-    xs = torch.linspace(-1.0, 1.0, crop_width, device=tensor.device, dtype=tensor.dtype)
-    grid_y, grid_x = torch.meshgrid(ys, xs, indexing="ij")
-    base_grid = torch.stack((grid_x, grid_y), dim=-1)
-    for image_index in range(flat_images.shape[0]):
-        valid_indices = torch.nonzero(mask[image_index], as_tuple=False).flatten()
-        for region_index in valid_indices:
-            x0, y0, x1, y1 = boxes[image_index, region_index].unbind()
-            if (x1 - x0) <= 1.0e-4 or (y1 - y0) <= 1.0e-4:
-                continue
-            cx = (x0 + x1) - 1.0
-            cy = (y0 + y1) - 1.0
-            sx = (x1 - x0).clamp_min(1.0e-4)
-            sy = (y1 - y0).clamp_min(1.0e-4)
-            grid = base_grid.clone()
-            grid[..., 0] = grid[..., 0] * sx + cx
-            grid[..., 1] = grid[..., 1] * sy + cy
-            crop = F.grid_sample(
-                flat_images[image_index : image_index + 1],
-                grid.unsqueeze(0),
-                mode="bilinear",
-                padding_mode="border",
-                align_corners=True,
-            )[0]
-            crops.append(crop)
-            crop_masks.append(tensor.new_ones(()))
-    if not crops:
-        return tensor.new_zeros((0, images.shape[2], crop_height, crop_width)), tensor.new_zeros((0,))
-    return torch.stack(crops, dim=0), torch.stack(crop_masks, dim=0)
-
-
-def extract_text_region_crops(
-    tensor: torch.Tensor,
-    boxes: torch.Tensor,
-    mask: torch.Tensor,
-    crop_height: int = 32,
-    crop_width: int = 128,
-) -> torch.Tensor:
-    crops, _ = _text_region_crop_batch(tensor, boxes, mask, crop_height, crop_width)
-    return crops
-
-
-def text_region_detail_loss(
-    prediction: torch.Tensor,
-    target: torch.Tensor,
-    boxes: torch.Tensor,
-    mask: torch.Tensor,
-    crop_height: int = 32,
-    crop_width: int = 128,
-    blur_kernel: int = 5,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Text-box-local high-pass/edge loss for OCR-positive regions."""
-    target = target.to(device=prediction.device, dtype=prediction.dtype)
-    pred_crops = extract_text_region_crops(prediction, boxes, mask, crop_height, crop_width)
-    target_crops = extract_text_region_crops(target, boxes, mask, crop_height, crop_width)
-    if pred_crops.numel() == 0:
-        return prediction.new_zeros(()), prediction.new_zeros(())
-    pred_luma = _luminance_bchw(pred_crops[:, :3])
-    target_luma = _luminance_bchw(target_crops[:, :3])
-    pred_dx, pred_dy = _gradient_xy(pred_luma)
-    target_dx, target_dy = _gradient_xy(target_luma)
-    edge_loss = charbonnier_loss(pred_dx, target_dx) + charbonnier_loss(pred_dy, target_dy)
-    detail_loss_value = charbonnier_loss(
-        _high_pass(pred_crops[:, :3], blur_kernel=blur_kernel),
-        _high_pass(target_crops[:, :3], blur_kernel=blur_kernel),
-    )
-    return edge_loss + 0.5 * detail_loss_value, prediction.new_tensor(float(pred_crops.shape[0]))
-
-
 def edge_consistency_loss(prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     """Preserve source/target structure and reduce painterly texture hallucination."""
     prediction = _btchw_as_bchw(prediction)
@@ -233,25 +146,6 @@ def edge_consistency_loss(prediction: torch.Tensor, target: torch.Tensor) -> tor
     pred_dx, pred_dy = _gradient_xy(pred_luma)
     target_dx, target_dy = _gradient_xy(target_luma)
     return charbonnier_loss(pred_dx, target_dx) + charbonnier_loss(pred_dy, target_dy)
-
-
-def text_layout_edge_loss(
-    prediction: torch.Tensor,
-    target: torch.Tensor,
-    edge_threshold: float = 0.12,
-) -> torch.Tensor:
-    """Edge-gated structure loss for text/UI layout without relying on OCR tokens."""
-    prediction = _btchw_as_bchw(prediction)
-    target = _btchw_as_bchw(target.to(device=prediction.device, dtype=prediction.dtype))
-    pred_luma = _luminance_bchw(prediction[:, :3])
-    target_luma = _luminance_bchw(target[:, :3])
-    pred_dx, pred_dy = _gradient_xy(pred_luma)
-    target_dx, target_dy = _gradient_xy(target_luma)
-    target_edge = target_dx.abs() + target_dy.abs()
-    mask = (target_edge > edge_threshold).to(dtype=prediction.dtype)
-    if mask.sum() < 1:
-        return prediction.new_zeros(())
-    return _masked_mean((pred_dx - target_dx).abs() + (pred_dy - target_dy).abs(), mask)
 
 
 def flat_region_smoothness_loss(

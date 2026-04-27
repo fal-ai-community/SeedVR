@@ -9,6 +9,13 @@ import torch
 
 MU_LAW_MU = 5000.0
 LOG_HDR_EPS = 1.0e-6
+PU21_L_MIN = 0.005
+PU21_L_MAX = 10000.0
+PU21_PEAK_NITS = 1000.0
+_LPIPS_MODEL = None
+_LPIPS_UNAVAILABLE = False
+_CVVDP_MODEL = None
+_CVVDP_UNAVAILABLE = False
 # Highlight-specific validation MAE was constant on this dataset, so do not log it.
 
 
@@ -87,12 +94,111 @@ def _preview_uint8_from_linear_hdr(linear_hdr: torch.Tensor) -> np.ndarray:
     return np.transpose(preview, (1, 2, 0))
 
 
+def _luminance(rgb: torch.Tensor) -> torch.Tensor:
+    return (
+        0.2126 * rgb[0:1]
+        + 0.7152 * rgb[1:2]
+        + 0.0722 * rgb[2:3]
+    )
+
+
+def _linear_hdr_to_absolute_nits(linear_hdr: torch.Tensor) -> torch.Tensor:
+    return torch.clamp(linear_hdr.float() * PU21_PEAK_NITS, min=PU21_L_MIN, max=PU21_L_MAX)
+
+
+def _pu21_encode(luminance_nits: torch.Tensor) -> torch.Tensor:
+    # PU21 banding_glare parameters from gfxdisp/pu21, recommended by the authors.
+    p = luminance_nits.new_tensor(
+        [
+            0.353487901,
+            0.3734658629,
+            8.277049286e-05,
+            0.9062562627,
+            0.09150303166,
+            0.9099517204,
+            596.3148142,
+        ]
+    )
+    y = torch.clamp(luminance_nits, PU21_L_MIN, PU21_L_MAX)
+    encoded = p[6] * (((p[0] + p[1] * y.pow(p[3])) / (1.0 + p[2] * y.pow(p[3]))).pow(p[4]) - p[5])
+    return torch.clamp(encoded, min=0.0)
+
+
+def _pu21_psnr(predicted_linear: torch.Tensor, target_linear: torch.Tensor) -> float:
+    pred_luminance = _linear_hdr_to_absolute_nits(_luminance(predicted_linear))
+    target_luminance = _linear_hdr_to_absolute_nits(_luminance(target_linear))
+    pred_pu = _pu21_encode(pred_luminance)
+    target_pu = _pu21_encode(target_luminance)
+    mse = torch.mean((pred_pu - target_pu) ** 2).item()
+    if mse <= 1.0e-12:
+        return float("inf")
+    return float(10.0 * np.log10((1023.0**2) / mse))
+
+
+def _lpips_distance(predicted_linear: torch.Tensor, target_linear: torch.Tensor) -> float | None:
+    global _LPIPS_MODEL, _LPIPS_UNAVAILABLE
+    if _LPIPS_UNAVAILABLE:
+        return None
+    try:
+        import lpips  # type: ignore
+
+        if _LPIPS_MODEL is None:
+            _LPIPS_MODEL = lpips.LPIPS(net="alex").eval().to(predicted_linear.device)
+        pred = _robust_tonemap(predicted_linear).mul(2.0).sub(1.0).unsqueeze(0)
+        target = _robust_tonemap(target_linear).mul(2.0).sub(1.0).unsqueeze(0)
+        with torch.no_grad():
+            return float(_LPIPS_MODEL(pred, target).mean().item())
+    except Exception as exc:
+        _LPIPS_UNAVAILABLE = True
+        print(f"[seedvr-hdr] LPIPS validation metric unavailable: {exc}")
+        return None
+
+
+def _colorvideovdp_jod(predicted_linear: torch.Tensor, target_linear: torch.Tensor) -> float | None:
+    global _CVVDP_MODEL, _CVVDP_UNAVAILABLE
+    if _CVVDP_UNAVAILABLE:
+        return None
+    try:
+        import pycvvdp  # type: ignore
+
+        if _CVVDP_MODEL is None:
+            _CVVDP_MODEL = pycvvdp.cvvdp(display_name="standard_hdr_linear")
+        pred = _linear_hdr_to_absolute_nits(predicted_linear).permute(1, 2, 0).detach().cpu().numpy()
+        target = _linear_hdr_to_absolute_nits(target_linear).permute(1, 2, 0).detach().cpu().numpy()
+        jod, _stats = _CVVDP_MODEL.predict(pred.astype(np.float32), target.astype(np.float32), dim_order="HWC")
+        return float(jod)
+    except Exception as exc:
+        _CVVDP_UNAVAILABLE = True
+        print(f"[seedvr-hdr] ColorVideoVDP JOD validation metric unavailable: {exc}")
+        return None
+
+
+def _add_panel_labels(panels: list[np.ndarray], labels: list[str]) -> list[np.ndarray]:
+    labeled_panels: list[np.ndarray] = []
+    for panel, label in zip(panels, labels):
+        labeled = panel.copy()
+        cv2.rectangle(labeled, (0, 0), (min(labeled.shape[1], 220), 28), (0, 0, 0), thickness=-1)
+        cv2.putText(
+            labeled,
+            label,
+            (8, 20),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (255, 255, 255),
+            thickness=1,
+            lineType=cv2.LINE_AA,
+        )
+        labeled_panels.append(labeled)
+    return labeled_panels
+
+
 def save_triptych(
     output_path: str | Path,
     input_image: torch.Tensor,
     predicted_image: torch.Tensor,
     target_image: torch.Tensor,
     target_representation: str,
+    base_predicted_image: torch.Tensor | None = None,
 ) -> Path:
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -102,14 +208,19 @@ def save_triptych(
     target_image = _select_preview_frame(target_image)
     predicted_linear = linear_hdr_from_target_tensor(predicted_image, target_representation)
     target_linear = linear_hdr_from_target_tensor(target_image, target_representation)
-    canvas = np.concatenate(
-        [
-            _input_tensor_to_uint8_image(input_image),
-            _preview_uint8_from_linear_hdr(predicted_linear),
-            _preview_uint8_from_linear_hdr(target_linear),
-        ],
-        axis=1,
-    )
+    panels = [
+        _input_tensor_to_uint8_image(input_image),
+        _preview_uint8_from_linear_hdr(predicted_linear),
+        _preview_uint8_from_linear_hdr(target_linear),
+    ]
+    labels = ["input", "prediction", "ground_truth"]
+    if base_predicted_image is not None:
+        base_predicted_image = _select_preview_frame(base_predicted_image)
+        base_linear = linear_hdr_from_target_tensor(base_predicted_image, target_representation)
+        panels.append(_preview_uint8_from_linear_hdr(base_linear))
+        labels.append("base_seedvr")
+    panels = _add_panel_labels(panels, labels)
+    canvas = np.concatenate(panels, axis=1)
     canvas_bgr = cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR)
     cv2.imwrite(str(output_path), canvas_bgr)
     return output_path
@@ -132,7 +243,7 @@ def compute_hdr_metrics(
             compute_hdr_metrics(predicted_image[index], target_image[index], target_representation)
             for index in range(predicted_image.shape[0])
         ]
-        metric_names = frame_metrics[0].keys()
+        metric_names = sorted(set.intersection(*(set(row) for row in frame_metrics)))
         return {
             name: float(np.mean([row[name] for row in frame_metrics]))
             for name in metric_names
@@ -148,8 +259,16 @@ def compute_hdr_metrics(
     preview_prediction = _robust_tonemap(predicted_linear)
     preview_target = _robust_tonemap(target_linear)
 
-    return {
+    metrics = {
         "hdr_log_mae": float(log_diff.mean().item()),
         "hdr_log_psnr": _psnr(predicted_log, target_log, data_range=max(1.0, float(target_log.max().item()))),
         "tonemap_psnr": _psnr(preview_prediction, preview_target, data_range=1.0),
+        "pu21_psnr": _pu21_psnr(predicted_linear, target_linear),
     }
+    lpips_value = _lpips_distance(predicted_linear, target_linear)
+    if lpips_value is not None:
+        metrics["lpips"] = lpips_value
+    jod_value = _colorvideovdp_jod(predicted_linear, target_linear)
+    if jod_value is not None:
+        metrics["jod"] = jod_value
+    return metrics

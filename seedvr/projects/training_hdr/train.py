@@ -39,12 +39,8 @@ from seedvr.projects.training_hdr.losses import (
     image_reconstruction_loss,
     latent_reconstruction_loss,
     low_frequency_banding_loss,
-    extract_text_region_crops,
-    text_region_detail_loss,
-    text_layout_edge_loss,
 )
-from seedvr.projects.training_hdr.text_recon import FalconOCRConfig, FalconOCRTextTeacher
-from seedvr.projects.training_hdr.validation import compute_hdr_metrics, linear_hdr_from_target_tensor, save_triptych
+from seedvr.projects.training_hdr.validation import compute_hdr_metrics, save_triptych
 from seedvr.projects.video_diffusion_sr.infer import VideoDiffusionInfer
 
 try:
@@ -356,7 +352,6 @@ def build_wandb_train_metrics(
     step: int,
     final_metrics: dict[str, float],
     include_step_timing: bool,
-    include_text_metrics: bool,
 ) -> dict[str, float]:
     metrics = {
         "step": step,
@@ -374,52 +369,12 @@ def build_wandb_train_metrics(
         "color_constancy",
         "detail",
         "edge_consistency",
-        "text_layout",
-        "text_region_detail",
-        "text_region_ctc",
     ):
         weight_key = f"{loss_name}_weight"
         loss_key = f"{loss_name}_loss"
         if float(final_metrics.get(weight_key, 0.0)) > 0.0:
             metrics[loss_key] = float(final_metrics[loss_key])
-    if include_text_metrics:
-        metrics["text_recon_loss"] = float(final_metrics["text_recon_loss"])
     return metrics
-
-
-def maybe_init_text_teacher(
-    config: TrainingConfig,
-    device: torch.device,
-) -> tuple[FalconOCRTextTeacher | None, dict[str, Any]]:
-    debug = {
-        "requested": bool(config.text_recon_loss_weight > 0.0),
-        "model_id": config.text_recon_model_id,
-        "init_ok": False,
-        "init_error": None,
-    }
-    if config.text_recon_loss_weight <= 0.0:
-        return None, debug
-    try:
-        teacher = FalconOCRTextTeacher(
-            device=device,
-            dtype=torch.bfloat16,
-            config=FalconOCRConfig(
-                model_id=config.text_recon_model_id,
-                max_new_tokens=config.text_recon_max_new_tokens,
-                min_dimension=config.text_recon_min_dimension,
-                max_dimension=config.text_recon_max_dimension,
-                min_chars=config.text_recon_min_chars,
-                min_tokens=config.text_recon_min_tokens,
-                loss_normalizer_min_tokens=config.text_recon_loss_normalizer_min_tokens,
-                require_alnum=config.text_recon_require_alnum,
-            ),
-        )
-        debug["init_ok"] = True
-        return teacher, debug
-    except Exception as exc:
-        debug["init_error"] = str(exc)
-        print(f"[seedvr-hdr] Falcon-OCR text loss disabled after init failure: {exc}")
-        return None, debug
 
 
 def get_cuda_memory_stats(device: torch.device) -> dict[str, float]:
@@ -527,9 +482,39 @@ def build_preview_indices(
         min(dataset_size - 1, int((index * dataset_size) / count))
         for index in range(count)
     ]
-    validation_round = max(0, (max(1, step) - 1) // max(1, validate_every))
-    offset = validation_round % dataset_size
-    return [int((base_index + offset) % dataset_size) for base_index in base_indices]
+    return [int(base_index) for base_index in base_indices]
+
+
+def validation_noise_seed(config: TrainingConfig, sample_index: int) -> int:
+    return int(config.seed + 17_017 + (sample_index * 1_009))
+
+
+def sampler_validation_noise_seed(config: TrainingConfig, sample_index: int) -> int:
+    return int(config.sampler_validation_seed + 23_017 + (sample_index * 1_009))
+
+
+def collect_base_preview_indices(config: TrainingConfig, dataset_size: int) -> list[int]:
+    if dataset_size <= 0:
+        return []
+    indices: set[int] = set()
+    sampler_preview_count = min(config.sampler_validation_samples, dataset_size)
+    indices.update(
+        build_preview_indices(
+            dataset_size=dataset_size,
+            num_previews=config.num_validation_samples,
+            step=1,
+            validate_every=config.validate_every,
+        )
+    )
+    indices.update(
+        build_preview_indices(
+            dataset_size=dataset_size,
+            num_previews=sampler_preview_count,
+            step=1,
+            validate_every=config.validate_every,
+        )
+    )
+    return sorted(indices)
 
 
 def single_sample_to_batch(sample: dict[str, Any]) -> dict[str, Any]:
@@ -550,6 +535,7 @@ def evaluate_validation_batch(
     text_pos_shapes: torch.Tensor,
     batch: dict[str, Any],
     device: torch.device,
+    noise_seed: int | None = None,
 ) -> tuple[float, dict[str, float], torch.Tensor, torch.Tensor, torch.Tensor]:
     input_images = batch["input_sdr"].to(device)
     target_images = batch["target"].to(device)
@@ -576,7 +562,16 @@ def evaluate_validation_batch(
 
     latents_flat, latent_shapes = na.flatten(target_latents)
     cond_flat, _ = na.flatten(conditions)
-    noise = torch.randn_like(latents_flat)
+    if noise_seed is None:
+        noise = torch.randn_like(latents_flat)
+    else:
+        generator = torch.Generator(device=device).manual_seed(int(noise_seed))
+        noise = torch.randn(
+            latents_flat.shape,
+            device=latents_flat.device,
+            dtype=latents_flat.dtype,
+            generator=generator,
+        )
     timesteps = torch.full(
         (len(target_latents),),
         runner.schedule.T * 0.5,
@@ -635,141 +630,45 @@ def evaluate_validation_batch(
     return denoise, hdr_metrics, input_images, target_images, predicted_images
 
 
-class LightweightCTCRecognizer(torch.nn.Module):
-    def __init__(self, num_classes: int) -> None:
-        super().__init__()
-        self.features = torch.nn.Sequential(
-            torch.nn.Conv2d(3, 32, kernel_size=3, stride=1, padding=1),
-            torch.nn.ReLU(inplace=True),
-            torch.nn.MaxPool2d((2, 2)),
-            torch.nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),
-            torch.nn.ReLU(inplace=True),
-            torch.nn.MaxPool2d((2, 2)),
-            torch.nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),
-            torch.nn.ReLU(inplace=True),
-            torch.nn.MaxPool2d((2, 1)),
-        )
-        self.classifier = torch.nn.Linear(128, num_classes)
-
-    def forward(self, images: torch.Tensor) -> torch.Tensor:
-        features = self.features(images.float())
-        features = features.mean(dim=2).permute(2, 0, 1).contiguous()
-        return self.classifier(features)
-
-
-def maybe_init_text_region_ctc_recognizer(
-    config: TrainingConfig,
-    device: torch.device,
-) -> LightweightCTCRecognizer | None:
-    if not config.text_region_ctc_checkpoint:
-        return None
-    recognizer = LightweightCTCRecognizer(num_classes=len(config.text_region_alphabet) + 1)
-    try:
-        if config.text_region_ctc_checkpoint.startswith(("http://", "https://")):
-            state = torch.hub.load_state_dict_from_url(
-                config.text_region_ctc_checkpoint,
-                map_location="cpu",
-                progress=False,
-            )
-        else:
-            state = torch.load(config.text_region_ctc_checkpoint, map_location="cpu")
-        if isinstance(state, dict) and "state_dict" in state:
-            state = state["state_dict"]
-        recognizer.load_state_dict(state, strict=True)
-    except Exception as exc:
-        print(f"[seedvr-hdr] text-region CTC recognizer disabled after load failure: {exc}")
-        return None
-    recognizer.to(device)
-    recognizer.eval()
-    recognizer.requires_grad_(False)
-    print("[seedvr-hdr] text-region CTC recognizer enabled.")
-    return recognizer
-
-
-def _tone_map_for_text_region_ctc(images: torch.Tensor, target_representation: str) -> torch.Tensor:
-    images = images.float()
-    original_shape = tuple(images.shape)
-    if images.ndim == 5:
-        b, t, c, h, w = images.shape
-        images = images.reshape(b * t, c, h, w)
-    linear = linear_hdr_from_target_tensor(images, target_representation)
-    flat = linear.clamp_min(0.0).reshape(linear.shape[0], -1)
-    percentile = torch.quantile(flat, 0.995, dim=1, keepdim=True)
-    maximum = flat.max(dim=1, keepdim=True).values.clamp(min=1.0)
-    scale = torch.where(percentile > 1.0e-6, percentile, maximum).view(linear.shape[0], 1, 1, 1)
-    mapped = linear / scale
-    mapped = (mapped / (1.0 + mapped)).clamp(0.0, 1.0) ** (1.0 / 2.2)
-    if len(original_shape) == 5:
-        mapped = mapped.reshape(original_shape[0], original_shape[1], original_shape[2], original_shape[3], original_shape[4])
-    return mapped
-
-
-def compute_text_region_ctc_loss(
+def build_base_validation_prediction_cache(
     *,
-    recognizer: LightweightCTCRecognizer | None,
-    predicted_images: torch.Tensor,
-    text_boxes: torch.Tensor,
-    text_mask: torch.Tensor,
-    text_tokens: torch.Tensor,
-    text_lengths: torch.Tensor,
-    target_representation: str,
-    crop_height: int,
-    crop_width: int,
-) -> tuple[torch.Tensor, dict[str, float]]:
-    zero = predicted_images.new_zeros(())
-    metrics = {
-        "text_region_ctc_loss": 0.0,
-        "text_region_ctc_active": 0.0,
-        "text_region_ctc_crops": 0.0,
-    }
-    if recognizer is None:
-        return zero, metrics
-    valid = text_mask.to(device=predicted_images.device, dtype=torch.bool) & (
-        text_lengths.to(device=predicted_images.device) > 0
+    config: TrainingConfig,
+    runner: VideoDiffusionInfer,
+    positive_embeddings: tuple[torch.Tensor, torch.Tensor],
+    val_loader: DataLoader,
+    device: torch.device,
+) -> dict[int, torch.Tensor]:
+    dataset = val_loader.dataset
+    indices = collect_base_preview_indices(config, len(dataset))
+    if not indices:
+        return {}
+    text_pos_embeds, text_pos_shapes = positive_embeddings
+    cache: dict[int, torch.Tensor] = {}
+    was_training = runner.dit.training
+    runner.dit.eval()
+    print(
+        "[seedvr-hdr] caching base validation predictions "
+        f"count={len(indices)}"
     )
-    if not bool(valid.any()):
-        return zero, metrics
-    preview_images = _tone_map_for_text_region_ctc(predicted_images, target_representation)
-    crops = extract_text_region_crops(
-        preview_images,
-        text_boxes.to(device=predicted_images.device),
-        valid,
-        crop_height=crop_height,
-        crop_width=crop_width,
-    )
-    if crops.numel() == 0:
-        return zero, metrics
-    logits = recognizer(crops)
-    log_probs = logits.log_softmax(dim=-1)
-    lengths = text_lengths.to(device=predicted_images.device)[valid].long()
-    token_rows = text_tokens.to(device=predicted_images.device)[valid].long()
-    flat_targets = torch.cat(
-        [row[: int(length.item())] for row, length in zip(token_rows, lengths)],
-        dim=0,
-    )
-    input_lengths = torch.full(
-        (crops.shape[0],),
-        logits.shape[0],
-        device=predicted_images.device,
-        dtype=torch.long,
-    )
-    loss = torch.nn.functional.ctc_loss(
-        log_probs,
-        flat_targets,
-        input_lengths,
-        lengths,
-        blank=0,
-        zero_infinity=True,
-    )
-    metrics.update(
-        {
-            "text_region_ctc_loss": float(loss.detach().item()),
-            "text_region_ctc_active": 1.0,
-            "text_region_ctc_crops": float(crops.shape[0]),
-        }
-    )
-    return loss, metrics
-
+    with torch.no_grad():
+        for sample_index in indices:
+            sample = dataset[sample_index]
+            batch = single_sample_to_batch(sample)
+            _denoise, _hdr_metrics, input_images, target_images, predicted_images = evaluate_validation_batch(
+                config=config,
+                runner=runner,
+                text_pos_embeds=text_pos_embeds,
+                text_pos_shapes=text_pos_shapes,
+                batch=batch,
+                device=device,
+                noise_seed=validation_noise_seed(config, sample_index),
+            )
+            cache[sample_index] = predicted_images[0].detach().cpu().to(torch.float16)
+            del input_images, target_images, predicted_images
+            cleanup_cuda_memory(device)
+    if was_training:
+        runner.dit.train()
+    return cache
 
 
 def _sampler_prediction_to_target_layout(
@@ -1123,10 +1022,6 @@ def build_dataloaders(config: TrainingConfig) -> tuple[DataLoader, DataLoader]:
         jpeg_roundtrip_prob=config.jpeg_roundtrip_prob,
         jpeg_roundtrip_min_quality=config.jpeg_roundtrip_min_quality,
         jpeg_roundtrip_max_quality=config.jpeg_roundtrip_max_quality,
-        text_region_max_regions=config.text_region_max_regions,
-        text_region_max_chars=config.text_region_max_chars,
-        text_region_min_chars=config.text_region_min_chars,
-        text_region_alphabet=config.text_region_alphabet,
     )
     val_dataset = dataset_cls(
         dataset_root=config.dataset_root,
@@ -1144,10 +1039,6 @@ def build_dataloaders(config: TrainingConfig) -> tuple[DataLoader, DataLoader]:
         phase_jitter=False,
         size_jitter_steps=0,
         jpeg_roundtrip_prob=0.0,
-        text_region_max_regions=config.text_region_max_regions,
-        text_region_max_chars=config.text_region_max_chars,
-        text_region_min_chars=config.text_region_min_chars,
-        text_region_alphabet=config.text_region_alphabet,
     )
     train_loader = DataLoader(
         train_dataset,
@@ -1271,6 +1162,7 @@ def run_validation(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     step: int,
+    base_prediction_cache: dict[int, torch.Tensor] | None = None,
 ) -> tuple[dict[str, float], list[Path], list[str]]:
     text_pos_embeds, text_pos_shapes = positive_embeddings
     preview_paths: list[Path] = []
@@ -1307,6 +1199,7 @@ def run_validation(
                 text_pos_shapes=text_pos_shapes,
                 batch=batch,
                 device=device,
+                noise_seed=validation_noise_seed(config, idx),
             )
             losses.append(denoise)
             hdr_metric_rows.append(hdr_metrics)
@@ -1317,6 +1210,9 @@ def run_validation(
                     predicted_images[0].cpu(),
                     target_images[0].cpu(),
                     target_representation=config.target_representation,
+                    base_predicted_image=(
+                        base_prediction_cache or {}
+                    ).get(idx),
                 )
                 preview_paths.append(preview_path)
                 scene_value = batch.get("scene_id", "")
@@ -1368,6 +1264,7 @@ def run_validation(
                 text_pos_shapes=text_pos_shapes,
                 batch=batch,
                 device=device,
+                noise_seed=validation_noise_seed(config, sample_index),
             )
             preview_path = save_triptych(
                 preview_dir / f"step_{step:06d}_{len(preview_paths):02d}.png",
@@ -1375,6 +1272,9 @@ def run_validation(
                 predicted_images[0].cpu(),
                 target_images[0].cpu(),
                 target_representation=config.target_representation,
+                base_predicted_image=(
+                    base_prediction_cache or {}
+                ).get(sample_index),
             )
             preview_paths.append(preview_path)
             preview_captions.append(
@@ -1412,7 +1312,7 @@ def run_validation(
                     positive_embeddings=positive_embeddings,
                     batch=batch,
                     device=device,
-                    seed=config.sampler_validation_seed + step + sampler_index,
+                    seed=sampler_validation_noise_seed(config, sample_index),
                 )
                 sampler_metric_rows.append(hdr_metrics)
                 preview_path = save_triptych(
@@ -1421,6 +1321,9 @@ def run_validation(
                     predicted_images[0].cpu(),
                     target_images[0].cpu(),
                     target_representation=config.target_representation,
+                    base_predicted_image=(
+                        base_prediction_cache or {}
+                    ).get(sample_index),
                 )
                 preview_paths.append(preview_path)
                 preview_captions.append(
@@ -1446,11 +1349,11 @@ def run_validation(
         "val_denoise_loss": float(np.mean(losses)) if losses else 0.0,
     }
     if hdr_metric_rows:
-        metric_names = hdr_metric_rows[0].keys()
+        metric_names = sorted(set.intersection(*(set(row) for row in hdr_metric_rows)))
         for name in metric_names:
             metrics[f"val_{name}"] = float(np.mean([row[name] for row in hdr_metric_rows]))
     if sampler_metric_rows:
-        metric_names = sampler_metric_rows[0].keys()
+        metric_names = sorted(set.intersection(*(set(row) for row in sampler_metric_rows)))
         for name in metric_names:
             metrics[f"sampler_val_{name}"] = float(np.mean([row[name] for row in sampler_metric_rows]))
     if config.debug_cuda_memory:
@@ -1514,6 +1417,13 @@ def main() -> None:
     )
     print("[seedvr-hdr] runtime info:")
     print(json.dumps(runtime_info, indent=2))
+    base_validation_prediction_cache = build_base_validation_prediction_cache(
+        config=config,
+        runner=runner,
+        positive_embeddings=positive_embeddings,
+        val_loader=val_loader,
+        device=device,
+    )
 
     optimizer = build_optimizer(config, runner.dit)
     optimizer_lrs = sorted(
@@ -1535,22 +1445,7 @@ def main() -> None:
     )
     runtime_info["resume_from_checkpoint"] = config.resume_from_checkpoint
     runtime_info["start_step"] = start_step
-    text_teacher, text_teacher_debug = maybe_init_text_teacher(config, device)
-    runtime_info["text_recon_enabled"] = bool(text_teacher is not None)
-    runtime_info["text_recon_model_id"] = config.text_recon_model_id
-    text_region_ctc_recognizer = maybe_init_text_region_ctc_recognizer(config, device)
-    runtime_info["text_region_ctc_enabled"] = bool(text_region_ctc_recognizer is not None)
     wandb_run = maybe_init_wandb(config)
-    if wandb_run is not None:
-        wandb_run.summary["text_recon_teacher_requested"] = bool(text_teacher_debug["requested"])
-        wandb_run.summary["text_recon_teacher_init_ok"] = bool(text_teacher_debug["init_ok"])
-        wandb_run.summary["text_recon_teacher_disabled"] = bool(
-            text_teacher is not None and text_teacher.disabled
-        )
-        if text_teacher_debug["init_error"] is not None:
-            wandb_run.summary["text_recon_teacher_init_error"] = str(
-                text_teacher_debug["init_error"]
-            )
 
     text_pos_embeds, text_pos_shapes = positive_embeddings
     train_iter = iter(train_loader)
@@ -1693,91 +1588,6 @@ def main() -> None:
         )
         if edge_consistency_weight > 0.0:
             edge_consistency = edge_consistency_loss(predicted_images, target_images)
-        text_layout = predicted_images.new_zeros(())
-        text_layout_weight = current_loss_weight(
-            config.text_layout_loss_weight,
-            config.text_layout_loss_warmup_steps,
-            step,
-        )
-        if text_layout_weight > 0.0:
-            text_layout = text_layout_edge_loss(
-                predicted_images,
-                target_images,
-                edge_threshold=config.text_layout_edge_threshold,
-            )
-        text_region_detail = predicted_images.new_zeros(())
-        text_region_detail_count = predicted_images.new_zeros(())
-        text_region_detail_weight = current_loss_weight(
-            config.text_region_detail_loss_weight,
-            config.text_region_detail_loss_warmup_steps,
-            step,
-        )
-        if text_region_detail_weight > 0.0 and "text_boxes" in batch:
-            text_region_detail, text_region_detail_count = text_region_detail_loss(
-                predicted_images,
-                target_images,
-                batch["text_boxes"].to(device),
-                batch["text_mask"].to(device),
-                crop_height=config.text_region_crop_height,
-                crop_width=config.text_region_crop_width,
-                blur_kernel=config.detail_loss_blur_kernel,
-            )
-        text_region_ctc = predicted_images.new_zeros(())
-        text_region_ctc_metrics = {
-            "text_region_ctc_loss": 0.0,
-            "text_region_ctc_active": 0.0,
-            "text_region_ctc_crops": 0.0,
-        }
-        text_region_ctc_weight = current_loss_weight(
-            config.text_region_ctc_loss_weight,
-            config.text_region_ctc_loss_warmup_steps,
-            step,
-        )
-        should_run_text_region_ctc = (
-            text_region_ctc_recognizer is not None
-            and text_region_ctc_weight > 0.0
-            and config.text_region_ctc_every > 0
-            and step % config.text_region_ctc_every == 0
-            and "text_boxes" in batch
-        )
-        if should_run_text_region_ctc:
-            text_region_ctc, text_region_ctc_metrics = compute_text_region_ctc_loss(
-                recognizer=text_region_ctc_recognizer,
-                predicted_images=predicted_images,
-                text_boxes=batch["text_boxes"].to(device),
-                text_mask=batch["text_mask"].to(device),
-                text_tokens=batch["text_tokens"].to(device),
-                text_lengths=batch["text_lengths"].to(device),
-                target_representation=config.target_representation,
-                crop_height=config.text_region_crop_height,
-                crop_width=config.text_region_crop_width,
-            )
-        text_recon = predicted_images.new_zeros(())
-        text_metrics = {
-            "text_recon_loss": 0.0,
-            "text_recon_active": 0.0,
-            "text_recon_tokens": 0.0,
-            "text_recon_chars": 0.0,
-            "text_recon_normalizer_tokens": 0.0,
-            "text_recon_skipped_short": 0.0,
-        }
-        text_recon_weight = current_loss_weight(
-            config.text_recon_loss_weight,
-            config.text_loss_warmup_steps,
-            step,
-        )
-        should_run_text_recon = (
-            text_teacher is not None
-            and text_recon_weight > 0.0
-            and config.text_recon_every > 0
-            and step % config.text_recon_every == 0
-        )
-        if should_run_text_recon:
-            text_recon, text_metrics = text_teacher.compute_loss(
-                predicted_images=predicted_images,
-                target_images=target_images,
-                target_representation=config.target_representation,
-            )
         decode_finished_at = perf_counter()
 
         total_loss = (
@@ -1799,10 +1609,6 @@ def main() -> None:
             + color_constancy_weight * color_constancy
             + detail_weight * detail
             + edge_consistency_weight * edge_consistency
-            + text_layout_weight * text_layout
-            + text_region_detail_weight * text_region_detail
-            + text_region_ctc_weight * text_region_ctc
-            + text_recon_weight * text_recon
         )
         total_loss.backward()
         if config.grad_clip_norm > 0:
@@ -1826,13 +1632,6 @@ def main() -> None:
             "detail_weight": float(detail_weight),
             "edge_consistency_loss": float(edge_consistency.item()),
             "edge_consistency_weight": float(edge_consistency_weight),
-            "text_layout_loss": float(text_layout.item()),
-            "text_layout_weight": float(text_layout_weight),
-            "text_region_detail_loss": float(text_region_detail.item()),
-            "text_region_detail_weight": float(text_region_detail_weight),
-            "text_region_detail_crops": float(text_region_detail_count.item()),
-            "text_region_ctc_weight": float(text_region_ctc_weight),
-            "text_recon_loss": float(text_recon.item()),
             "lr": float(optimizer.param_groups[0]["lr"]),
             "latent_recon_weight": float(
                 current_loss_weight(
@@ -1848,10 +1647,7 @@ def main() -> None:
                     step,
                 )
             ),
-            "text_recon_weight": float(text_recon_weight),
         }
-        final_metrics.update(text_metrics)
-        final_metrics.update(text_region_ctc_metrics)
         if config.profile_step_time:
             final_metrics.update(
                 {
@@ -1877,7 +1673,6 @@ def main() -> None:
                         step=step,
                         final_metrics=final_metrics,
                         include_step_timing=config.profile_step_time,
-                        include_text_metrics=should_run_text_recon,
                     )
                 )
 
@@ -1890,6 +1685,7 @@ def main() -> None:
                 optimizer=optimizer,
                 device=device,
                 step=step,
+                base_prediction_cache=base_validation_prediction_cache,
             )
             final_metrics.update(val_metrics)
             print(f"[seedvr-hdr] validation step={step} metrics={val_metrics}")
@@ -1942,11 +1738,6 @@ def main() -> None:
             color_constancy,
             detail,
             edge_consistency,
-            text_layout,
-            text_region_detail,
-            text_region_detail_count,
-            text_region_ctc,
-            text_recon,
             total_loss,
         )
         if config.cuda_cleanup_every > 0 and step % config.cuda_cleanup_every == 0:
@@ -1963,14 +1754,7 @@ def main() -> None:
         config_path=config_copy_path,
         validation_preview_paths=latest_preview_paths,
         metrics=final_metrics,
-        extra={
-            "text_recon_debug": (
-                {
-                    **text_teacher_debug,
-                    "teacher_state": text_teacher.debug_state() if text_teacher is not None else None,
-                }
-            ),
-        },
+        extra={},
     )
     if wandb_run is not None:
         try:

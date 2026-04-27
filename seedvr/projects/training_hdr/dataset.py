@@ -70,10 +70,6 @@ class ManifestSample:
     gamma: float | None = None
     quantization_bits: int | None = None
     jpeg_quality: int | None = None
-    text_regions: list[dict[str, Any]] | None = None
-    text_regions_path: str | None = None
-    text_regions_url: str | None = None
-
     @classmethod
     def from_row(cls, row: dict) -> "ManifestSample":
         allowed = {field.name for field in fields(cls)}
@@ -1848,135 +1844,6 @@ _FalBaseImageDataset.__getitem__ = _fal_image_dataset_getitem
 _FalBaseVideoDataset.__getitem__ = _fal_video_dataset_getitem
 
 
-
-def _fal_text_region_box(region: dict, width: int, height: int) -> list[float] | None:
-    raw_box = (
-        region.get("bbox")
-        or region.get("box")
-        or region.get("xyxy")
-        or region.get("poly")
-        or region.get("polygon")
-    )
-    if raw_box is None:
-        return None
-    if isinstance(raw_box, (list, tuple)) and len(raw_box) == 4 and all(
-        isinstance(value, (int, float)) for value in raw_box
-    ):
-        x0, y0, x1, y1 = [float(value) for value in raw_box]
-    elif isinstance(raw_box, (list, tuple)) and len(raw_box) >= 4:
-        points = []
-        for point in raw_box:
-            if isinstance(point, (list, tuple)) and len(point) >= 2:
-                points.append((float(point[0]), float(point[1])))
-        if not points:
-            return None
-        xs = [point[0] for point in points]
-        ys = [point[1] for point in points]
-        x0, y0, x1, y1 = min(xs), min(ys), max(xs), max(ys)
-    else:
-        return None
-
-    if max(abs(x0), abs(y0), abs(x1), abs(y1)) > 1.5:
-        width = max(1, int(width))
-        height = max(1, int(height))
-        x0, x1 = x0 / width, x1 / width
-        y0, y1 = y0 / height, y1 / height
-    x0, x1 = sorted((max(0.0, min(1.0, x0)), max(0.0, min(1.0, x1))))
-    y0, y1 = sorted((max(0.0, min(1.0, y0)), max(0.0, min(1.0, y1))))
-    if (x1 - x0) <= 1.0e-4 or (y1 - y0) <= 1.0e-4:
-        return None
-    return [x0, y0, x1, y1]
-
-
-def _fal_text_region_text(region: dict) -> str:
-    value = region.get("text") or region.get("transcript") or region.get("label") or ""
-    return str(value).strip()
-
-
-def _fal_load_text_regions(dataset, sample: ManifestSample) -> list[dict]:
-    if sample.text_regions:
-        return list(sample.text_regions)
-    source = sample.text_regions_path or sample.text_regions_url
-    if not source:
-        return []
-    try:
-        if sample.text_regions_url:
-            path = dataset._resolve_pair(
-                sample,
-                (None, sample.text_regions_url),
-                kind="text_regions",
-                cache_key=dataset._cache_identity(sample, purpose="text_regions", extra=sample.text_regions_url),
-                default_suffix=".json",
-            )
-        else:
-            path = Path(sample.text_regions_path)
-            if not path.is_absolute():
-                path = dataset.dataset_root / path
-        with open(path) as file:
-            payload = json.load(file)
-    except Exception:
-        return []
-    if isinstance(payload, dict):
-        payload = payload.get("text_regions") or payload.get("regions") or payload.get("boxes") or []
-    return payload if isinstance(payload, list) else []
-
-
-def _fal_tokenize_text_region(text: str, char_to_idx: dict[str, int], max_chars: int) -> list[int]:
-    tokens = [char_to_idx[ch] for ch in text[:max_chars] if ch in char_to_idx]
-    return tokens[:max_chars]
-
-
-def _fal_attach_text_region_tensors(dataset, item: dict, sample: ManifestSample) -> dict:
-    target = item["target"]
-    frame_count = int(target.shape[0]) if isinstance(target, torch.Tensor) and target.ndim >= 4 else 1
-    boxes = torch.zeros(frame_count, dataset.text_region_max_regions, 4, dtype=torch.float32)
-    mask = torch.zeros(frame_count, dataset.text_region_max_regions, dtype=torch.float32)
-    tokens = torch.zeros(
-        frame_count,
-        dataset.text_region_max_regions,
-        dataset.text_region_max_chars,
-        dtype=torch.long,
-    )
-    lengths = torch.zeros(frame_count, dataset.text_region_max_regions, dtype=torch.long)
-    if dataset.text_region_max_regions <= 0:
-        item["text_boxes"] = boxes
-        item["text_mask"] = mask
-        item["text_tokens"] = tokens
-        item["text_lengths"] = lengths
-        return item
-
-    per_frame_counts = [0 for _ in range(frame_count)]
-    for region in _fal_load_text_regions(dataset, sample):
-        if not isinstance(region, dict):
-            continue
-        frame_index = int(region.get("frame_index", region.get("frame", 0)) or 0)
-        frame_index = max(0, min(frame_count - 1, frame_index))
-        slot = per_frame_counts[frame_index]
-        if slot >= dataset.text_region_max_regions:
-            continue
-        text = _fal_text_region_text(region)
-        encoded = _fal_tokenize_text_region(
-            text,
-            dataset.text_region_char_to_idx,
-            dataset.text_region_max_chars,
-        )
-        if len(encoded) < dataset.text_region_min_chars:
-            continue
-        box = _fal_text_region_box(region, width=sample.width, height=sample.height)
-        if box is None:
-            continue
-        boxes[frame_index, slot] = torch.tensor(box, dtype=torch.float32)
-        mask[frame_index, slot] = 1.0
-        tokens[frame_index, slot, : len(encoded)] = torch.tensor(encoded, dtype=torch.long)
-        lengths[frame_index, slot] = len(encoded)
-        per_frame_counts[frame_index] += 1
-    item["text_boxes"] = boxes
-    item["text_mask"] = mask
-    item["text_tokens"] = tokens
-    item["text_lengths"] = lengths
-    return item
-
-
 class SeedVRHDRImageDataset(_FalBaseImageDataset):
     def __init__(
         self,
@@ -1987,10 +1854,6 @@ class SeedVRHDRImageDataset(_FalBaseImageDataset):
         jpeg_roundtrip_prob: float = 0.0,
         jpeg_roundtrip_min_quality: int = 75,
         jpeg_roundtrip_max_quality: int = 95,
-        text_region_max_regions: int = 4,
-        text_region_max_chars: int = 32,
-        text_region_min_chars: int = 3,
-        text_region_alphabet: str = "",
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -2000,11 +1863,6 @@ class SeedVRHDRImageDataset(_FalBaseImageDataset):
         self.jpeg_roundtrip_prob = jpeg_roundtrip_prob
         self.jpeg_roundtrip_min_quality = jpeg_roundtrip_min_quality
         self.jpeg_roundtrip_max_quality = jpeg_roundtrip_max_quality
-        self.text_region_max_regions = text_region_max_regions
-        self.text_region_max_chars = text_region_max_chars
-        self.text_region_min_chars = text_region_min_chars
-        self.text_region_alphabet = text_region_alphabet
-        self.text_region_char_to_idx = {ch: idx + 1 for idx, ch in enumerate(text_region_alphabet)}
 
     def _resolve_direct_target_path(self, sample: ManifestSample) -> Path | None:
         if self.target_representation in {"pq_1000", "logc3"}:
@@ -2029,10 +1887,9 @@ class SeedVRHDRImageDataset(_FalBaseImageDataset):
         return super()._resolve_direct_target_path(sample)
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor | str]:
-        manifest_sample = self.samples[index]
         sample = super().__getitem__(index)
         if not self.random_crop:
-            return _fal_attach_text_region_tensors(self, sample, manifest_sample)
+            return sample
         rng = random.Random((self.seed * 1_000_000) + index)
         input_tensor, target_tensor = _fal_apply_spatial_jitter_pair(
             sample["input_sdr"],
@@ -2051,7 +1908,7 @@ class SeedVRHDRImageDataset(_FalBaseImageDataset):
         )
         sample["input_sdr"] = input_tensor
         sample["target"] = target_tensor
-        return _fal_attach_text_region_tensors(self, sample, manifest_sample)
+        return sample
 
 
 class SeedVRHDRVideoDataset(_FalBaseVideoDataset):
@@ -2064,10 +1921,6 @@ class SeedVRHDRVideoDataset(_FalBaseVideoDataset):
         jpeg_roundtrip_prob: float = 0.0,
         jpeg_roundtrip_min_quality: int = 75,
         jpeg_roundtrip_max_quality: int = 95,
-        text_region_max_regions: int = 4,
-        text_region_max_chars: int = 32,
-        text_region_min_chars: int = 3,
-        text_region_alphabet: str = "",
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -2077,11 +1930,6 @@ class SeedVRHDRVideoDataset(_FalBaseVideoDataset):
         self.jpeg_roundtrip_prob = jpeg_roundtrip_prob
         self.jpeg_roundtrip_min_quality = jpeg_roundtrip_min_quality
         self.jpeg_roundtrip_max_quality = jpeg_roundtrip_max_quality
-        self.text_region_max_regions = text_region_max_regions
-        self.text_region_max_chars = text_region_max_chars
-        self.text_region_min_chars = text_region_min_chars
-        self.text_region_alphabet = text_region_alphabet
-        self.text_region_char_to_idx = {ch: idx + 1 for idx, ch in enumerate(text_region_alphabet)}
 
     def _direct_target_pairs(self, sample: ManifestSample) -> list[tuple[str | None, str | None]]:
         if self.target_representation in {"pq_1000", "logc3"}:
@@ -2095,10 +1943,9 @@ class SeedVRHDRVideoDataset(_FalBaseVideoDataset):
         return super()._direct_target_pairs(sample)
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor | str]:
-        manifest_sample = self.samples[index]
         sample = super().__getitem__(index)
         if not self.random_crop:
-            return _fal_attach_text_region_tensors(self, sample, manifest_sample)
+            return sample
         rng = random.Random((self.seed * 1_000_000) + index)
         input_tensor, target_tensor = _fal_apply_spatial_jitter_pair(
             sample["input_sdr"],
@@ -2117,4 +1964,4 @@ class SeedVRHDRVideoDataset(_FalBaseVideoDataset):
         )
         sample["input_sdr"] = input_tensor
         sample["target"] = target_tensor
-        return _fal_attach_text_region_tensors(self, sample, manifest_sample)
+        return sample
