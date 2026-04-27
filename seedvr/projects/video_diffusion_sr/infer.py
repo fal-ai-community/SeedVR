@@ -303,7 +303,7 @@ class VideoDiffusionInfer:
             x=latents,
             f=lambda args: classifier_free_guidance_dispatcher(
                 pos=lambda: self.dit(
-                    vid=torch.cat([args.x_t, latents_cond], dim=-1),
+                    vid=torch.cat([args.x_t.to(latents_cond.dtype), latents_cond], dim=-1),
                     txt=text_pos_embeds,
                     vid_shape=latents_shapes,
                     txt_shape=text_pos_shapes,
