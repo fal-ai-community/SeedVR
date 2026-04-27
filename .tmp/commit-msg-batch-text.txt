@@ -1,0 +1,6 @@
+Fix batched text conditioning for HDR training
+
+Repeat the shared positive text conditioning to match the latent batch size
+before DiT forward passes. Batch-size >1 training previously flattened
+multiple video samples while keeping a single text-shape row, which caused
+repeat_interleave shape mismatches in the multimodal attention blocks.

@@ -125,6 +125,26 @@ def expand_timesteps_to_latents(
     return torch.repeat_interleave(timesteps, lengths, dim=0)
 
 
+def ensure_text_condition_batch(
+    txt: torch.Tensor,
+    txt_shape: torch.Tensor,
+    batch_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Repeat shared text conditioning to match a batched latent forward."""
+    text_batch_size = int(txt_shape.shape[0])
+    if text_batch_size == batch_size:
+        return txt, txt_shape
+    if text_batch_size != 1:
+        raise ValueError(
+            "Text conditioning batch size must be 1 or match latent batch size: "
+            f"text_batch_size={text_batch_size}, latent_batch_size={batch_size}"
+        )
+    if batch_size < 1:
+        raise ValueError(f"Latent batch size must be positive, got {batch_size}")
+    text_sample = na.unflatten(txt, txt_shape)[0]
+    return na.flatten([text_sample] * batch_size)
+
+
 def _enable_safe_attention_fallback() -> None:
     if hasattr(torch.backends.cuda, "enable_flash_sdp"):
         torch.backends.cuda.enable_flash_sdp(False)
@@ -147,6 +167,11 @@ def run_dit_forward(
     step: int | None = None,
 ):
     try:
+        txt, txt_shape = ensure_text_condition_batch(
+            txt=txt,
+            txt_shape=txt_shape,
+            batch_size=int(vid_shape.shape[0]),
+        )
         return runner.dit(
             vid=vid,
             txt=txt,
