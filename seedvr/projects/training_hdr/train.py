@@ -1448,10 +1448,10 @@ def maybe_resume_training(
     checkpoint = load_checkpoint(
         checkpoint_path=config.resume_from_checkpoint,
         model=model,
-        optimizer=optimizer,
-        scheduler=scheduler,
+        optimizer=optimizer if config.resume_optimizer_state else None,
+        scheduler=scheduler if config.resume_scheduler_state else None,
         device=device,
-        restore_rng=True,
+        restore_rng=config.resume_rng_state,
     )
     resumed_step = int(checkpoint.get("step", 0))
     if resumed_step >= config.steps:
@@ -1462,7 +1462,10 @@ def maybe_resume_training(
     resumed_metrics = checkpoint.get("metrics") or {}
     print(
         f"[seedvr-hdr] resumed from checkpoint={config.resume_from_checkpoint} "
-        f"step={resumed_step}"
+        f"step={resumed_step} "
+        f"optimizer_state={config.resume_optimizer_state} "
+        f"scheduler_state={config.resume_scheduler_state} "
+        f"rng_state={config.resume_rng_state}"
     )
     return resumed_step + 1, resumed_metrics
 

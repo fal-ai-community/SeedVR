@@ -68,6 +68,9 @@ class TrainingConfig:
     frame_stride: int = 1
     target_representation: str = "mu_law_mu5000"
     resume_from_checkpoint: str | None = None
+    resume_optimizer_state: bool = True
+    resume_scheduler_state: bool = True
+    resume_rng_state: bool = True
     checkpoint_repo_id: str | None = None
     dit_filename: str | None = None
     vae_filename: str | None = None
