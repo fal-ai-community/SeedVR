@@ -26,10 +26,32 @@ def _input_tensor_to_uint8_image(tensor: torch.Tensor) -> np.ndarray:
 
 
 def _select_preview_frame(tensor: torch.Tensor) -> torch.Tensor:
+    frames = _as_chw_frames(tensor)
+    return frames[len(frames) // 2]
+
+
+def _as_chw_frames(tensor: torch.Tensor) -> list[torch.Tensor]:
+    """Normalize validation tensors to a list of C,H,W RGB frames."""
+    tensor = tensor.detach().float()
+    if tensor.ndim == 5:
+        if tensor.shape[2] == 3:
+            batch, frames, channels, height, width = tensor.shape
+            return list(tensor.reshape(batch * frames, channels, height, width))
+        if tensor.shape[1] == 3:
+            batch, channels, frames, height, width = tensor.shape
+            tensor = tensor.permute(0, 2, 1, 3, 4).contiguous()
+            return list(tensor.reshape(batch * frames, channels, height, width))
     if tensor.ndim == 4:
-        frame_index = tensor.shape[0] // 2
-        return tensor[frame_index]
-    return tensor
+        if tensor.shape[1] == 3:
+            return list(tensor)
+        if tensor.shape[0] == 3:
+            return list(tensor.permute(1, 0, 2, 3).contiguous())
+    if tensor.ndim == 3 and tensor.shape[0] == 3:
+        return [tensor]
+    raise ValueError(
+        "Expected RGB tensor in CHW, TCHW, BTCHW, or BCTHW layout, "
+        f"got {tuple(tensor.shape)}"
+    )
 
 
 def linear_hdr_from_target_tensor(
@@ -238,10 +260,23 @@ def compute_hdr_metrics(
     target_image: torch.Tensor,
     target_representation: str,
 ) -> dict[str, float]:
-    if predicted_image.ndim == 4 and target_image.ndim == 4:
+    predicted_frames = _as_chw_frames(predicted_image)
+    target_frames = _as_chw_frames(target_image)
+    if len(predicted_frames) != len(target_frames):
+        if len(predicted_frames) == 1:
+            predicted_frames = predicted_frames * len(target_frames)
+        elif len(target_frames) == 1:
+            target_frames = target_frames * len(predicted_frames)
+        else:
+            raise ValueError(
+                "Validation prediction/target frame counts do not match: "
+                f"{len(predicted_frames)} vs {len(target_frames)}"
+            )
+
+    if len(predicted_frames) > 1:
         frame_metrics = [
-            compute_hdr_metrics(predicted_image[index], target_image[index], target_representation)
-            for index in range(predicted_image.shape[0])
+            _compute_hdr_metrics_chw(predicted_frame, target_frame, target_representation)
+            for predicted_frame, target_frame in zip(predicted_frames, target_frames)
         ]
         metric_names = sorted(set.intersection(*(set(row) for row in frame_metrics)))
         return {
@@ -249,6 +284,14 @@ def compute_hdr_metrics(
             for name in metric_names
         }
 
+    return _compute_hdr_metrics_chw(predicted_frames[0], target_frames[0], target_representation)
+
+
+def _compute_hdr_metrics_chw(
+    predicted_image: torch.Tensor,
+    target_image: torch.Tensor,
+    target_representation: str,
+) -> dict[str, float]:
     predicted_linear = linear_hdr_from_target_tensor(predicted_image, target_representation)
     target_linear = linear_hdr_from_target_tensor(target_image, target_representation)
 
