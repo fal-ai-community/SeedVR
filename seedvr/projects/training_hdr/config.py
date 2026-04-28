@@ -90,6 +90,7 @@ class TrainingConfig:
     scheduler_type: str = "cosine"
     warmup_steps: int = 100
     min_lr_ratio: float = 0.1
+    scheduler_total_steps: int | None = None
     layerwise_lr_decay: float = 1.0
     layerwise_lr_min_scale: float = 0.05
     num_workers: int = 4

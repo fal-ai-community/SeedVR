@@ -965,7 +965,8 @@ def build_scheduler(
         def lr_lambda(step: int) -> float:
             if config.warmup_steps > 0 and step < config.warmup_steps:
                 return max(1.0e-8, float(step + 1) / float(config.warmup_steps))
-            progress_denominator = max(1, config.steps - config.warmup_steps)
+            total_steps = config.scheduler_total_steps or config.steps
+            progress_denominator = max(1, total_steps - config.warmup_steps)
             progress = min(
                 1.0,
                 max(0.0, float(step - config.warmup_steps) / float(progress_denominator)),
