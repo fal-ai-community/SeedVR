@@ -4,6 +4,7 @@ import argparse
 import gc
 import json
 import random
+import re
 from pathlib import Path
 from time import perf_counter
 from typing import Any
@@ -26,7 +27,7 @@ from seedvr.projects.training_hdr.checkpointing import (
     save_checkpoint,
     write_result_manifest,
 )
-from seedvr.projects.training_hdr.config import TrainingConfig
+from seedvr.projects.training_hdr.config import ExtraValidationConfig, TrainingConfig
 from seedvr.projects.training_hdr.dataset import (
     SeedVRHDRImageDataset,
     SeedVRHDRVideoDataset,
@@ -363,6 +364,11 @@ def build_wandb_train_metrics(
     return metrics
 
 
+def metric_safe_name(name: str) -> str:
+    safe = re.sub(r"[^0-9A-Za-z_]+", "_", name.strip().lower()).strip("_")
+    return safe or "extra"
+
+
 def get_cuda_memory_stats(device: torch.device) -> dict[str, float]:
     if device.type != "cuda":
         return {}
@@ -479,15 +485,31 @@ def sampler_validation_noise_seed(config: TrainingConfig, sample_index: int) -> 
     return int(config.sampler_validation_seed + 23_017 + (sample_index * 1_009))
 
 
-def collect_base_preview_indices(config: TrainingConfig, dataset_size: int) -> list[int]:
+def collect_base_preview_indices(
+    config: TrainingConfig,
+    dataset_size: int,
+    *,
+    num_validation_samples: int | None = None,
+    sampler_validation_samples: int | None = None,
+) -> list[int]:
     if dataset_size <= 0:
         return []
+    validation_count = (
+        config.num_validation_samples
+        if num_validation_samples is None
+        else num_validation_samples
+    )
+    sampler_count = (
+        config.sampler_validation_samples
+        if sampler_validation_samples is None
+        else sampler_validation_samples
+    )
     indices: set[int] = set()
-    sampler_preview_count = min(config.sampler_validation_samples, dataset_size)
+    sampler_preview_count = min(sampler_count, dataset_size)
     indices.update(
         build_preview_indices(
             dataset_size=dataset_size,
-            num_previews=config.num_validation_samples,
+            num_previews=validation_count,
             step=1,
             validate_every=config.validate_every,
         )
@@ -623,9 +645,16 @@ def build_base_validation_prediction_cache(
     positive_embeddings: tuple[torch.Tensor, torch.Tensor],
     val_loader: DataLoader,
     device: torch.device,
+    num_validation_samples: int | None = None,
+    sampler_validation_samples: int | None = None,
 ) -> dict[int, torch.Tensor]:
     dataset = val_loader.dataset
-    indices = collect_base_preview_indices(config, len(dataset))
+    indices = collect_base_preview_indices(
+        config,
+        len(dataset),
+        num_validation_samples=num_validation_samples,
+        sampler_validation_samples=sampler_validation_samples,
+    )
     if not indices:
         return {}
     text_pos_embeds, text_pos_shapes = positive_embeddings
@@ -1036,6 +1065,65 @@ def lpips_reconstruction_loss(
     return model(pred, target).mean()
 
 
+def build_validation_dataloader(
+    config: TrainingConfig,
+    *,
+    dataset_root: str,
+    manifest_path: str,
+    data_mode: str,
+) -> DataLoader:
+    dataset_cls = SeedVRHDRVideoDataset if data_mode == "video" else SeedVRHDRImageDataset
+    val_dataset = dataset_cls(
+        dataset_root=dataset_root,
+        manifest_path=manifest_path,
+        train_height=config.train_height,
+        train_width=config.train_width,
+        random_crop=False,
+        seed=config.seed,
+        target_representation=config.target_representation,
+        runtime_cache_root=config.runtime_cache_root,
+        download_timeout_seconds=config.remote_download_timeout_seconds,
+        download_retries=config.remote_download_retries,
+        cache_rendered_sdr_inputs=config.cache_rendered_sdr_inputs,
+        cache_compressed_targets=config.cache_compressed_targets,
+        phase_jitter=False,
+        size_jitter_steps=0,
+        jpeg_roundtrip_prob=0.0,
+    )
+    worker_count = min(2, config.num_workers)
+    return DataLoader(
+        val_dataset,
+        batch_size=1,
+        shuffle=False,
+        drop_last=False,
+        num_workers=worker_count,
+        pin_memory=True,
+        persistent_workers=bool(
+            config.dataloader_persistent_workers and worker_count > 0
+        ),
+        prefetch_factor=(
+            config.dataloader_prefetch_factor if worker_count > 0 else None
+        ),
+    )
+
+
+def build_extra_validation_dataloaders(
+    config: TrainingConfig,
+) -> list[tuple[ExtraValidationConfig, DataLoader]]:
+    return [
+        (
+            extra,
+            build_validation_dataloader(
+                config,
+                dataset_root=extra.dataset_root,
+                manifest_path=extra.val_manifest,
+                data_mode=extra.data_mode,
+            ),
+        )
+        for extra in config.extra_validation_datasets
+    ]
+
+
 def build_dataloaders(config: TrainingConfig) -> tuple[DataLoader, DataLoader]:
     dataset_cls = SeedVRHDRVideoDataset if config.data_mode == "video" else SeedVRHDRImageDataset
     train_dataset = dataset_cls(
@@ -1058,23 +1146,6 @@ def build_dataloaders(config: TrainingConfig) -> tuple[DataLoader, DataLoader]:
         jpeg_roundtrip_min_quality=config.jpeg_roundtrip_min_quality,
         jpeg_roundtrip_max_quality=config.jpeg_roundtrip_max_quality,
     )
-    val_dataset = dataset_cls(
-        dataset_root=config.dataset_root,
-        manifest_path=config.val_manifest,
-        train_height=config.train_height,
-        train_width=config.train_width,
-        random_crop=False,
-        seed=config.seed,
-        target_representation=config.target_representation,
-        runtime_cache_root=config.runtime_cache_root,
-        download_timeout_seconds=config.remote_download_timeout_seconds,
-        download_retries=config.remote_download_retries,
-        cache_rendered_sdr_inputs=config.cache_rendered_sdr_inputs,
-        cache_compressed_targets=config.cache_compressed_targets,
-        phase_jitter=False,
-        size_jitter_steps=0,
-        jpeg_roundtrip_prob=0.0,
-    )
     train_loader = DataLoader(
         train_dataset,
         batch_size=config.batch_size,
@@ -1087,17 +1158,11 @@ def build_dataloaders(config: TrainingConfig) -> tuple[DataLoader, DataLoader]:
             config.dataloader_prefetch_factor if config.num_workers > 0 else None
         ),
     )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=1,
-        shuffle=False,
-        drop_last=False,
-        num_workers=min(2, config.num_workers),
-        pin_memory=True,
-        persistent_workers=bool(config.dataloader_persistent_workers and min(2, config.num_workers) > 0),
-        prefetch_factor=(
-            config.dataloader_prefetch_factor if min(2, config.num_workers) > 0 else None
-        ),
+    val_loader = build_validation_dataloader(
+        config,
+        dataset_root=config.dataset_root,
+        manifest_path=config.val_manifest,
+        data_mode=config.data_mode,
     )
     return train_loader, val_loader
 
@@ -1198,6 +1263,11 @@ def run_validation(
     device: torch.device,
     step: int,
     base_prediction_cache: dict[int, torch.Tensor] | None = None,
+    metric_prefix: str = "val",
+    sampler_metric_prefix: str = "sampler_val",
+    preview_subdir: str = "validation",
+    num_validation_samples: int | None = None,
+    sampler_validation_samples: int | None = None,
 ) -> tuple[dict[str, float], list[Path], list[str]]:
     text_pos_embeds, text_pos_shapes = positive_embeddings
     preview_paths: list[Path] = []
@@ -1205,13 +1275,23 @@ def run_validation(
     losses: list[float] = []
     hdr_metric_rows: list[dict[str, float]] = []
     sampler_metric_rows: list[dict[str, float]] = []
-    preview_dir = config.output_path / "validation"
+    validation_count = (
+        config.num_validation_samples
+        if num_validation_samples is None
+        else num_validation_samples
+    )
+    sampler_count = (
+        config.sampler_validation_samples
+        if sampler_validation_samples is None
+        else sampler_validation_samples
+    )
+    preview_dir = config.output_path / preview_subdir
     preview_dir.mkdir(parents=True, exist_ok=True)
-    metric_limit = config.num_validation_samples
+    metric_limit = validation_count
     preview_index_set = set(
         build_preview_indices(
             dataset_size=len(val_loader.dataset),
-            num_previews=config.num_validation_samples,
+            num_previews=validation_count,
             step=step,
             validate_every=config.validate_every,
         )
@@ -1283,7 +1363,7 @@ def run_validation(
             index
             for index in build_preview_indices(
                 dataset_size=len(dataset),
-                num_previews=config.num_validation_samples,
+                num_previews=validation_count,
                 step=step,
                 validate_every=config.validate_every,
             )
@@ -1330,11 +1410,11 @@ def run_validation(
             cleanup_cuda_memory(device)
 
 
-        if config.sampler_validation_samples > 0:
+        if sampler_count > 0:
             dataset = val_loader.dataset
             sampler_indices = build_preview_indices(
                 dataset_size=len(dataset),
-                num_previews=min(config.sampler_validation_samples, len(dataset)),
+                num_previews=min(sampler_count, len(dataset)),
                 step=step,
                 validate_every=config.validate_every,
             )
@@ -1381,16 +1461,16 @@ def run_validation(
     if hasattr(optimizer, "train"):
         optimizer.train()
     metrics = {
-        "val_denoise_loss": float(np.mean(losses)) if losses else 0.0,
+        f"{metric_prefix}_denoise_loss": float(np.mean(losses)) if losses else 0.0,
     }
     if hdr_metric_rows:
         metric_names = sorted(set.intersection(*(set(row) for row in hdr_metric_rows)))
         for name in metric_names:
-            metrics[f"val_{name}"] = float(np.mean([row[name] for row in hdr_metric_rows]))
+            metrics[f"{metric_prefix}_{name}"] = float(np.mean([row[name] for row in hdr_metric_rows]))
     if sampler_metric_rows:
         metric_names = sorted(set.intersection(*(set(row) for row in sampler_metric_rows)))
         for name in metric_names:
-            metrics[f"sampler_val_{name}"] = float(np.mean([row[name] for row in sampler_metric_rows]))
+            metrics[f"{sampler_metric_prefix}_{name}"] = float(np.mean([row[name] for row in sampler_metric_rows]))
     if config.debug_cuda_memory:
         log_cuda_memory("validation_end", device, step)
         if device.type == "cuda":
@@ -1445,6 +1525,7 @@ def main() -> None:
     set_seed(config.seed)
     device = get_device()
     train_loader, val_loader = build_dataloaders(config)
+    extra_validation_loaders = build_extra_validation_dataloaders(config)
     runner, positive_embeddings, _negative_embeddings, runtime_info = build_runner(
         config=config,
         repo_root=repo_root,
@@ -1459,6 +1540,22 @@ def main() -> None:
         val_loader=val_loader,
         device=device,
     )
+    extra_base_prediction_caches: dict[str, dict[int, torch.Tensor]] = {}
+    for extra, extra_loader in extra_validation_loaders:
+        extra_name = metric_safe_name(extra.name)
+        print(
+            "[seedvr-hdr] preparing extra validation dataset "
+            f"name={extra.name} rows={len(extra_loader.dataset)}"
+        )
+        extra_base_prediction_caches[extra_name] = build_base_validation_prediction_cache(
+            config=config,
+            runner=runner,
+            positive_embeddings=positive_embeddings,
+            val_loader=extra_loader,
+            device=device,
+            num_validation_samples=extra.num_validation_samples,
+            sampler_validation_samples=extra.sampler_validation_samples,
+        )
 
     optimizer = build_optimizer(config, runner.dit)
     optimizer_lrs = sorted(
@@ -1656,6 +1753,38 @@ def main() -> None:
                     step=step,
                     preview_captions=latest_preview_captions,
                 )
+            for extra, extra_loader in extra_validation_loaders:
+                extra_name = metric_safe_name(extra.name)
+                extra_metrics, extra_preview_paths, extra_preview_captions = run_validation(
+                    config=config,
+                    runner=runner,
+                    positive_embeddings=positive_embeddings,
+                    val_loader=extra_loader,
+                    optimizer=optimizer,
+                    device=device,
+                    step=step,
+                    base_prediction_cache=extra_base_prediction_caches.get(extra_name),
+                    metric_prefix=f"val_{extra_name}",
+                    sampler_metric_prefix=f"sampler_val_{extra_name}",
+                    preview_subdir=f"validation_{extra_name}",
+                    num_validation_samples=extra.num_validation_samples,
+                    sampler_validation_samples=extra.sampler_validation_samples,
+                )
+                final_metrics.update(extra_metrics)
+                latest_preview_paths.extend(extra_preview_paths)
+                latest_preview_captions.extend(extra_preview_captions)
+                print(
+                    "[seedvr-hdr] extra validation "
+                    f"name={extra.name} step={step} metrics={extra_metrics}"
+                )
+                if wandb_run is not None:
+                    wandb.log({"step": step, **extra_metrics})
+                    log_validation_previews_to_wandb(
+                        wandb_run=wandb_run,
+                        preview_paths=extra_preview_paths,
+                        step=step,
+                        preview_captions=extra_preview_captions,
+                    )
 
         if step % config.save_every == 0 or step == config.steps:
             checkpoint_path = save_checkpoint(

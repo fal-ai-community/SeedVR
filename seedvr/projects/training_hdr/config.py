@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 
@@ -41,6 +41,16 @@ BASE_MODEL_SPECS: dict[str, CheckpointSpec] = {
 }
 
 SUPPORTED_TARGET_REPRESENTATIONS = {"raw_hdr", "mu_law_mu5000", "log_hdr", "pq_1000", "logc3"}
+
+
+@dataclass
+class ExtraValidationConfig:
+    name: str
+    dataset_root: str
+    val_manifest: str
+    data_mode: str = "image"
+    num_validation_samples: int | None = None
+    sampler_validation_samples: int | None = None
 
 
 @dataclass
@@ -143,6 +153,7 @@ class TrainingConfig:
     dataloader_prefetch_factor: int = 2
     dataloader_persistent_workers: bool = True
     profile_step_time: bool = True
+    extra_validation_datasets: list[ExtraValidationConfig] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.target_representation not in SUPPORTED_TARGET_REPRESENTATIONS:
@@ -163,6 +174,10 @@ class TrainingConfig:
     def from_path(cls, path: str | Path) -> "TrainingConfig":
         with open(path) as file:
             data = json.load(file)
+        data["extra_validation_datasets"] = [
+            item if isinstance(item, ExtraValidationConfig) else ExtraValidationConfig(**item)
+            for item in data.get("extra_validation_datasets", [])
+        ]
         return cls(**data)
 
     def to_dict(self) -> dict:
