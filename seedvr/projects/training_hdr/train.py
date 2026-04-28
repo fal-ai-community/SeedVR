@@ -10,6 +10,7 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from huggingface_hub import snapshot_download
 from omegaconf import ListConfig
 from einops import rearrange
@@ -350,6 +351,13 @@ def build_wandb_train_metrics(
         "denoise_loss": float(final_metrics["denoise_loss"]),
         "lr": float(final_metrics["lr"]),
     }
+    for key in (
+        "denoise_loss_weight",
+        "lpips_loss",
+        "lpips_loss_weight",
+    ):
+        if key in final_metrics:
+            metrics[key] = float(final_metrics[key])
     if include_step_timing and "step_seconds" in final_metrics:
         metrics["step_seconds"] = float(final_metrics["step_seconds"])
     return metrics
@@ -979,6 +987,54 @@ def current_loss_weight(target_weight: float, warmup_steps: int, step: int) -> f
     return target_weight * ramp
 
 
+def build_lpips_model(config: TrainingConfig, device: torch.device):
+    if config.lpips_loss_weight <= 0.0:
+        return None
+    try:
+        import lpips  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError(
+            "lpips_loss_weight > 0 but the lpips package is not installed."
+        ) from exc
+
+    model = lpips.LPIPS(net=config.lpips_net).eval().to(device)
+    model.requires_grad_(False)
+    return model
+
+
+def _as_lpips_input(tensor: torch.Tensor, resize: int) -> torch.Tensor:
+    if tensor.ndim == 5:
+        b, t, c, h, w = tensor.shape
+        tensor = tensor.reshape(b * t, c, h, w)
+    elif tensor.ndim != 4:
+        raise ValueError(
+            f"Expected BCHW or BTCHW tensor for LPIPS, got {tuple(tensor.shape)}"
+        )
+    tensor = tensor[:, :3].float().clamp(0.0, 1.0)
+    if resize > 0 and min(tensor.shape[-2:]) > resize:
+        tensor = F.interpolate(
+            tensor,
+            size=(resize, resize),
+            mode="bilinear",
+            align_corners=False,
+        )
+    return tensor.mul(2.0).sub(1.0)
+
+
+def lpips_reconstruction_loss(
+    model,
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    resize: int,
+) -> torch.Tensor:
+    pred = _as_lpips_input(prediction, resize=resize)
+    target = _as_lpips_input(
+        target.to(device=prediction.device, dtype=prediction.dtype),
+        resize=resize,
+    )
+    return model(pred, target).mean()
+
+
 def build_dataloaders(config: TrainingConfig) -> tuple[DataLoader, DataLoader]:
     dataset_cls = SeedVRHDRVideoDataset if config.data_mode == "video" else SeedVRHDRImageDataset
     train_dataset = dataset_cls(
@@ -1424,6 +1480,7 @@ def main() -> None:
     runtime_info["resume_from_checkpoint"] = config.resume_from_checkpoint
     runtime_info["start_step"] = start_step
     wandb_run = maybe_init_wandb(config)
+    lpips_model = build_lpips_model(config, device)
 
     text_pos_embeds, text_pos_shapes = positive_embeddings
     train_iter = iter(train_loader)
@@ -1504,8 +1561,43 @@ def main() -> None:
         ).vid_sample
 
         denoise = denoise_loss(prediction, target)
+        denoise_weight = current_loss_weight(
+            config.denoise_loss_weight,
+            warmup_steps=0,
+            step=step,
+        )
+        total_loss = denoise * denoise_weight
+        aux_metrics: dict[str, float] = {
+            "denoise_loss": float(denoise.item()),
+            "denoise_loss_weight": float(denoise_weight),
+        }
 
-        total_loss = denoise
+        lpips_weight = current_loss_weight(
+            config.lpips_loss_weight,
+            config.lpips_loss_warmup_steps,
+            step,
+        )
+        pred_x0 = None
+        predicted_images = None
+        lpips_value = None
+        if lpips_model is not None and lpips_weight > 0.0:
+            pred_x0, _ = runner.schedule.convert_from_pred(
+                prediction,
+                PredictionType.v_lerp,
+                x_t,
+                diffusion_timesteps,
+            )
+            predicted_images = decode_latents_to_images(runner, pred_x0, latent_shapes)
+            lpips_value = lpips_reconstruction_loss(
+                lpips_model,
+                predicted_images,
+                target_images,
+                resize=config.lpips_resize,
+            )
+            total_loss = total_loss + lpips_value * lpips_weight
+            aux_metrics["lpips_loss"] = float(lpips_value.item())
+            aux_metrics["lpips_loss_weight"] = float(lpips_weight)
+
         total_loss.backward()
         if config.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(runner.dit.parameters(), config.grad_clip_norm)
@@ -1515,8 +1607,8 @@ def main() -> None:
 
         final_metrics = {
             "loss": float(total_loss.item()),
-            "denoise_loss": float(denoise.item()),
             "lr": float(optimizer.param_groups[0]["lr"]),
+            **aux_metrics,
         }
         if config.profile_step_time:
             final_metrics.update(
@@ -1595,6 +1687,9 @@ def main() -> None:
             target,
             prediction,
             denoise,
+            pred_x0,
+            predicted_images,
+            lpips_value,
             total_loss,
         )
         if config.cuda_cleanup_every > 0 and step % config.cuda_cleanup_every == 0:

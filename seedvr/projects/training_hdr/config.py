@@ -101,8 +101,12 @@ class TrainingConfig:
     denoise_loss_weight: float = 1.0
     latent_recon_loss_weight: float = 0.1
     image_recon_loss_weight: float = 0.0
+    lpips_loss_weight: float = 0.0
     latent_loss_warmup_steps: int = 0
     image_loss_warmup_steps: int = 0
+    lpips_loss_warmup_steps: int = 0
+    lpips_net: str = "alex"
+    lpips_resize: int = 256
     sampler_validation_samples: int = 0
     sampler_validation_guidance_scale: float = 1.0
     sampler_validation_seed: int = 2079280474
