@@ -137,6 +137,81 @@ def detail_reconstruction_loss(
     return 0.5 * rgb_loss + 0.5 * luma_loss
 
 
+def dwt_high_frequency_loss(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    levels: int = 2,
+) -> torch.Tensor:
+    """Match Haar wavelet high-frequency bands across one or more scales."""
+    prediction = _btchw_as_bchw(prediction)
+    target = _btchw_as_bchw(target.to(device=prediction.device, dtype=prediction.dtype))
+    pred = prediction[:, :3].float()
+    tgt = target[:, :3].float()
+    levels = max(1, int(levels))
+    total = pred.new_tensor(0.0)
+    count = 0
+    for _level in range(levels):
+        height = min(pred.shape[-2], tgt.shape[-2])
+        width = min(pred.shape[-1], tgt.shape[-1])
+        height = height - (height % 2)
+        width = width - (width % 2)
+        if height < 2 or width < 2:
+            break
+        pred = pred[..., :height, :width]
+        tgt = tgt[..., :height, :width]
+        filters = pred.new_tensor(
+            [
+                [[0.5, 0.5], [0.5, 0.5]],
+                [[-0.5, -0.5], [0.5, 0.5]],
+                [[-0.5, 0.5], [-0.5, 0.5]],
+                [[0.5, -0.5], [-0.5, 0.5]],
+            ]
+        ).view(4, 1, 2, 2)
+        channels = pred.shape[1]
+        filters = filters.repeat(channels, 1, 1, 1)
+        pred_bands = F.conv2d(pred, filters, stride=2, groups=channels)
+        tgt_bands = F.conv2d(tgt, filters, stride=2, groups=channels)
+        pred_bands = pred_bands.view(pred.shape[0], channels, 4, pred_bands.shape[-2], pred_bands.shape[-1])
+        tgt_bands = tgt_bands.view(tgt.shape[0], channels, 4, tgt_bands.shape[-2], tgt_bands.shape[-1])
+        total = total + charbonnier_loss(pred_bands[:, :, 1:], tgt_bands[:, :, 1:])
+        count += 1
+        pred = pred_bands[:, :, 0]
+        tgt = tgt_bands[:, :, 0]
+    return total / max(1, count)
+
+
+def fft_high_frequency_loss(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    min_freq: float = 0.25,
+) -> torch.Tensor:
+    """Compare high-frequency log-magnitude spectra while ignoring low-frequency color/exposure."""
+    prediction = _btchw_as_bchw(prediction)
+    target = _btchw_as_bchw(target.to(device=prediction.device, dtype=prediction.dtype))
+    pred_luma = _luminance_bchw(prediction[:, :3].float())
+    target_luma = _luminance_bchw(target[:, :3].float())
+    height, width = pred_luma.shape[-2:]
+    fy = torch.fft.fftfreq(height, device=pred_luma.device).view(height, 1)
+    fx = torch.fft.rfftfreq(width, device=pred_luma.device).view(1, width // 2 + 1)
+    radius = torch.sqrt(fx.pow(2) + fy.pow(2))
+    mask = (radius >= float(min_freq)).to(dtype=pred_luma.dtype).view(1, 1, height, width // 2 + 1)
+    if not bool(mask.any().item()):
+        return pred_luma.new_tensor(0.0)
+    pred_fft = torch.fft.rfft2(pred_luma, norm="ortho")
+    target_fft = torch.fft.rfft2(target_luma, norm="ortho")
+    pred_mag = torch.log1p(pred_fft.abs())
+    target_mag = torch.log1p(target_fft.abs())
+    return _masked_mean((pred_mag - target_mag).abs(), mask)
+
+
+def total_variation_map(tensor: torch.Tensor, eps: float = 1.0e-6) -> torch.Tensor:
+    """Return a 3-channel local gradient magnitude map for perceptual TV losses."""
+    tensor = _btchw_as_bchw(tensor)
+    rgb = tensor[:, :3].float()
+    dx, dy = _gradient_xy(rgb)
+    return torch.sqrt(dx.square() + dy.square() + eps)
+
+
 def edge_consistency_loss(prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     """Preserve source/target structure and reduce painterly texture hallucination."""
     prediction = _btchw_as_bchw(prediction)

@@ -32,7 +32,12 @@ from seedvr.projects.training_hdr.dataset import (
     SeedVRHDRImageDataset,
     SeedVRHDRVideoDataset,
 )
-from seedvr.projects.training_hdr.losses import denoise_loss
+from seedvr.projects.training_hdr.losses import (
+    denoise_loss,
+    dwt_high_frequency_loss,
+    fft_high_frequency_loss,
+    total_variation_map,
+)
 from seedvr.projects.training_hdr.validation import compute_hdr_metrics, save_triptych
 from seedvr.projects.video_diffusion_sr.infer import VideoDiffusionInfer
 
@@ -356,6 +361,12 @@ def build_wandb_train_metrics(
         "denoise_loss_weight",
         "lpips_loss",
         "lpips_loss_weight",
+        "dwt_hf_loss",
+        "dwt_hf_loss_weight",
+        "fft_hf_loss",
+        "fft_hf_loss_weight",
+        "tv_lpips_loss",
+        "tv_lpips_loss_weight",
     ):
         if key in final_metrics:
             metrics[key] = float(final_metrics[key])
@@ -1036,7 +1047,7 @@ def current_loss_weight(target_weight: float, warmup_steps: int, step: int) -> f
 
 
 def build_lpips_model(config: TrainingConfig, device: torch.device):
-    if config.lpips_loss_weight <= 0.0:
+    if config.lpips_loss_weight <= 0.0 and config.tv_lpips_loss_weight <= 0.0:
         return None
     try:
         import lpips  # type: ignore
@@ -1081,6 +1092,24 @@ def lpips_reconstruction_loss(
         resize=resize,
     )
     return model(pred, target).mean()
+
+
+def tv_lpips_reconstruction_loss(
+    model,
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    resize: int,
+    gamma: float,
+) -> torch.Tensor:
+    pred_tv = total_variation_map(prediction)
+    target_tv = total_variation_map(target.to(device=prediction.device, dtype=prediction.dtype))
+    gamma = max(0.1, float(gamma))
+    pred_tv = pred_tv.clamp_min(0.0).pow(gamma)
+    target_tv = target_tv.clamp_min(0.0).pow(gamma)
+    return model(
+        _as_lpips_input(pred_tv, resize=resize),
+        _as_lpips_input(target_tv, resize=resize),
+    ).mean()
 
 
 def build_validation_dataloader(
@@ -1689,10 +1718,30 @@ def main() -> None:
             config.lpips_loss_warmup_steps,
             step,
         )
+        dwt_hf_weight = current_loss_weight(
+            config.dwt_hf_loss_weight,
+            config.dwt_hf_loss_warmup_steps,
+            step,
+        )
+        fft_hf_weight = current_loss_weight(
+            config.fft_hf_loss_weight,
+            config.fft_hf_loss_warmup_steps,
+            step,
+        )
+        tv_lpips_weight = current_loss_weight(
+            config.tv_lpips_loss_weight,
+            config.tv_lpips_loss_warmup_steps,
+            step,
+        )
         pred_x0 = None
         predicted_images = None
         lpips_value = None
-        if lpips_model is not None and lpips_weight > 0.0:
+        needs_decoded_prediction = (
+            (lpips_model is not None and (lpips_weight > 0.0 or tv_lpips_weight > 0.0))
+            or dwt_hf_weight > 0.0
+            or fft_hf_weight > 0.0
+        )
+        if needs_decoded_prediction:
             pred_x0, _ = runner.schedule.convert_from_pred(
                 prediction,
                 PredictionType.v_lerp,
@@ -1700,6 +1749,7 @@ def main() -> None:
                 diffusion_timesteps,
             )
             predicted_images = decode_latents_to_images(runner, pred_x0, latent_shapes)
+        if lpips_model is not None and lpips_weight > 0.0 and predicted_images is not None:
             lpips_value = lpips_reconstruction_loss(
                 lpips_model,
                 predicted_images,
@@ -1709,6 +1759,35 @@ def main() -> None:
             total_loss = total_loss + lpips_value * lpips_weight
             aux_metrics["lpips_loss"] = float(lpips_value.item())
             aux_metrics["lpips_loss_weight"] = float(lpips_weight)
+        if dwt_hf_weight > 0.0 and predicted_images is not None:
+            dwt_hf_value = dwt_high_frequency_loss(
+                predicted_images,
+                target_images,
+                levels=config.dwt_hf_levels,
+            )
+            total_loss = total_loss + dwt_hf_value * dwt_hf_weight
+            aux_metrics["dwt_hf_loss"] = float(dwt_hf_value.item())
+            aux_metrics["dwt_hf_loss_weight"] = float(dwt_hf_weight)
+        if fft_hf_weight > 0.0 and predicted_images is not None:
+            fft_hf_value = fft_high_frequency_loss(
+                predicted_images,
+                target_images,
+                min_freq=config.fft_hf_min_freq,
+            )
+            total_loss = total_loss + fft_hf_value * fft_hf_weight
+            aux_metrics["fft_hf_loss"] = float(fft_hf_value.item())
+            aux_metrics["fft_hf_loss_weight"] = float(fft_hf_weight)
+        if lpips_model is not None and tv_lpips_weight > 0.0 and predicted_images is not None:
+            tv_lpips_value = tv_lpips_reconstruction_loss(
+                lpips_model,
+                predicted_images,
+                target_images,
+                resize=config.lpips_resize,
+                gamma=config.tv_lpips_gamma,
+            )
+            total_loss = total_loss + tv_lpips_value * tv_lpips_weight
+            aux_metrics["tv_lpips_loss"] = float(tv_lpips_value.item())
+            aux_metrics["tv_lpips_loss_weight"] = float(tv_lpips_weight)
 
         total_loss.backward()
         if config.grad_clip_norm > 0:

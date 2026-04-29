@@ -118,6 +118,15 @@ class TrainingConfig:
     lpips_loss_warmup_steps: int = 0
     lpips_net: str = "alex"
     lpips_resize: int = 256
+    dwt_hf_loss_weight: float = 0.0
+    dwt_hf_loss_warmup_steps: int = 0
+    dwt_hf_levels: int = 2
+    fft_hf_loss_weight: float = 0.0
+    fft_hf_loss_warmup_steps: int = 0
+    fft_hf_min_freq: float = 0.25
+    tv_lpips_loss_weight: float = 0.0
+    tv_lpips_loss_warmup_steps: int = 0
+    tv_lpips_gamma: float = 0.5
     sampler_validation_samples: int = 0
     sampler_validation_guidance_scale: float = 1.0
     sampler_validation_seed: int = 2079280474
