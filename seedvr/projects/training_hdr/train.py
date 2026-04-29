@@ -1452,6 +1452,7 @@ def build_validation_dataloader(
         quality_cache_root=config.quality_cache_root,
         quality_cache_rebuild=False,
         quality_cache_build_on_init=False,
+        quality_cache_workers=config.quality_cache_workers,
     )
     worker_count = min(2, config.num_workers)
     return DataLoader(
@@ -1519,6 +1520,7 @@ def build_dataloaders(config: TrainingConfig) -> tuple[DataLoader, DataLoader]:
         quality_cache_root=config.quality_cache_root,
         quality_cache_rebuild=config.quality_cache_rebuild,
         quality_cache_build_on_init=config.quality_cache_build_on_init,
+        quality_cache_workers=config.quality_cache_workers,
     )
     train_loader = DataLoader(
         train_dataset,

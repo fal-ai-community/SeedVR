@@ -8,6 +8,8 @@ import tempfile
 import time
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass
 from dataclasses import fields
@@ -1715,7 +1717,7 @@ def _fal_manifest_digest(path: Path) -> str:
 
 def _fal_quality_cache_config(dataset) -> dict[str, Any]:
     return {
-        "version": 2,
+        "version": 3,
         "manifest_digest": _fal_manifest_digest(dataset.manifest_path),
         "sample_count": len(dataset.samples),
         "target_representation": dataset.target_representation,
@@ -1770,45 +1772,74 @@ def _fal_load_quality_cache(dataset) -> bool:
     return bool(good_indices)
 
 
+def _fal_quality_cache_entry(dataset, index: int) -> dict[str, Any]:
+    sample_id = ""
+    try:
+        sample = dataset._load_augmented_sample(index)
+        sample_id = str(sample.get("sample_id", ""))
+        usable, stats = _fal_tensor_sample_quality_is_usable(sample, dataset)
+        error = None
+    except Exception as exc:
+        usable = False
+        stats = {}
+        error = f"{type(exc).__name__}: {exc}"
+        sample_id = getattr(dataset.samples[index], "sample_id", "")
+    return {
+        "index": index,
+        "sample_id": sample_id,
+        "usable": bool(usable),
+        "stats": stats,
+        "error": error,
+    }
+
+
 def _fal_write_quality_cache(dataset, path: Path) -> None:
-    good_indices: list[int] = []
-    entries: list[dict[str, Any]] = []
     start = time.monotonic()
-    for index in range(len(dataset.samples)):
-        sample_id = ""
-        try:
-            sample = dataset._load_augmented_sample(index)
-            sample_id = str(sample.get("sample_id", ""))
-            usable, stats = _fal_tensor_sample_quality_is_usable(sample, dataset)
-            error = None
-        except Exception as exc:
-            usable = False
-            stats = {}
-            error = f"{type(exc).__name__}: {exc}"
-            sample_id = getattr(dataset.samples[index], "sample_id", "")
-        if usable:
-            good_indices.append(index)
-        entries.append(
-            {
-                "index": index,
-                "sample_id": sample_id,
-                "usable": bool(usable),
-                "stats": stats,
-                "error": error,
-            }
-        )
-        if index > 0 and index % 1000 == 0:
-            print(
-                "[seedvr-hdr][stage=dataset_quality_cache] building "
-                f"path={path} checked={index}/{len(dataset.samples)} "
-                f"good={len(good_indices)}"
-            )
+    sample_count = len(dataset.samples)
+    entries_by_index: dict[int, dict[str, Any]] = {}
+    good_count = 0
+    workers = max(1, int(getattr(dataset, "quality_cache_workers", 1) or 1))
+    print(
+        "[seedvr-hdr][stage=dataset_quality_cache] builder "
+        f"path={path} samples={sample_count} workers={workers}"
+    )
+    if workers == 1:
+        for index in range(sample_count):
+            entry = _fal_quality_cache_entry(dataset, index)
+            entries_by_index[index] = entry
+            if entry["usable"]:
+                good_count += 1
+            checked = index + 1
+            if checked % 1000 == 0 or checked == sample_count:
+                print(
+                    "[seedvr-hdr][stage=dataset_quality_cache] building "
+                    f"path={path} checked={checked}/{sample_count} good={good_count}"
+                )
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = [
+                executor.submit(_fal_quality_cache_entry, dataset, index)
+                for index in range(sample_count)
+            ]
+            for checked, future in enumerate(as_completed(futures), start=1):
+                entry = future.result()
+                entries_by_index[int(entry["index"])] = entry
+                if entry["usable"]:
+                    good_count += 1
+                if checked % 1000 == 0 or checked == sample_count:
+                    print(
+                        "[seedvr-hdr][stage=dataset_quality_cache] building "
+                        f"path={path} checked={checked}/{sample_count} "
+                        f"good={good_count}"
+                    )
+    entries = [entries_by_index[index] for index in range(sample_count)]
+    good_indices = [int(entry["index"]) for entry in entries if entry["usable"]]
     payload = {
         "config": _fal_quality_cache_config(dataset),
         "created_at_unix": time.time(),
         "duration_seconds": time.monotonic() - start,
         "good_indices": good_indices,
-        "bad_count": len(dataset.samples) - len(good_indices),
+        "bad_count": sample_count - len(good_indices),
         "entries": entries,
     }
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -2423,6 +2454,7 @@ class SeedVRHDRImageDataset(_FalBaseImageDataset):
         quality_cache_root: str | Path = "/data/seedvr_hdr_quality_cache",
         quality_cache_rebuild: bool = False,
         quality_cache_build_on_init: bool = True,
+        quality_cache_workers: int = 8,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -2441,6 +2473,7 @@ class SeedVRHDRImageDataset(_FalBaseImageDataset):
         self.quality_cache_root = quality_cache_root
         self.quality_cache_rebuild = quality_cache_rebuild
         self.quality_cache_build_on_init = quality_cache_build_on_init
+        self.quality_cache_workers = quality_cache_workers
         _fal_prepare_quality_cache(self)
 
     def _resolve_direct_target_path(self, sample: ManifestSample) -> Path | None:
@@ -2571,6 +2604,7 @@ class SeedVRHDRVideoDataset(_FalBaseVideoDataset):
         quality_cache_root: str | Path = "/data/seedvr_hdr_quality_cache",
         quality_cache_rebuild: bool = False,
         quality_cache_build_on_init: bool = True,
+        quality_cache_workers: int = 8,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -2589,6 +2623,7 @@ class SeedVRHDRVideoDataset(_FalBaseVideoDataset):
         self.quality_cache_root = quality_cache_root
         self.quality_cache_rebuild = quality_cache_rebuild
         self.quality_cache_build_on_init = quality_cache_build_on_init
+        self.quality_cache_workers = quality_cache_workers
         _fal_prepare_quality_cache(self)
 
     def _direct_target_pairs(
