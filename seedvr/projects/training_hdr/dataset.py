@@ -1691,6 +1691,19 @@ def _fal_format_quality_stats(stats: dict[str, float]) -> str:
     return " ".join(f"{key}={value:.4f}" for key, value in sorted(stats.items()))
 
 
+def _fal_quality_filter_candidate_index(index: int, attempt: int, length: int) -> int:
+    if length <= 0:
+        raise RuntimeError("Dataset is empty; cannot select a replacement sample")
+    if attempt <= 0:
+        return index % length
+    # Avoid walking adjacent frames from the same corrupted/noisy scene.
+    return (index + attempt * 9973 + attempt * attempt * 7919) % length
+
+
+def _fal_should_log_quality_rejection(attempt: int, attempts: int) -> bool:
+    return attempt == 0 or attempt + 1 == attempts or (attempt + 1) % 16 == 0
+
+
 _FalBaseImageDataset = SeedVRHDRImageDataset
 _FalBaseVideoDataset = SeedVRHDRVideoDataset
 
@@ -2334,7 +2347,9 @@ class SeedVRHDRImageDataset(_FalBaseImageDataset):
         last_sample: dict[str, torch.Tensor | str] | None = None
         last_stats: dict[str, float] | None = None
         for attempt in range(attempts):
-            candidate_index = (index + attempt) % len(self.samples)
+            candidate_index = _fal_quality_filter_candidate_index(
+                index, attempt, len(self.samples)
+            )
             sample = self._load_augmented_sample(candidate_index)
             usable, stats = _fal_tensor_sample_quality_is_usable(sample, self)
             if usable:
@@ -2347,19 +2362,21 @@ class SeedVRHDRImageDataset(_FalBaseImageDataset):
                 return sample
             last_sample = sample
             last_stats = stats
-            print(
-                "[seedvr-hdr][stage=dataset_quality_filter] rejected "
-                f"index={candidate_index} sample={sample.get('sample_id', '')} "
-                f"{_fal_format_quality_stats(stats)}"
-            )
+            if _fal_should_log_quality_rejection(attempt, attempts):
+                print(
+                    "[seedvr-hdr][stage=dataset_quality_filter] rejected "
+                    f"index={candidate_index} sample={sample.get('sample_id', '')} "
+                    f"attempt={attempt + 1}/{attempts} "
+                    f"{_fal_format_quality_stats(stats)}"
+                )
         if last_sample is None:
             raise RuntimeError(f"Failed to load any dataset sample for index={index}")
-        print(
-            "[seedvr-hdr][stage=dataset_quality_filter] warning using rejected sample "
-            f"index={index} after {attempts} attempts "
+        raise RuntimeError(
+            "Dataset quality filter could not find a usable replacement "
+            f"for index={index} after {attempts} attempts; refusing to train on "
+            f"a rejected sample. Last candidate sample={last_sample.get('sample_id', '')} "
             f"{_fal_format_quality_stats(last_stats or {})}"
         )
-        return last_sample
 
 
 class SeedVRHDRVideoDataset(_FalBaseVideoDataset):
@@ -2450,7 +2467,9 @@ class SeedVRHDRVideoDataset(_FalBaseVideoDataset):
         last_sample: dict[str, torch.Tensor | str] | None = None
         last_stats: dict[str, float] | None = None
         for attempt in range(attempts):
-            candidate_index = (index + attempt) % len(self.samples)
+            candidate_index = _fal_quality_filter_candidate_index(
+                index, attempt, len(self.samples)
+            )
             sample = self._load_augmented_sample(candidate_index)
             usable, stats = _fal_tensor_sample_quality_is_usable(sample, self)
             if usable:
@@ -2463,16 +2482,18 @@ class SeedVRHDRVideoDataset(_FalBaseVideoDataset):
                 return sample
             last_sample = sample
             last_stats = stats
-            print(
-                "[seedvr-hdr][stage=dataset_quality_filter] rejected "
-                f"index={candidate_index} sample={sample.get('sample_id', '')} "
-                f"{_fal_format_quality_stats(stats)}"
-            )
+            if _fal_should_log_quality_rejection(attempt, attempts):
+                print(
+                    "[seedvr-hdr][stage=dataset_quality_filter] rejected "
+                    f"index={candidate_index} sample={sample.get('sample_id', '')} "
+                    f"attempt={attempt + 1}/{attempts} "
+                    f"{_fal_format_quality_stats(stats)}"
+                )
         if last_sample is None:
             raise RuntimeError(f"Failed to load any dataset sample for index={index}")
-        print(
-            "[seedvr-hdr][stage=dataset_quality_filter] warning using rejected sample "
-            f"index={index} after {attempts} attempts "
+        raise RuntimeError(
+            "Dataset quality filter could not find a usable replacement "
+            f"for index={index} after {attempts} attempts; refusing to train on "
+            f"a rejected sample. Last candidate sample={last_sample.get('sample_id', '')} "
             f"{_fal_format_quality_stats(last_stats or {})}"
         )
-        return last_sample
