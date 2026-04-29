@@ -46,9 +46,11 @@ from seedvr.projects.training_hdr.losses import (
 )
 from seedvr.projects.training_hdr.validation import (
     compute_hdr_metrics,
+    linear_hdr_from_target_tensor,
     save_dataset_sample_preview,
     save_triptych,
 )
+
 try:
     import wandb
 except ImportError:  # pragma: no cover - optional at runtime
@@ -335,7 +337,9 @@ def maybe_enable_mxfp8_training(
     return model, True
 
 
-def maybe_compile_dit(model: torch.nn.Module, config: TrainingConfig) -> tuple[torch.nn.Module, bool]:
+def maybe_compile_dit(
+    model: torch.nn.Module, config: TrainingConfig
+) -> tuple[torch.nn.Module, bool]:
     if not config.use_torch_compile or not hasattr(torch, "compile"):
         return model, False
     try:
@@ -372,7 +376,9 @@ def maybe_init_wandb(config: TrainingConfig) -> Any | None:
         return None
     wandb_dir = Path(config.output_dir) / "wandb"
     wandb_dir.mkdir(parents=True, exist_ok=True)
-    run_id = f"{re.sub(r'[^A-Za-z0-9_-]+', '-', config.experiment_name)[:96]}-{uuid.uuid4().hex[:8]}"
+    run_id = (
+        f"{re.sub(r'[^A-Za-z0-9_-]+', '-', config.experiment_name)[:96]}-{uuid.uuid4().hex[:8]}"
+    )
     os.environ.setdefault("WANDB_START_METHOD", "thread")
     os.environ.setdefault("WANDB_INIT_TIMEOUT", "300")
     for attempt in range(1, 4):
@@ -544,11 +550,13 @@ def log_dataset_samples_to_wandb(
     sample_dir = config.output_path / "dataset_samples" / split_name
     sample_paths: list[Path] = []
     captions: list[str] = []
-    indices = build_preview_indices(
-        dataset_size=len(dataset),
+    indices = build_quality_preview_indices(
+        dataset=dataset,
+        config=config,
         num_previews=config.wandb_dataset_sample_count,
         step=step,
         validate_every=config.validate_every,
+        split_name=split_name,
     )
     for preview_index, sample_index in enumerate(indices):
         sample = dataset[sample_index]
@@ -567,13 +575,13 @@ def log_dataset_samples_to_wandb(
                     f"index={sample_index}",
                     f"scene={sample.get('scene_id', '')}",
                     f"sample={sample.get('sample_id', '')}",
+                    f"source={sample.get('source_dataset', '')}",
                 ]
                 if part
             )
         )
     images = [
-        wandb.Image(str(path), caption=captions[index])
-        for index, path in enumerate(sample_paths)
+        wandb.Image(str(path), caption=captions[index]) for index, path in enumerate(sample_paths)
     ]
     wandb.log({"step": step, f"dataset_samples/{split_name}": images})
 
@@ -592,10 +600,153 @@ def build_preview_indices(
         return list(range(dataset_size))
 
     base_indices = [
-        min(dataset_size - 1, int((index * dataset_size) / count))
-        for index in range(count)
+        min(dataset_size - 1, int((index * dataset_size) / count)) for index in range(count)
     ]
     return [int(base_index) for base_index in base_indices]
+
+
+def _preview_chw_frame(tensor: torch.Tensor) -> torch.Tensor:
+    tensor = tensor.detach().float()
+    if tensor.ndim == 4:
+        return tensor[len(tensor) // 2]
+    if tensor.ndim == 3:
+        return tensor
+    raise ValueError(f"Expected CHW/TCHW preview tensor, got {tuple(tensor.shape)}")
+
+
+def _luma_stats(image: torch.Tensor) -> dict[str, float]:
+    image = image.detach().float()
+    if image.ndim != 3 or image.shape[0] != 3:
+        raise ValueError(f"Expected CHW RGB image, got {tuple(image.shape)}")
+    image = image.clamp(0.0, 1.0).unsqueeze(0)
+    if max(image.shape[-2:]) > 192:
+        image = F.interpolate(
+            image,
+            size=(128, 128),
+            mode="bilinear",
+            align_corners=False,
+        )
+    image = image.squeeze(0)
+    luma = 0.2126 * image[0] + 0.7152 * image[1] + 0.0722 * image[2]
+    std = float(torch.std(luma, unbiased=False).item())
+    dx = torch.abs(luma[:, 1:] - luma[:, :-1]).mean()
+    dy = torch.abs(luma[1:, :] - luma[:-1, :]).mean()
+    hf = float(((dx + dy) * 0.5).item())
+    return {
+        "luma_std": std,
+        "luma_hf": hf,
+        "noise_hf_ratio": float(hf / max(std, 1.0e-6)),
+    }
+
+
+def _target_preview_image(target: torch.Tensor, target_representation: str) -> torch.Tensor:
+    target_frame = _preview_chw_frame(target)
+    linear = linear_hdr_from_target_tensor(target_frame, target_representation)
+    linear = torch.clamp(torch.nan_to_num(linear.float(), nan=0.0, posinf=0.0, neginf=0.0), min=0.0)
+    flat = linear.reshape(-1)
+    scale = torch.quantile(flat, 0.995) if flat.numel() else linear.new_tensor(1.0)
+    scale = torch.clamp(scale, min=1.0e-6)
+    preview = torch.log1p(linear) / torch.log1p(scale)
+    return preview.clamp(0.0, 1.0)
+
+
+def _input_preview_image(input_sdr: torch.Tensor) -> torch.Tensor:
+    frame = _preview_chw_frame(input_sdr)
+    return frame.clamp(-1.0, 1.0).add(1.0).mul(0.5)
+
+
+def validation_sample_is_preview_usable(
+    sample: dict[str, Any],
+    config: TrainingConfig,
+) -> tuple[bool, dict[str, float]]:
+    input_stats = _luma_stats(_input_preview_image(sample["input_sdr"]))
+    target_stats = _luma_stats(
+        _target_preview_image(sample["target"], config.target_representation)
+    )
+    stats = {
+        "input_luma_std": input_stats["luma_std"],
+        "input_luma_hf": input_stats["luma_hf"],
+        "input_noise_hf_ratio": input_stats["noise_hf_ratio"],
+        "target_luma_std": target_stats["luma_std"],
+        "target_luma_hf": target_stats["luma_hf"],
+        "target_noise_hf_ratio": target_stats["noise_hf_ratio"],
+    }
+    usable = (
+        input_stats["luma_std"] >= config.validation_preview_min_luma_std
+        and target_stats["luma_std"] >= config.validation_preview_min_luma_std
+        and input_stats["luma_hf"] <= config.validation_preview_max_luma_hf
+        and target_stats["luma_hf"] <= config.validation_preview_max_luma_hf
+        and input_stats["noise_hf_ratio"] <= config.validation_preview_max_noise_hf_ratio
+        and target_stats["noise_hf_ratio"] <= config.validation_preview_max_noise_hf_ratio
+    )
+    return usable, stats
+
+
+def build_quality_preview_indices(
+    *,
+    dataset: Dataset,
+    config: TrainingConfig,
+    num_previews: int,
+    step: int,
+    validate_every: int,
+    split_name: str,
+) -> list[int]:
+    dataset_size = len(dataset)
+    if dataset_size <= 0 or num_previews <= 0:
+        return []
+    count = min(dataset_size, num_previews)
+    scan_count = min(
+        dataset_size,
+        max(count, count * max(1, int(config.validation_preview_scan_multiplier))),
+    )
+    candidates = build_preview_indices(
+        dataset_size=dataset_size,
+        num_previews=scan_count,
+        step=step,
+        validate_every=validate_every,
+    )
+    selected: list[int] = []
+    rejected: list[tuple[int, str]] = []
+    for index in candidates:
+        if index in selected:
+            continue
+        try:
+            sample = dataset[index]
+            usable, stats = validation_sample_is_preview_usable(sample, config)
+        except Exception as exc:
+            rejected.append((index, f"error={type(exc).__name__}:{exc}"))
+            continue
+        if usable:
+            selected.append(index)
+            if len(selected) >= count:
+                break
+        else:
+            rejected.append(
+                (
+                    index,
+                    " ".join(f"{key}={value:.4f}" for key, value in sorted(stats.items())),
+                )
+            )
+    if len(selected) < count:
+        for index in build_preview_indices(
+            dataset_size=dataset_size,
+            num_previews=count,
+            step=step,
+            validate_every=validate_every,
+        ):
+            if index not in selected:
+                selected.append(index)
+                if len(selected) >= count:
+                    break
+    if rejected:
+        preview = "; ".join(f"idx={index} {reason}" for index, reason in rejected[:5])
+        suffix = "" if len(rejected) <= 5 else f"; +{len(rejected) - 5} more"
+        print(
+            "[seedvr-hdr][stage=validation_preview_filter] "
+            f"split={split_name} selected={selected} rejected={len(rejected)} "
+            f"{preview}{suffix}"
+        )
+    return selected[:count]
 
 
 def validation_noise_seed(config: TrainingConfig, sample_index: int) -> int:
@@ -608,17 +759,17 @@ def sampler_validation_noise_seed(config: TrainingConfig, sample_index: int) -> 
 
 def collect_base_preview_indices(
     config: TrainingConfig,
-    dataset_size: int,
+    dataset: Dataset,
     *,
     num_validation_samples: int | None = None,
     sampler_validation_samples: int | None = None,
+    split_name: str = "val",
 ) -> list[int]:
+    dataset_size = len(dataset)
     if dataset_size <= 0:
         return []
     validation_count = (
-        config.num_validation_samples
-        if num_validation_samples is None
-        else num_validation_samples
+        config.num_validation_samples if num_validation_samples is None else num_validation_samples
     )
     sampler_count = (
         config.sampler_validation_samples
@@ -628,19 +779,23 @@ def collect_base_preview_indices(
     indices: set[int] = set()
     sampler_preview_count = min(sampler_count, dataset_size)
     indices.update(
-        build_preview_indices(
-            dataset_size=dataset_size,
+        build_quality_preview_indices(
+            dataset=dataset,
+            config=config,
             num_previews=validation_count,
             step=1,
             validate_every=config.validate_every,
+            split_name=split_name,
         )
     )
     indices.update(
-        build_preview_indices(
-            dataset_size=dataset_size,
+        build_quality_preview_indices(
+            dataset=dataset,
+            config=config,
             num_previews=sampler_preview_count,
             step=1,
             validate_every=config.validate_every,
+            split_name=f"{split_name}/sampler",
         )
     )
     return sorted(indices)
@@ -726,7 +881,9 @@ def evaluate_validation_batch(
         dtype=latents_flat.dtype,
     )
     timesteps = runner.timestep_transform(timesteps, latent_shapes).to(latents_flat.dtype)
-    diffusion_timesteps = expand_timesteps_to_latents(timesteps, latent_shapes).to(latents_flat.dtype)
+    diffusion_timesteps = expand_timesteps_to_latents(timesteps, latent_shapes).to(
+        latents_flat.dtype
+    )
     x_t = runner.schedule.forward(latents_flat, noise, diffusion_timesteps)
     target = runner.schedule.convert_to_pred(
         latents_flat,
@@ -786,13 +943,15 @@ def build_base_validation_prediction_cache(
     device: torch.device,
     num_validation_samples: int | None = None,
     sampler_validation_samples: int | None = None,
+    split_name: str = "base_cache",
 ) -> dict[int, torch.Tensor]:
     dataset = val_loader.dataset
     indices = collect_base_preview_indices(
         config,
-        len(dataset),
+        dataset,
         num_validation_samples=num_validation_samples,
         sampler_validation_samples=sampler_validation_samples,
+        split_name=split_name,
     )
     if not indices:
         return {}
@@ -800,22 +959,21 @@ def build_base_validation_prediction_cache(
     cache: dict[int, torch.Tensor] = {}
     was_training = runner.dit.training
     runner.dit.eval()
-    print(
-        "[seedvr-hdr] caching base validation predictions "
-        f"count={len(indices)}"
-    )
+    print("[seedvr-hdr] caching base validation predictions " f"count={len(indices)}")
     with torch.no_grad():
         for sample_index in indices:
             sample = dataset[sample_index]
             batch = single_sample_to_batch(sample)
-            _denoise, _hdr_metrics, input_images, target_images, predicted_images = evaluate_validation_batch(
-                config=config,
-                runner=runner,
-                text_pos_embeds=text_pos_embeds,
-                text_pos_shapes=text_pos_shapes,
-                batch=batch,
-                device=device,
-                noise_seed=validation_noise_seed(config, sample_index),
+            _denoise, _hdr_metrics, input_images, target_images, predicted_images = (
+                evaluate_validation_batch(
+                    config=config,
+                    runner=runner,
+                    text_pos_embeds=text_pos_embeds,
+                    text_pos_shapes=text_pos_shapes,
+                    batch=batch,
+                    device=device,
+                    noise_seed=validation_noise_seed(config, sample_index),
+                )
             )
             cache[sample_index] = predicted_images[0].detach().cpu().to(torch.float16)
             del input_images, target_images, predicted_images
@@ -923,10 +1081,9 @@ def select_trainable_parameters(model: torch.nn.Module, strategy: str) -> int:
         if num_blocks <= 0:
             raise ValueError("DiT model exposes no blocks for block trainable_strategy")
         if start >= num_blocks:
-            raise ValueError(
-                f"Block index {start} is outside model block range 0-{num_blocks - 1}"
-            )
+            raise ValueError(f"Block index {start} is outside model block range 0-{num_blocks - 1}")
         end = min(end, num_blocks - 1)
+
         def predicate(name: str) -> bool:
             index = block_index(name)
             if index is None:
@@ -934,6 +1091,7 @@ def select_trainable_parameters(model: torch.nn.Module, strategy: str) -> int:
             if index < start or index > end:
                 return False
             return module_filter is None or module_filter in name
+
         enable_if(predicate)
 
     def parse_block_suffix(prefix: str) -> int:
@@ -952,9 +1110,7 @@ def select_trainable_parameters(model: torch.nn.Module, strategy: str) -> int:
         ]
         num_blocks = max(block_indices) + 1 if block_indices else 0
     if strategy in {"top8", "top16", "attention_top16", "mlp_top16"} and num_blocks <= 0:
-        raise ValueError(
-            f"DiT model exposes no blocks for trainable_strategy {strategy!r}"
-        )
+        raise ValueError(f"DiT model exposes no blocks for trainable_strategy {strategy!r}")
     top8_start = max(0, num_blocks - 8)
     top16_start = max(0, num_blocks - 16)
 
@@ -966,37 +1122,23 @@ def select_trainable_parameters(model: torch.nn.Module, strategy: str) -> int:
         for parameter in model.parameters():
             parameter.requires_grad_(True)
     elif strategy == "top8":
-        enable_if(
-            lambda name: (
-                block_at_or_after(name, top8_start)
-                or is_io_adapter(name)
-            )
-        )
+        enable_if(lambda name: (block_at_or_after(name, top8_start) or is_io_adapter(name)))
     elif strategy == "top16":
-        enable_if(
-            lambda name: (
-                block_at_or_after(name, top16_start)
-                or is_io_adapter(name)
-            )
-        )
+        enable_if(lambda name: (block_at_or_after(name, top16_start) or is_io_adapter(name)))
     elif strategy == "emb_out":
         enable_if(
-            lambda name: name.startswith(("vid_out", "vid_out_norm", "vid_out_ada", "txt_in", "emb_in"))
+            lambda name: name.startswith(
+                ("vid_out", "vid_out_norm", "vid_out_ada", "txt_in", "emb_in")
+            )
         )
     elif strategy == "attention_top16":
         enable_if(
-            lambda name: (
-                block_at_or_after(name, top16_start)
-                and "attn" in name
-            )
+            lambda name: (block_at_or_after(name, top16_start) and "attn" in name)
             or is_io_adapter(name)
         )
     elif strategy == "mlp_top16":
         enable_if(
-            lambda name: (
-                block_at_or_after(name, top16_start)
-                and "mlp" in name
-            )
+            lambda name: (block_at_or_after(name, top16_start) and "mlp" in name)
             or is_io_adapter(name)
         )
     elif strategy.startswith("block_"):
@@ -1089,9 +1231,7 @@ def build_trainable_param_groups(
     model: torch.nn.Module,
 ) -> list[torch.nn.Parameter] | list[dict[str, object]]:
     trainable_named_params = [
-        (name, parameter)
-        for name, parameter in model.named_parameters()
-        if parameter.requires_grad
+        (name, parameter) for name, parameter in model.named_parameters() if parameter.requires_grad
     ]
     if config.layerwise_lr_decay > 1.0:
         raise ValueError("layerwise_lr_decay must be <= 1.0")
@@ -1113,7 +1253,7 @@ def build_trainable_param_groups(
         else:
             # Later DiT blocks stay closest to the base LR; earlier blocks decay.
             depth_from_top = max(0, num_blocks - 1 - block_idx)
-            scale = config.layerwise_lr_decay ** depth_from_top
+            scale = config.layerwise_lr_decay**depth_from_top
             scale = max(float(config.layerwise_lr_min_scale), float(scale))
         grouped.setdefault(round(float(scale), 8), []).append(parameter)
 
@@ -1143,6 +1283,7 @@ def build_scheduler(
         return torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _step: 1.0)
 
     if config.scheduler_type == "cosine":
+
         def lr_lambda(step: int) -> float:
             if config.warmup_steps > 0 and step < config.warmup_steps:
                 return max(1.0e-8, float(step + 1) / float(config.warmup_steps))
@@ -1175,9 +1316,7 @@ def build_lpips_model(config: TrainingConfig, device: torch.device):
     try:
         import lpips  # type: ignore
     except ImportError as exc:
-        raise RuntimeError(
-            "lpips_loss_weight > 0 but the lpips package is not installed."
-        ) from exc
+        raise RuntimeError("lpips_loss_weight > 0 but the lpips package is not installed.") from exc
 
     model = lpips.LPIPS(net=config.lpips_net).eval().to(device)
     model.requires_grad_(False)
@@ -1189,9 +1328,7 @@ def _as_lpips_input(tensor: torch.Tensor, resize: int) -> torch.Tensor:
         b, t, c, h, w = tensor.shape
         tensor = tensor.reshape(b * t, c, h, w)
     elif tensor.ndim != 4:
-        raise ValueError(
-            f"Expected BCHW or BTCHW tensor for LPIPS, got {tuple(tensor.shape)}"
-        )
+        raise ValueError(f"Expected BCHW or BTCHW tensor for LPIPS, got {tuple(tensor.shape)}")
     tensor = tensor[:, :3].float().clamp(0.0, 1.0)
     if resize > 0 and min(tensor.shape[-2:]) > resize:
         tensor = F.interpolate(
@@ -1268,12 +1405,8 @@ def build_validation_dataloader(
         drop_last=False,
         num_workers=worker_count,
         pin_memory=True,
-        persistent_workers=bool(
-            config.dataloader_persistent_workers and worker_count > 0
-        ),
-        prefetch_factor=(
-            config.dataloader_prefetch_factor if worker_count > 0 else None
-        ),
+        persistent_workers=bool(config.dataloader_persistent_workers and worker_count > 0),
+        prefetch_factor=(config.dataloader_prefetch_factor if worker_count > 0 else None),
     )
 
 
@@ -1324,9 +1457,7 @@ def build_dataloaders(config: TrainingConfig) -> tuple[DataLoader, DataLoader]:
         num_workers=config.num_workers,
         pin_memory=True,
         persistent_workers=bool(config.dataloader_persistent_workers and config.num_workers > 0),
-        prefetch_factor=(
-            config.dataloader_prefetch_factor if config.num_workers > 0 else None
-        ),
+        prefetch_factor=(config.dataloader_prefetch_factor if config.num_workers > 0 else None),
     )
     val_loader = build_validation_dataloader(
         config,
@@ -1341,7 +1472,12 @@ def build_runner(
     config: TrainingConfig,
     repo_root: Path,
     device: torch.device,
-) -> tuple[VideoDiffusionInfer, tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor], dict[str, Any]]:
+) -> tuple[
+    VideoDiffusionInfer,
+    tuple[torch.Tensor, torch.Tensor],
+    tuple[torch.Tensor, torch.Tensor],
+    dict[str, Any],
+]:
     from seedvr.projects.video_diffusion_sr.infer import VideoDiffusionInfer
 
     if not config.freeze_vae:
@@ -1403,10 +1539,14 @@ def decode_latents_to_images(
 
     # Use a cloned batch tensor so the decode branch cannot mutate views
     # that autograd is still tracking for the denoise / latent losses.
-    latent_batch = torch.stack([latent for latent in latents], dim=0).to(
-        device=device,
-        dtype=dtype,
-    ).clone()
+    latent_batch = (
+        torch.stack([latent for latent in latents], dim=0)
+        .to(
+            device=device,
+            dtype=dtype,
+        )
+        .clone()
+    )
     latent_batch = latent_batch / scale + shift
     latent_batch = rearrange(latent_batch, "b t h w c -> b c t h w")
 
@@ -1448,9 +1588,7 @@ def run_validation(
     hdr_metric_rows: list[dict[str, float]] = []
     sampler_metric_rows: list[dict[str, float]] = []
     validation_count = (
-        config.num_validation_samples
-        if num_validation_samples is None
-        else num_validation_samples
+        config.num_validation_samples if num_validation_samples is None else num_validation_samples
     )
     sampler_count = (
         config.sampler_validation_samples
@@ -1458,22 +1596,21 @@ def run_validation(
         else sampler_validation_samples
     )
     sampler_validate_every = int(config.sampler_validate_every or config.validate_every)
-    run_sampler_validation = (
-        sampler_count > 0
-        and (step % sampler_validate_every == 0 or step == config.steps)
+    run_sampler_validation = sampler_count > 0 and (
+        step % sampler_validate_every == 0 or step == config.steps
     )
     if not run_sampler_validation:
         sampler_count = 0
     preview_dir = config.output_path / preview_subdir
     preview_dir.mkdir(parents=True, exist_ok=True)
-    metric_limit = validation_count
-    preview_index_set = set(
-        build_preview_indices(
-            dataset_size=len(val_loader.dataset),
-            num_previews=validation_count,
-            step=step,
-            validate_every=config.validate_every,
-        )
+    dataset = val_loader.dataset
+    metric_indices = build_quality_preview_indices(
+        dataset=dataset,
+        config=config,
+        num_previews=validation_count,
+        step=step,
+        validate_every=config.validate_every,
+        split_name=preview_subdir,
     )
 
     runner.dit.eval()
@@ -1482,93 +1619,30 @@ def run_validation(
     if config.debug_cuda_memory:
         log_cuda_memory("validation_start", device, step)
     with torch.no_grad():
-        for idx, batch in enumerate(val_loader):
-            if idx >= metric_limit:
-                break
+        for sample_index in metric_indices:
+            sample = dataset[sample_index]
+            batch = single_sample_to_batch(sample)
 
-            denoise, hdr_metrics, input_images, target_images, predicted_images = evaluate_validation_batch(
-                config=config,
-                runner=runner,
-                text_pos_embeds=text_pos_embeds,
-                text_pos_shapes=text_pos_shapes,
-                batch=batch,
-                device=device,
-                noise_seed=validation_noise_seed(config, idx),
+            denoise, hdr_metrics, input_images, target_images, predicted_images = (
+                evaluate_validation_batch(
+                    config=config,
+                    runner=runner,
+                    text_pos_embeds=text_pos_embeds,
+                    text_pos_shapes=text_pos_shapes,
+                    batch=batch,
+                    device=device,
+                    noise_seed=validation_noise_seed(config, sample_index),
+                )
             )
             losses.append(denoise)
             hdr_metric_rows.append(hdr_metrics)
-            if idx in preview_index_set:
-                preview_path = save_triptych(
-                    preview_dir / f"step_{step:06d}_{len(preview_paths):02d}.png",
-                    input_images[0].cpu(),
-                    predicted_images[0].cpu(),
-                    target_images[0].cpu(),
-                    target_representation=config.target_representation,
-                    base_predicted_image=(
-                        base_prediction_cache or {}
-                    ).get(idx),
-                )
-                preview_paths.append(preview_path)
-                scene_value = batch.get("scene_id", "")
-                sample_value = batch.get("sample_id", "")
-                if isinstance(scene_value, list):
-                    scene_value = scene_value[0] if scene_value else ""
-                if isinstance(sample_value, list):
-                    sample_value = sample_value[0] if sample_value else ""
-                preview_captions.append(
-                    " ".join(
-                        part
-                        for part in [
-                            f"step={step}",
-                            f"preview={len(preview_paths) - 1}",
-                            f"scene={scene_value}",
-                            f"sample={sample_value}",
-                        ]
-                        if part
-                    )
-                )
-            if config.debug_cuda_memory:
-                log_cuda_memory(f"validation_sample idx={idx}", device, step)
-
-            del (
-                input_images,
-                target_images,
-                predicted_images,
-            )
-            cleanup_cuda_memory(device)
-
-        dataset = val_loader.dataset
-        extra_preview_indices = [
-            index
-            for index in build_preview_indices(
-                dataset_size=len(dataset),
-                num_previews=validation_count,
-                step=step,
-                validate_every=config.validate_every,
-            )
-            if index >= metric_limit
-        ]
-        for sample_index in extra_preview_indices:
-            sample = dataset[sample_index]
-            batch = single_sample_to_batch(sample)
-            _denoise, _hdr_metrics, input_images, target_images, predicted_images = evaluate_validation_batch(
-                config=config,
-                runner=runner,
-                text_pos_embeds=text_pos_embeds,
-                text_pos_shapes=text_pos_shapes,
-                batch=batch,
-                device=device,
-                noise_seed=validation_noise_seed(config, sample_index),
-            )
             preview_path = save_triptych(
                 preview_dir / f"step_{step:06d}_{len(preview_paths):02d}.png",
                 input_images[0].cpu(),
                 predicted_images[0].cpu(),
                 target_images[0].cpu(),
                 target_representation=config.target_representation,
-                base_predicted_image=(
-                    base_prediction_cache or {}
-                ).get(sample_index),
+                base_predicted_image=(base_prediction_cache or {}).get(sample_index),
             )
             preview_paths.append(preview_path)
             preview_captions.append(
@@ -1577,36 +1651,45 @@ def run_validation(
                     for part in [
                         f"step={step}",
                         f"preview={len(preview_paths) - 1}",
+                        f"index={sample_index}",
                         f"scene={sample.get('scene_id', '')}",
                         f"sample={sample.get('sample_id', '')}",
+                        f"source={sample.get('source_dataset', '')}",
                     ]
                     if part
                 )
             )
             if config.debug_cuda_memory:
-                log_cuda_memory(f"validation_preview sample_index={sample_index}", device, step)
-            del input_images, target_images, predicted_images
+                log_cuda_memory(f"validation_sample idx={sample_index}", device, step)
+
+            del (
+                input_images,
+                target_images,
+                predicted_images,
+            )
             cleanup_cuda_memory(device)
 
-
         if sampler_count > 0:
-            dataset = val_loader.dataset
-            sampler_indices = build_preview_indices(
-                dataset_size=len(dataset),
+            sampler_indices = build_quality_preview_indices(
+                dataset=dataset,
+                config=config,
                 num_previews=min(sampler_count, len(dataset)),
                 step=step,
                 validate_every=config.validate_every,
+                split_name=f"{preview_subdir}/sampler",
             )
             for sampler_index, sample_index in enumerate(sampler_indices):
                 sample = dataset[sample_index]
                 batch = single_sample_to_batch(sample)
-                hdr_metrics, input_images, target_images, predicted_images = evaluate_sampler_validation_batch(
-                    config=config,
-                    runner=runner,
-                    positive_embeddings=positive_embeddings,
-                    batch=batch,
-                    device=device,
-                    seed=sampler_validation_noise_seed(config, sample_index),
+                hdr_metrics, input_images, target_images, predicted_images = (
+                    evaluate_sampler_validation_batch(
+                        config=config,
+                        runner=runner,
+                        positive_embeddings=positive_embeddings,
+                        batch=batch,
+                        device=device,
+                        seed=sampler_validation_noise_seed(config, sample_index),
+                    )
                 )
                 sampler_metric_rows.append(hdr_metrics)
                 preview_path = save_triptych(
@@ -1615,9 +1698,7 @@ def run_validation(
                     predicted_images[0].cpu(),
                     target_images[0].cpu(),
                     target_representation=config.target_representation,
-                    base_predicted_image=(
-                        base_prediction_cache or {}
-                    ).get(sample_index),
+                    base_predicted_image=(base_prediction_cache or {}).get(sample_index),
                 )
                 preview_paths.append(preview_path)
                 preview_captions.append(
@@ -1626,8 +1707,10 @@ def run_validation(
                         for part in [
                             f"step={step}",
                             f"sampler_preview={sampler_index}",
+                            f"index={sample_index}",
                             f"scene={sample.get('scene_id', '')}",
                             f"sample={sample.get('sample_id', '')}",
+                            f"source={sample.get('source_dataset', '')}",
                             f"cfg={config.sampler_validation_guidance_scale}",
                         ]
                         if part
@@ -1747,12 +1830,11 @@ def main() -> None:
             device=device,
             num_validation_samples=extra.num_validation_samples,
             sampler_validation_samples=extra.sampler_validation_samples,
+            split_name=f"{extra_name}/base_cache",
         )
 
     optimizer = build_optimizer(config, runner.dit)
-    optimizer_lrs = sorted(
-        {float(group["lr"]) for group in optimizer.param_groups}
-    )
+    optimizer_lrs = sorted({float(group["lr"]) for group in optimizer.param_groups})
     print(
         "[seedvr-hdr] optimizer parameter groups: "
         f"count={len(optimizer.param_groups)} "
@@ -1847,7 +1929,9 @@ def main() -> None:
             device=device,
         ).to(latents_flat.dtype)
         timesteps = runner.timestep_transform(timesteps, latent_shapes).to(latents_flat.dtype)
-        diffusion_timesteps = expand_timesteps_to_latents(timesteps, latent_shapes).to(latents_flat.dtype)
+        diffusion_timesteps = expand_timesteps_to_latents(timesteps, latent_shapes).to(
+            latents_flat.dtype
+        )
         x_t = runner.schedule.forward(latents_flat, noise, diffusion_timesteps)
         target = runner.schedule.convert_to_pred(
             latents_flat,
@@ -1988,9 +2072,7 @@ def main() -> None:
             final_metrics.update(
                 {
                     "encode_seconds": float(encode_finished_at - encode_started_at),
-                    "post_encode_seconds": float(
-                        step_finished_at - encode_finished_at
-                    ),
+                    "post_encode_seconds": float(step_finished_at - encode_finished_at),
                     "step_seconds": float(step_finished_at - step_started_at),
                 }
             )

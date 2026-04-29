@@ -19,7 +19,6 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
-
 MU_LAW_MU = 5000.0
 LOG_HDR_EPS = 1.0e-6
 LOCK_TIMEOUT_SECONDS = 600.0
@@ -75,6 +74,7 @@ class ManifestSample:
     gamma: float | None = None
     quantization_bits: int | None = None
     jpeg_quality: int | None = None
+
     @classmethod
     def from_row(cls, row: dict) -> "ManifestSample":
         allowed = {field.name for field in fields(cls)}
@@ -83,7 +83,12 @@ class ManifestSample:
 
     @property
     def is_video(self) -> bool:
-        return bool(self.input_sdr_paths or self.input_sdr_urls or self.source_hdr_paths or self.source_hdr_urls)
+        return bool(
+            self.input_sdr_paths
+            or self.input_sdr_urls
+            or self.source_hdr_paths
+            or self.source_hdr_urls
+        )
 
 
 def load_manifest(path: str | Path) -> list[ManifestSample]:
@@ -293,7 +298,9 @@ def _quantize_sdr(image: np.ndarray, bits: int) -> np.ndarray:
 def _apply_jpeg_roundtrip(image: np.ndarray, quality: int | None) -> np.ndarray:
     if quality is None:
         return image
-    bgr = cv2.cvtColor((np.clip(image, 0.0, 1.0) * 255.0).round().astype(np.uint8), cv2.COLOR_RGB2BGR)
+    bgr = cv2.cvtColor(
+        (np.clip(image, 0.0, 1.0) * 255.0).round().astype(np.uint8), cv2.COLOR_RGB2BGR
+    )
     ok, encoded = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
     if not ok:
         return image
@@ -353,7 +360,9 @@ def _atomic_write_png(path: Path, image: np.ndarray) -> None:
     with tempfile.NamedTemporaryFile(dir=path.parent, suffix=".png", delete=False) as tmp_file:
         tmp_path = Path(tmp_file.name)
     try:
-        bgr = cv2.cvtColor((np.clip(image, 0.0, 1.0) * 255.0).round().astype(np.uint8), cv2.COLOR_RGB2BGR)
+        bgr = cv2.cvtColor(
+            (np.clip(image, 0.0, 1.0) * 255.0).round().astype(np.uint8), cv2.COLOR_RGB2BGR
+        )
         if not cv2.imwrite(str(tmp_path), bgr):
             raise ValueError(f"Failed to write PNG cache: {tmp_path}")
         os.replace(tmp_path, path)
@@ -438,7 +447,9 @@ class _RuntimeAssetCache:
                 return candidate
         if not raw_url:
             missing = raw_path or "<none>"
-            raise FileNotFoundError(f"Missing local asset and no fallback url for {kind}: {missing}")
+            raise FileNotFoundError(
+                f"Missing local asset and no fallback url for {kind}: {missing}"
+            )
 
         suffix = _suffix_hint(raw_path or raw_url, default_suffix)
         digest = _sha1_text(f"{kind}|{cache_key}|{raw_url}")
@@ -466,10 +477,15 @@ class _RuntimeAssetCache:
         dest.parent.mkdir(parents=True, exist_ok=True)
         last_error: Exception | None = None
         for attempt in range(1, self.download_retries + 1):
-            with tempfile.NamedTemporaryFile(dir=dest.parent, suffix=".part", delete=False) as tmp_file:
+            with tempfile.NamedTemporaryFile(
+                dir=dest.parent, suffix=".part", delete=False
+            ) as tmp_file:
                 tmp_path = Path(tmp_file.name)
             try:
-                with urllib.request.urlopen(url, timeout=self.download_timeout_seconds) as response, tmp_path.open("wb") as output_file:
+                with (
+                    urllib.request.urlopen(url, timeout=self.download_timeout_seconds) as response,
+                    tmp_path.open("wb") as output_file,
+                ):
                     while True:
                         chunk = response.read(1024 * 1024)
                         if not chunk:
@@ -491,7 +507,9 @@ class _RuntimeAssetCache:
                 if attempt >= self.download_retries:
                     break
                 time.sleep(min(30.0, 2.0 * attempt))
-        raise RuntimeError(f"Failed to download {url} after {self.download_retries} attempts: {last_error}")
+        raise RuntimeError(
+            f"Failed to download {url} after {self.download_retries} attempts: {last_error}"
+        )
 
 
 class _SeedVRHDRDatasetBase(Dataset):
@@ -866,7 +884,9 @@ class SeedVRHDRImageDataset(_SeedVRHDRDatasetBase):
             )
 
         if direct_target_path is not None:
-            target_image = _read_target_for_representation(direct_target_path, self.target_representation)
+            target_image = _read_target_for_representation(
+                direct_target_path, self.target_representation
+            )
         else:
             assert hdr is not None and hdr_source_path is not None
             target_image = self._load_cached_or_compressed_target(
@@ -947,7 +967,9 @@ class SeedVRHDRImageDataset(_SeedVRHDRDatasetBase):
                         purpose=f"target_{self.target_representation}",
                         extra=f"{raw_path or ''}|{raw_url or ''}",
                     ),
-                    default_suffix=".npy" if (raw_path or raw_url or "").endswith(".npy") else ".exr",
+                    default_suffix=(
+                        ".npy" if (raw_path or raw_url or "").endswith(".npy") else ".exr"
+                    ),
                 )
         return None
 
@@ -1046,7 +1068,9 @@ class SeedVRHDRVideoDataset(_SeedVRHDRDatasetBase):
                     ),
                     default_suffix=".npy",
                 )
-                target_image = _read_target_for_representation(target_path, self.target_representation)
+                target_image = _read_target_for_representation(
+                    target_path, self.target_representation
+                )
             else:
                 if hdr is None or hdr_source_path is None:
                     hdr, hdr_source_path = self._load_hdr_source(sample, frame_index=frame_index)
@@ -1165,7 +1189,9 @@ def _fal_logc3_encode(linear: np.ndarray) -> np.ndarray:
     e = 5.367655
     f = 0.092809
     linear = np.maximum(linear.astype(np.float32), 0.0)
-    return np.where(linear > cut, c * np.log10(a * linear + b) + d, e * linear + f).astype(np.float32)
+    return np.where(linear > cut, c * np.log10(a * linear + b) + d, e * linear + f).astype(
+        np.float32
+    )
 
 
 def _fal_mu_law_decode(compressed: np.ndarray) -> np.ndarray:
@@ -1361,6 +1387,42 @@ def _fal_crop_or_pad_to_shape(
     return _fal_from_nchw(cropped.contiguous(), original_shape)
 
 
+def _fal_crop_or_pad_pair_to_shape(
+    input_tensor: torch.Tensor,
+    target_tensor: torch.Tensor,
+    height: int,
+    width: int,
+    rng: random.Random,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    input_nchw, input_shape = _fal_to_nchw(input_tensor)
+    target_nchw, target_shape = _fal_to_nchw(target_tensor)
+    _, _, current_h, current_w = input_nchw.shape
+    if target_nchw.shape[-2:] != (current_h, current_w):
+        raise ValueError(
+            "Input/target spatial shapes diverged before paired crop: "
+            f"{tuple(input_nchw.shape[-2:])} vs {tuple(target_nchw.shape[-2:])}"
+        )
+    pad_h = max(0, height - current_h)
+    pad_w = max(0, width - current_w)
+    if pad_h > 0 or pad_w > 0:
+        pad_top = pad_h // 2
+        pad_bottom = pad_h - pad_top
+        pad_left = pad_w // 2
+        pad_right = pad_w - pad_left
+        padding = (pad_left, pad_right, pad_top, pad_bottom)
+        input_nchw = _fal_F.pad(input_nchw, padding, mode="reflect")
+        target_nchw = _fal_F.pad(target_nchw, padding, mode="reflect")
+        current_h, current_w = input_nchw.shape[-2:]
+    top = 0 if current_h == height else rng.randint(0, current_h - height)
+    left = 0 if current_w == width else rng.randint(0, current_w - width)
+    input_crop = input_nchw[..., top : top + height, left : left + width]
+    target_crop = target_nchw[..., top : top + height, left : left + width]
+    return (
+        _fal_from_nchw(input_crop.contiguous(), input_shape),
+        _fal_from_nchw(target_crop.contiguous(), target_shape),
+    )
+
+
 def _fal_apply_spatial_jitter_pair(
     input_tensor: torch.Tensor,
     target_tensor: torch.Tensor,
@@ -1378,8 +1440,13 @@ def _fal_apply_spatial_jitter_pair(
         jitter_w = max(32, width + delta_w)
         input_tensor = _fal_resize_spatial(input_tensor, jitter_h, jitter_w)
         target_tensor = _fal_resize_spatial(target_tensor, jitter_h, jitter_w)
-        input_tensor = _fal_crop_or_pad_to_shape(input_tensor, height, width, rng)
-        target_tensor = _fal_crop_or_pad_to_shape(target_tensor, height, width, rng)
+        input_tensor, target_tensor = _fal_crop_or_pad_pair_to_shape(
+            input_tensor,
+            target_tensor,
+            height,
+            width,
+            rng,
+        )
 
     if phase_jitter and phase_jitter_max_pixels > 0:
         max_y = min(phase_jitter_max_pixels, max(0, height - 1))
@@ -1389,11 +1456,13 @@ def _fal_apply_spatial_jitter_pair(
             pad_x = max_x
             top = rng.randint(0, pad_y * 2) if pad_y > 0 else 0
             left = rng.randint(0, pad_x * 2) if pad_x > 0 else 0
+
             def shift(tensor: torch.Tensor) -> torch.Tensor:
                 nchw, original_shape = _fal_to_nchw(tensor)
                 padded = _fal_F.pad(nchw, (pad_x, pad_x, pad_y, pad_y), mode="reflect")
                 shifted = padded[..., top : top + height, left : left + width]
                 return _fal_from_nchw(shifted.contiguous(), original_shape)
+
             input_tensor = shift(input_tensor)
             target_tensor = shift(target_tensor)
 
@@ -1442,8 +1511,10 @@ def _fal_cache_read_attempts(dataset) -> int:
 
 def _fal_is_runtime_cache_path(dataset, path: Path) -> bool:
     try:
-        return Path(path).resolve().is_relative_to(
-            Path(dataset.asset_cache.runtime_cache_root).resolve()
+        return (
+            Path(path)
+            .resolve()
+            .is_relative_to(Path(dataset.asset_cache.runtime_cache_root).resolve())
         )
     except Exception:
         return False
@@ -1802,6 +1873,7 @@ def _fal_image_dataset_getitem(self, index: int) -> dict[str, torch.Tensor | str
         "scene_id": sample.scene_id,
         "sample_id": sample.sample_id,
         "variant_id": sample.variant_id or "",
+        "source_dataset": sample.source_dataset or "",
     }
 
 
@@ -1952,6 +2024,7 @@ def _fal_video_dataset_getitem(self, index: int) -> dict[str, torch.Tensor | str
         "scene_id": sample.scene_id,
         "sample_id": sample.sample_id,
         "variant_id": sample.variant_id or "",
+        "source_dataset": sample.source_dataset or "",
     }
 
 

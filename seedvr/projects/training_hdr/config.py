@@ -167,6 +167,10 @@ class TrainingConfig:
     dataloader_prefetch_factor: int = 2
     dataloader_persistent_workers: bool = True
     profile_step_time: bool = True
+    validation_preview_scan_multiplier: int = 8
+    validation_preview_min_luma_std: float = 0.015
+    validation_preview_max_luma_hf: float = 0.18
+    validation_preview_max_noise_hf_ratio: float = 0.95
     extra_validation_datasets: list[ExtraValidationConfig] = field(default_factory=list)
 
     def __post_init__(self) -> None:
