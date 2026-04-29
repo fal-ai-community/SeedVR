@@ -36,6 +36,7 @@ from seedvr.projects.training_hdr.losses import (
     denoise_loss,
     dwt_high_frequency_loss,
     fft_high_frequency_loss,
+    image_reconstruction_loss,
     total_variation_map,
 )
 from seedvr.projects.training_hdr.validation import (
@@ -1801,6 +1802,11 @@ def main() -> None:
             config.lpips_loss_warmup_steps,
             step,
         )
+        image_recon_weight = current_loss_weight(
+            config.image_recon_loss_weight,
+            config.image_loss_warmup_steps,
+            step,
+        )
         dwt_hf_weight = current_loss_weight(
             config.dwt_hf_loss_weight,
             config.dwt_hf_loss_warmup_steps,
@@ -1821,6 +1827,7 @@ def main() -> None:
         lpips_value = None
         needs_decoded_prediction = (
             (lpips_model is not None and (lpips_weight > 0.0 or tv_lpips_weight > 0.0))
+            or image_recon_weight > 0.0
             or dwt_hf_weight > 0.0
             or fft_hf_weight > 0.0
         )
@@ -1832,6 +1839,14 @@ def main() -> None:
                 diffusion_timesteps,
             )
             predicted_images = decode_latents_to_images(runner, pred_x0, latent_shapes)
+        if image_recon_weight > 0.0 and predicted_images is not None:
+            image_recon_value = image_reconstruction_loss(
+                predicted_images,
+                target_images,
+            )
+            total_loss = total_loss + image_recon_value * image_recon_weight
+            aux_metrics["image_recon_loss"] = float(image_recon_value.item())
+            aux_metrics["image_recon_loss_weight"] = float(image_recon_weight)
         if lpips_model is not None and lpips_weight > 0.0 and predicted_images is not None:
             lpips_value = lpips_reconstruction_loss(
                 lpips_model,

@@ -22,7 +22,7 @@ def latent_reconstruction_loss(prediction: torch.Tensor, target: torch.Tensor) -
 
 def image_reconstruction_loss(prediction: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     target = target.to(device=prediction.device, dtype=prediction.dtype)
-    return charbonnier_loss(prediction.float(), target.float())
+    return F.l1_loss(prediction.float(), target.float())
 
 
 
