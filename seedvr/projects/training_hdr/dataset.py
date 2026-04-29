@@ -30,6 +30,11 @@ class ManifestSample:
     sample_id: str
     scene_id: str
     split: str
+    source_dataset: str | None = None
+    dataset_namespace: str | None = None
+    input_mode: str | None = None
+    compressed_target_space: str | None = None
+    source_metadata: dict[str, Any] | None = None
     input_sdr_path: str | None = None
     input_sdr_paths: list[str] | None = None
     input_sdr_url: str | None = None
@@ -534,6 +539,17 @@ class _SeedVRHDRDatasetBase(Dataset):
             getattr(sample, f"{field_name}_url", None),
         )
 
+    def _metadata_field_pair(
+        self,
+        sample: ManifestSample,
+        field_name: str,
+    ) -> tuple[str | None, str | None]:
+        metadata = sample.source_metadata if isinstance(sample.source_metadata, dict) else {}
+        return (
+            metadata.get(f"{field_name}_path"),
+            metadata.get(f"{field_name}_url"),
+        )
+
     def _pair_list(
         self,
         sample: ManifestSample,
@@ -612,6 +628,8 @@ class _SeedVRHDRDatasetBase(Dataset):
                 [
                     self._optional_field_pair(sample, "source_hdr"),
                     self._optional_field_pair(sample, "target_hdr"),
+                    self._metadata_field_pair(sample, "source_hdr"),
+                    self._metadata_field_pair(sample, "target_hdr"),
                 ]
             )
         else:
@@ -1155,6 +1173,55 @@ def _fal_mu_law_decode(compressed: np.ndarray) -> np.ndarray:
     return np.expm1(compressed * np.log1p(MU_LAW_MU)) / MU_LAW_MU
 
 
+def _fal_log_hdr_decode(encoded: np.ndarray) -> np.ndarray:
+    return np.maximum(np.exp(encoded.astype(np.float32)) - LOG_HDR_EPS, 0.0)
+
+
+def _fal_pq_eotf(encoded: np.ndarray) -> np.ndarray:
+    encoded = np.clip(encoded.astype(np.float32), 0.0, 1.0)
+    m1 = 2610.0 / 16384.0
+    m2 = 2523.0 / 32.0
+    c1 = 3424.0 / 4096.0
+    c2 = 2413.0 / 128.0
+    c3 = 2392.0 / 128.0
+    powered = np.power(encoded, 1.0 / m2)
+    numerator = np.maximum(powered - c1, 0.0)
+    denominator = np.maximum(c2 - c3 * powered, 1.0e-8)
+    return np.power(numerator / denominator, 1.0 / m1) * 10.0
+
+
+def _fal_logc3_decode(encoded: np.ndarray) -> np.ndarray:
+    encoded = encoded.astype(np.float32)
+    cut = 0.010591
+    a = 5.555556
+    b = 0.052272
+    c = 0.247190
+    d = 0.385537
+    e = 5.367655
+    f = 0.092809
+    cut_encoded = e * cut + f
+    linear = np.where(
+        encoded > cut_encoded,
+        (np.power(10.0, (encoded - d) / c) - b) / a,
+        (encoded - f) / e,
+    )
+    return np.maximum(linear.astype(np.float32), 0.0)
+
+
+def _fal_target_to_linear(encoded: np.ndarray, representation: str) -> np.ndarray:
+    if representation == "raw_hdr":
+        return np.maximum(encoded.astype(np.float32), 0.0)
+    if representation == "mu_law_mu5000":
+        return _fal_mu_law_decode(encoded)
+    if representation == "log_hdr":
+        return _fal_log_hdr_decode(encoded)
+    if representation == "pq_1000":
+        return _fal_pq_eotf(encoded)
+    if representation == "logc3":
+        return _fal_logc3_decode(encoded)
+    raise ValueError(f"Unsupported source target representation: {representation}")
+
+
 def _compress_target_from_hdr(hdr: np.ndarray, target_representation: str) -> np.ndarray:
     hdr = np.maximum(hdr.astype(np.float32), 0.0)
     if target_representation == "raw_hdr":
@@ -1173,14 +1240,45 @@ def _compress_target_from_hdr(hdr: np.ndarray, target_representation: str) -> np
 _fal_base_read_target_for_representation = _read_target_for_representation
 
 
+def _fal_infer_target_representation_from_path(path: Path) -> str | None:
+    name = path.as_posix().lower()
+    if "mu_law" in name or "mulaw" in name:
+        return "mu_law_mu5000"
+    if "log_hdr" in name:
+        return "log_hdr"
+    if "pq_1000" in name or "pq1000" in name:
+        return "pq_1000"
+    if "logc3" in name or "log_c3" in name:
+        return "logc3"
+    if "raw" in name:
+        return "raw_hdr"
+    return None
+
+
+def _fal_default_suffix(value: str, fallback: str = ".exr") -> str:
+    parsed_path = urllib.parse.urlparse(value).path if "://" in value else value
+    suffix = Path(parsed_path).suffix.lower()
+    return suffix or fallback
+
+
 def _read_target_for_representation(path: Path, target_representation: str) -> np.ndarray:
-    if target_representation in {"pq_1000", "logc3"} and path.suffix.lower() == ".npy":
-        # Older manifests only have mu-law direct targets. Convert them through
-        # linear HDR so validation can use the newer target encodings too.
-        return _compress_target_from_hdr(
-            _fal_mu_law_decode(_read_target_array(path)),
-            target_representation,
-        )
+    if path.suffix.lower() == ".npy":
+        encoded = _read_target_array(path)
+        source_representation = _fal_infer_target_representation_from_path(path)
+        if source_representation is not None and source_representation != target_representation:
+            return _compress_target_from_hdr(
+                _fal_target_to_linear(encoded, source_representation),
+                target_representation,
+            )
+        if target_representation in {"pq_1000", "logc3"} and source_representation is None:
+            # Legacy slim manifests expose mu-law targets through generic
+            # compressed_target_path fields. Only use this fallback when the
+            # filename gives no stronger representation signal.
+            return _compress_target_from_hdr(
+                _fal_mu_law_decode(encoded),
+                target_representation,
+            )
+        return encoded
     return _fal_base_read_target_for_representation(path, target_representation)
 
 
@@ -1867,21 +1965,35 @@ class SeedVRHDRImageDataset(_FalBaseImageDataset):
     def _resolve_direct_target_path(self, sample: ManifestSample) -> Path | None:
         if self.target_representation in {"pq_1000", "logc3"}:
             candidates = [
+                self._optional_field_pair(sample, "target_hdr_npy"),
+                self._optional_field_pair(sample, "target_hdr"),
+                self._optional_field_pair(sample, "source_hdr"),
+                self._metadata_field_pair(sample, "target_hdr"),
+                self._metadata_field_pair(sample, "source_hdr"),
                 self._optional_field_pair(sample, "target_mu_law"),
-                self._optional_field_pair(sample, "compressed_target"),
+                self._optional_field_pair(sample, "target_log_hdr"),
             ]
+            if sample.compressed_target_space in {
+                "raw_hdr",
+                "mu_law_mu5000",
+                "log_hdr",
+                "pq_1000",
+                "logc3",
+            }:
+                candidates.append(self._optional_field_pair(sample, "compressed_target"))
             for raw_path, raw_url in candidates:
                 if raw_path or raw_url:
+                    suffix_source = raw_path or raw_url or ""
                     return self._resolve_pair(
                         sample,
                         (raw_path, raw_url),
-                        kind=f"target_mu_law_for_{self.target_representation}",
+                        kind=f"target_source_for_{self.target_representation}",
                         cache_key=self._cache_identity(
                             sample,
-                            purpose=f"target_mu_law_for_{self.target_representation}",
+                            purpose=f"target_source_for_{self.target_representation}",
                             extra=f"{raw_path or ''}|{raw_url or ''}",
                         ),
-                        default_suffix=".npy",
+                        default_suffix=_fal_default_suffix(suffix_source),
                     )
             return None
         return super()._resolve_direct_target_path(sample)
@@ -1934,9 +2046,22 @@ class SeedVRHDRVideoDataset(_FalBaseVideoDataset):
     def _direct_target_pairs(self, sample: ManifestSample) -> list[tuple[str | None, str | None]]:
         if self.target_representation in {"pq_1000", "logc3"}:
             for pairs in [
+                self._pair_list(sample, "target_hdr_npy"),
+                self._pair_list(sample, "target_hdr"),
+                self._pair_list(sample, "source_hdr"),
                 self._pair_list(sample, "target_mu_law"),
-                self._pair_list(sample, "compressed_target"),
+                self._pair_list(sample, "target_log_hdr"),
             ]:
+                if pairs:
+                    return pairs
+            if sample.compressed_target_space in {
+                "raw_hdr",
+                "mu_law_mu5000",
+                "log_hdr",
+                "pq_1000",
+                "logc3",
+            }:
+                pairs = self._pair_list(sample, "compressed_target")
                 if pairs:
                     return pairs
             return []
