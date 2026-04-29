@@ -2454,7 +2454,7 @@ class SeedVRHDRImageDataset(_FalBaseImageDataset):
         quality_cache_root: str | Path = "/data/seedvr_hdr_quality_cache",
         quality_cache_rebuild: bool = False,
         quality_cache_build_on_init: bool = True,
-        quality_cache_workers: int = 8,
+        quality_cache_workers: int = 16,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -2604,7 +2604,7 @@ class SeedVRHDRVideoDataset(_FalBaseVideoDataset):
         quality_cache_root: str | Path = "/data/seedvr_hdr_quality_cache",
         quality_cache_rebuild: bool = False,
         quality_cache_build_on_init: bool = True,
-        quality_cache_workers: int = 8,
+        quality_cache_workers: int = 16,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)

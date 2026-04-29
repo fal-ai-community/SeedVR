@@ -186,7 +186,7 @@ class TrainingConfig:
     quality_cache_root: str = "/data/seedvr_hdr_quality_cache"
     quality_cache_rebuild: bool = False
     quality_cache_build_on_init: bool = True
-    quality_cache_workers: int = 8
+    quality_cache_workers: int = 16
     extra_validation_datasets: list[ExtraValidationConfig] = field(default_factory=list)
 
     def __post_init__(self) -> None:
