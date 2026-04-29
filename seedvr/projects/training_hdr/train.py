@@ -888,8 +888,23 @@ def select_trainable_parameters(model: torch.nn.Module, strategy: str) -> int:
 
     block_count = getattr(model, "blocks", None)
     num_blocks = len(block_count) if block_count is not None else 0
+    if num_blocks == 0:
+        block_indices = [
+            index
+            for name, _parameter in model.named_parameters()
+            if (index := block_index(name)) is not None
+        ]
+        num_blocks = max(block_indices) + 1 if block_indices else 0
+    if strategy in {"top8", "top16", "attention_top16", "mlp_top16"} and num_blocks <= 0:
+        raise ValueError(
+            f"DiT model exposes no blocks for trainable_strategy {strategy!r}"
+        )
     top8_start = max(0, num_blocks - 8)
     top16_start = max(0, num_blocks - 16)
+
+    def block_at_or_after(name: str, start: int) -> bool:
+        index = block_index(name)
+        return index is not None and index >= start
 
     if strategy == "full":
         for parameter in model.parameters():
@@ -897,15 +912,15 @@ def select_trainable_parameters(model: torch.nn.Module, strategy: str) -> int:
     elif strategy == "top8":
         enable_if(
             lambda name: (
-                (name.startswith("blocks.") and int(name.split(".")[1]) >= top8_start)
-                or name.startswith(("vid_out", "vid_out_norm", "vid_out_ada", "txt_in", "emb_in"))
+                block_at_or_after(name, top8_start)
+                or is_io_adapter(name)
             )
         )
     elif strategy == "top16":
         enable_if(
             lambda name: (
-                (name.startswith("blocks.") and int(name.split(".")[1]) >= top16_start)
-                or name.startswith(("vid_out", "vid_out_norm", "vid_out_ada", "txt_in", "emb_in"))
+                block_at_or_after(name, top16_start)
+                or is_io_adapter(name)
             )
         )
     elif strategy == "emb_out":
@@ -915,17 +930,15 @@ def select_trainable_parameters(model: torch.nn.Module, strategy: str) -> int:
     elif strategy == "attention_top16":
         enable_if(
             lambda name: (
-                name.startswith("blocks.")
-                and int(name.split(".")[1]) >= top16_start
+                block_at_or_after(name, top16_start)
                 and "attn" in name
             )
-            or name.startswith(("vid_out", "vid_out_norm", "vid_out_ada", "txt_in", "emb_in"))
+            or is_io_adapter(name)
         )
     elif strategy == "mlp_top16":
         enable_if(
             lambda name: (
-                name.startswith("blocks.")
-                and int(name.split(".")[1]) >= top16_start
+                block_at_or_after(name, top16_start)
                 and "mlp" in name
             )
             or is_io_adapter(name)
