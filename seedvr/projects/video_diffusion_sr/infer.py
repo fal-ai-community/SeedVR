@@ -325,7 +325,10 @@ class VideoDiffusionInfer:
                 rescale=self.config.diffusion.cfg.rescale,
             ),
         )
-        print(f"{latents=}")
+        print(
+            "Sampling latents complete: "
+            f"shape={tuple(latents.shape)} dtype={latents.dtype} device={latents.device}"
+        )
 
         # Exit eval mode.
         self.dit.train(was_training)
