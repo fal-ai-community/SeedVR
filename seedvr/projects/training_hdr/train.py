@@ -4,6 +4,7 @@ import argparse
 import contextlib
 import fcntl
 import gc
+import hashlib
 import json
 import os
 import random
@@ -564,12 +565,11 @@ def log_dataset_samples_to_wandb(
     sample_dir = config.output_path / "dataset_samples" / split_name
     sample_paths: list[Path] = []
     captions: list[str] = []
-    indices = build_quality_preview_indices(
+    indices = build_random_quality_preview_indices(
         dataset=dataset,
         config=config,
         num_previews=config.wandb_dataset_sample_count,
         step=step,
-        validate_every=config.validate_every,
         split_name=split_name,
     )
     for preview_index, sample_index in enumerate(indices):
@@ -619,6 +619,58 @@ def build_preview_indices(
         for index in range(count)
     ]
     return [int(base_index) for base_index in base_indices]
+
+
+def build_random_quality_preview_indices(
+    *,
+    dataset: Dataset,
+    config: TrainingConfig,
+    num_previews: int,
+    step: int,
+    split_name: str,
+) -> list[int]:
+    dataset_size = len(dataset)
+    if dataset_size <= 0 or num_previews <= 0:
+        return []
+    count = min(dataset_size, num_previews)
+    cached_good_indices = list(getattr(dataset, "quality_good_indices", []) or [])
+    seed_material = f"{config.seed}:{step}:{split_name}:{dataset_size}:dataset_samples"
+    rng = random.Random(
+        int(hashlib.sha1(seed_material.encode("utf-8")).hexdigest()[:16], 16)
+    )
+    if cached_good_indices:
+        rng.shuffle(cached_good_indices)
+        selected = [int(index) for index in cached_good_indices[:count]]
+        print(
+            "[seedvr-hdr][stage=dataset_sample_log] "
+            f"split={split_name} selected={selected} source=quality_cache_random"
+        )
+        return selected
+
+    candidates = list(range(dataset_size))
+    rng.shuffle(candidates)
+    scan_limit = min(dataset_size, max(count, count * 64))
+    selected: list[int] = []
+    rejected = 0
+    for index in candidates[:scan_limit]:
+        try:
+            sample = dataset[index]
+            usable, _stats = validation_sample_is_preview_usable(sample, config)
+        except Exception:
+            rejected += 1
+            continue
+        if usable:
+            selected.append(index)
+            if len(selected) >= count:
+                break
+        else:
+            rejected += 1
+    print(
+        "[seedvr-hdr][stage=dataset_sample_log] "
+        f"split={split_name} selected={selected} rejected={rejected} "
+        "source=random_quality_scan"
+    )
+    return selected
 
 
 def _preview_chw_frame(tensor: torch.Tensor) -> torch.Tensor:
