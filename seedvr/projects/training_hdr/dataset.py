@@ -111,7 +111,9 @@ def _read_target_array(path: Path) -> np.ndarray:
     target = np.load(path)
     if target.ndim != 3 or target.shape[-1] != 3:
         raise ValueError(f"Expected HWC RGB target at {path}, got {target.shape}")
-    return np.nan_to_num(target.astype(np.float32), nan=0.0, posinf=1.0e6, neginf=-1.0e6)
+    return np.nan_to_num(
+        target.astype(np.float32), nan=0.0, posinf=1.0e6, neginf=-1.0e6
+    )
 
 
 def _read_hdr_image(path: Path) -> np.ndarray:
@@ -126,7 +128,9 @@ def _read_hdr_image(path: Path) -> np.ndarray:
     return np.nan_to_num(image, nan=0.0, posinf=1.0e6, neginf=0.0)
 
 
-def _compress_target_from_hdr(hdr: np.ndarray, target_representation: str) -> np.ndarray:
+def _compress_target_from_hdr(
+    hdr: np.ndarray, target_representation: str
+) -> np.ndarray:
     hdr = np.maximum(hdr.astype(np.float32), 0.0)
     if target_representation == "raw_hdr":
         return hdr
@@ -137,7 +141,9 @@ def _compress_target_from_hdr(hdr: np.ndarray, target_representation: str) -> np
     raise ValueError(f"Unsupported target_representation: {target_representation}")
 
 
-def _read_target_for_representation(path: Path, target_representation: str) -> np.ndarray:
+def _read_target_for_representation(
+    path: Path, target_representation: str
+) -> np.ndarray:
     if path.suffix.lower() == ".npy":
         return _read_target_array(path)
     if path.suffix.lower() in {".exr", ".hdr"}:
@@ -154,10 +160,14 @@ def _resize_to_cover(
     height, width = image.shape[:2]
     if height >= target_height and width >= target_width:
         return image
-    scale = max(float(target_height) / float(height), float(target_width) / float(width))
+    scale = max(
+        float(target_height) / float(height), float(target_width) / float(width)
+    )
     resized_width = int(round(width * scale))
     resized_height = int(round(height * scale))
-    return cv2.resize(image, (resized_width, resized_height), interpolation=interpolation)
+    return cv2.resize(
+        image, (resized_width, resized_height), interpolation=interpolation
+    )
 
 
 def _aligned_size(size: int, alignment: int = 16) -> int:
@@ -261,7 +271,9 @@ def _stack_input_frames(frames: list[np.ndarray]) -> torch.Tensor:
     return torch.stack(tensors, dim=0)
 
 
-def _stack_target_frames(frames: list[np.ndarray], target_representation: str) -> torch.Tensor:
+def _stack_target_frames(
+    frames: list[np.ndarray], target_representation: str
+) -> torch.Tensor:
     tensors = [_to_target_tensor(frame, target_representation) for frame in frames]
     return torch.stack(tensors, dim=0)
 
@@ -277,7 +289,9 @@ def _apply_exposure_ev(image: np.ndarray, ev: float) -> np.ndarray:
     return image * (2.0**ev)
 
 
-def _apply_camera_response(image: np.ndarray, crf_name: str, gamma: float) -> np.ndarray:
+def _apply_camera_response(
+    image: np.ndarray, crf_name: str, gamma: float
+) -> np.ndarray:
     image = np.clip(image, 0.0, None)
     if crf_name == "linear_clip":
         return np.clip(image, 0.0, 1.0)
@@ -357,11 +371,14 @@ def _validate_cached_asset(path: Path) -> None:
 
 def _atomic_write_png(path: Path, image: np.ndarray) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(dir=path.parent, suffix=".png", delete=False) as tmp_file:
+    with tempfile.NamedTemporaryFile(
+        dir=path.parent, suffix=".png", delete=False
+    ) as tmp_file:
         tmp_path = Path(tmp_file.name)
     try:
         bgr = cv2.cvtColor(
-            (np.clip(image, 0.0, 1.0) * 255.0).round().astype(np.uint8), cv2.COLOR_RGB2BGR
+            (np.clip(image, 0.0, 1.0) * 255.0).round().astype(np.uint8),
+            cv2.COLOR_RGB2BGR,
         )
         if not cv2.imwrite(str(tmp_path), bgr):
             raise ValueError(f"Failed to write PNG cache: {tmp_path}")
@@ -373,7 +390,9 @@ def _atomic_write_png(path: Path, image: np.ndarray) -> None:
 
 def _atomic_write_npy(path: Path, array: np.ndarray) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(dir=path.parent, suffix=".npy", delete=False) as tmp_file:
+    with tempfile.NamedTemporaryFile(
+        dir=path.parent, suffix=".npy", delete=False
+    ) as tmp_file:
         tmp_path = Path(tmp_file.name)
     try:
         np.save(tmp_path, array.astype(np.float32))
@@ -453,7 +472,9 @@ class _RuntimeAssetCache:
 
         suffix = _suffix_hint(raw_path or raw_url, default_suffix)
         digest = _sha1_text(f"{kind}|{cache_key}|{raw_url}")
-        dest = self.runtime_cache_root / "remote" / kind / digest[:2] / f"{digest}{suffix}"
+        dest = (
+            self.runtime_cache_root / "remote" / kind / digest[:2] / f"{digest}{suffix}"
+        )
         if dest.exists() and not force_refresh:
             return dest
 
@@ -471,7 +492,13 @@ class _RuntimeAssetCache:
 
     def derived_path(self, *, kind: str, cache_key: str, suffix: str) -> Path:
         digest = _sha1_text(f"{kind}|{cache_key}")
-        return self.runtime_cache_root / "derived" / kind / digest[:2] / f"{digest}{suffix}"
+        return (
+            self.runtime_cache_root
+            / "derived"
+            / kind
+            / digest[:2]
+            / f"{digest}{suffix}"
+        )
 
     def _download_url(self, url: str, dest: Path) -> None:
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -483,7 +510,9 @@ class _RuntimeAssetCache:
                 tmp_path = Path(tmp_file.name)
             try:
                 with (
-                    urllib.request.urlopen(url, timeout=self.download_timeout_seconds) as response,
+                    urllib.request.urlopen(
+                        url, timeout=self.download_timeout_seconds
+                    ) as response,
                     tmp_path.open("wb") as output_file,
                 ):
                     while True:
@@ -562,7 +591,9 @@ class _SeedVRHDRDatasetBase(Dataset):
         sample: ManifestSample,
         field_name: str,
     ) -> tuple[str | None, str | None]:
-        metadata = sample.source_metadata if isinstance(sample.source_metadata, dict) else {}
+        metadata = (
+            sample.source_metadata if isinstance(sample.source_metadata, dict) else {}
+        )
         return (
             metadata.get(f"{field_name}_path"),
             metadata.get(f"{field_name}_url"),
@@ -609,7 +640,11 @@ class _SeedVRHDRDatasetBase(Dataset):
                 sample.camera_response or "",
                 "" if sample.exposure_ev is None else f"{sample.exposure_ev:.8f}",
                 "" if sample.gamma is None else f"{sample.gamma:.8f}",
-                "" if sample.quantization_bits is None else str(sample.quantization_bits),
+                (
+                    ""
+                    if sample.quantization_bits is None
+                    else str(sample.quantization_bits)
+                ),
                 "" if sample.jpeg_quality is None else str(sample.jpeg_quality),
             ]
         )
@@ -680,7 +715,9 @@ class _SeedVRHDRDatasetBase(Dataset):
                     default_suffix=".exr",
                     force_refresh=force_refresh,
                 )
-        raise ValueError(f"Sample {sample.sample_id} does not provide an HDR source path/url")
+        raise ValueError(
+            f"Sample {sample.sample_id} does not provide an HDR source path/url"
+        )
 
     def _load_hdr_source(
         self,
@@ -734,7 +771,9 @@ class _SeedVRHDRDatasetBase(Dataset):
                 f"Failed to load HDR source for {sample.sample_id} "
                 f"(frame_index={frame_index}): {last_error}"
             ) from last_error
-        raise ValueError(f"Sample {sample.sample_id} does not provide an HDR source path/url")
+        raise ValueError(
+            f"Sample {sample.sample_id} does not provide an HDR source path/url"
+        )
 
     def _load_cached_or_rendered_input(
         self,
@@ -749,7 +788,9 @@ class _SeedVRHDRDatasetBase(Dataset):
                 f"Sample {sample.sample_id} is missing camera_response/exposure_ev required for SDR synthesis"
             )
         gamma = sample.gamma if sample.gamma is not None else 2.2
-        quantization_bits = sample.quantization_bits if sample.quantization_bits is not None else 8
+        quantization_bits = (
+            sample.quantization_bits if sample.quantization_bits is not None else 8
+        )
         cache_key = self._cache_identity(
             sample,
             purpose="rendered_input",
@@ -954,7 +995,9 @@ class SeedVRHDRImageDataset(_SeedVRHDRDatasetBase):
                 ]
             )
         else:
-            raise ValueError(f"Unsupported target_representation: {self.target_representation}")
+            raise ValueError(
+                f"Unsupported target_representation: {self.target_representation}"
+            )
 
         for raw_path, raw_url in candidates:
             if raw_path or raw_url:
@@ -968,7 +1011,9 @@ class SeedVRHDRImageDataset(_SeedVRHDRDatasetBase):
                         extra=f"{raw_path or ''}|{raw_url or ''}",
                     ),
                     default_suffix=(
-                        ".npy" if (raw_path or raw_url or "").endswith(".npy") else ".exr"
+                        ".npy"
+                        if (raw_path or raw_url or "").endswith(".npy")
+                        else ".exr"
                     ),
                 )
         return None
@@ -1041,13 +1086,17 @@ class SeedVRHDRVideoDataset(_SeedVRHDRDatasetBase):
                         sample,
                         purpose="input_sdr",
                         frame_index=frame_index,
-                        extra="|".join(value or "" for value in input_pairs[frame_index]),
+                        extra="|".join(
+                            value or "" for value in input_pairs[frame_index]
+                        ),
                     ),
                     default_suffix=".png",
                 )
                 input_image = _read_rgb_png(input_path)
             else:
-                hdr, hdr_source_path = self._load_hdr_source(sample, frame_index=frame_index)
+                hdr, hdr_source_path = self._load_hdr_source(
+                    sample, frame_index=frame_index
+                )
                 input_image = self._load_cached_or_rendered_input(
                     sample,
                     hdr=hdr,
@@ -1064,7 +1113,9 @@ class SeedVRHDRVideoDataset(_SeedVRHDRDatasetBase):
                         sample,
                         purpose=f"target_{self.target_representation}",
                         frame_index=frame_index,
-                        extra="|".join(value or "" for value in target_pairs[frame_index]),
+                        extra="|".join(
+                            value or "" for value in target_pairs[frame_index]
+                        ),
                     ),
                     default_suffix=".npy",
                 )
@@ -1073,7 +1124,9 @@ class SeedVRHDRVideoDataset(_SeedVRHDRDatasetBase):
                 )
             else:
                 if hdr is None or hdr_source_path is None:
-                    hdr, hdr_source_path = self._load_hdr_source(sample, frame_index=frame_index)
+                    hdr, hdr_source_path = self._load_hdr_source(
+                        sample, frame_index=frame_index
+                    )
                 target_image = self._load_cached_or_compressed_target(
                     sample,
                     hdr=hdr,
@@ -1132,7 +1185,9 @@ class SeedVRHDRVideoDataset(_SeedVRHDRDatasetBase):
             "variant_id": sample.variant_id or "",
         }
 
-    def _direct_target_pairs(self, sample: ManifestSample) -> list[tuple[str | None, str | None]]:
+    def _direct_target_pairs(
+        self, sample: ManifestSample
+    ) -> list[tuple[str | None, str | None]]:
         candidates: list[list[tuple[str | None, str | None]]] = []
         if self.target_representation == "raw_hdr":
             candidates.extend(
@@ -1156,7 +1211,9 @@ class SeedVRHDRVideoDataset(_SeedVRHDRDatasetBase):
                 ]
             )
         else:
-            raise ValueError(f"Unsupported target_representation: {self.target_representation}")
+            raise ValueError(
+                f"Unsupported target_representation: {self.target_representation}"
+            )
 
         for pairs in candidates:
             if pairs:
@@ -1189,9 +1246,9 @@ def _fal_logc3_encode(linear: np.ndarray) -> np.ndarray:
     e = 5.367655
     f = 0.092809
     linear = np.maximum(linear.astype(np.float32), 0.0)
-    return np.where(linear > cut, c * np.log10(a * linear + b) + d, e * linear + f).astype(
-        np.float32
-    )
+    return np.where(
+        linear > cut, c * np.log10(a * linear + b) + d, e * linear + f
+    ).astype(np.float32)
 
 
 def _fal_mu_law_decode(compressed: np.ndarray) -> np.ndarray:
@@ -1248,7 +1305,9 @@ def _fal_target_to_linear(encoded: np.ndarray, representation: str) -> np.ndarra
     raise ValueError(f"Unsupported source target representation: {representation}")
 
 
-def _compress_target_from_hdr(hdr: np.ndarray, target_representation: str) -> np.ndarray:
+def _compress_target_from_hdr(
+    hdr: np.ndarray, target_representation: str
+) -> np.ndarray:
     hdr = np.maximum(hdr.astype(np.float32), 0.0)
     if target_representation == "raw_hdr":
         return hdr
@@ -1304,19 +1363,30 @@ def _fal_can_use_compressed_target_for_transcode(
     if declared in {"mu_law_mu5000", target_representation}:
         return True
     value = raw_path or raw_url or ""
-    return _fal_infer_target_representation_from_path(_fal_path_for_inference(value)) is not None
+    return (
+        _fal_infer_target_representation_from_path(_fal_path_for_inference(value))
+        is not None
+    )
 
 
-def _read_target_for_representation(path: Path, target_representation: str) -> np.ndarray:
+def _read_target_for_representation(
+    path: Path, target_representation: str
+) -> np.ndarray:
     if path.suffix.lower() == ".npy":
         encoded = _read_target_array(path)
         source_representation = _fal_infer_target_representation_from_path(path)
-        if source_representation is not None and source_representation != target_representation:
+        if (
+            source_representation is not None
+            and source_representation != target_representation
+        ):
             return _compress_target_from_hdr(
                 _fal_target_to_linear(encoded, source_representation),
                 target_representation,
             )
-        if target_representation in {"pq_1000", "logc3"} and source_representation is None:
+        if (
+            target_representation in {"pq_1000", "logc3"}
+            and source_representation is None
+        ):
             # Legacy slim manifests expose mu-law targets through generic
             # compressed_target_path fields. Only use this fallback when the
             # filename gives no stronger representation signal.
@@ -1346,7 +1416,9 @@ def _fal_to_nchw(tensor: torch.Tensor) -> tuple[torch.Tensor, tuple[int, ...]]:
     raise ValueError(f"Expected CHW or TCHW tensor, got {original_shape}")
 
 
-def _fal_from_nchw(tensor: torch.Tensor, original_shape: tuple[int, ...]) -> torch.Tensor:
+def _fal_from_nchw(
+    tensor: torch.Tensor, original_shape: tuple[int, ...]
+) -> torch.Tensor:
     if len(original_shape) == 3:
         return tensor.squeeze(0)
     return tensor
@@ -1379,7 +1451,9 @@ def _fal_crop_or_pad_to_shape(
         pad_bottom = pad_h - pad_top
         pad_left = pad_w // 2
         pad_right = pad_w - pad_left
-        nchw = _fal_F.pad(nchw, (pad_left, pad_right, pad_top, pad_bottom), mode="reflect")
+        nchw = _fal_F.pad(
+            nchw, (pad_left, pad_right, pad_top, pad_bottom), mode="reflect"
+        )
         current_h, current_w = nchw.shape[-2:]
     top = 0 if current_h == height else rng.randint(0, current_h - height)
     left = 0 if current_w == width else rng.randint(0, current_w - width)
@@ -1487,17 +1561,134 @@ def _fal_apply_input_jpeg_roundtrip(
         image = frame.detach().float().clamp(-1.0, 1.0).add(1.0).mul(127.5)
         array = image.round().to(torch.uint8).cpu().numpy().transpose(1, 2, 0)
         bgr = cv2.cvtColor(array, cv2.COLOR_RGB2BGR)
-        ok, encoded = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
+        ok, encoded = cv2.imencode(
+            ".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), quality]
+        )
         if not ok:
             output_frames.append(frame)
             continue
         decoded = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
         decoded = cv2.cvtColor(decoded, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-        output_frames.append(torch.from_numpy(decoded.transpose(2, 0, 1)).mul(2.0).sub(1.0))
+        output_frames.append(
+            torch.from_numpy(decoded.transpose(2, 0, 1)).mul(2.0).sub(1.0)
+        )
     output = torch.stack(output_frames, dim=0).to(dtype=input_tensor.dtype)
     if len(original_shape) == 3:
         output = output.squeeze(0)
     return output
+
+
+def _fal_hwc_to_luma_preview(image: np.ndarray) -> np.ndarray:
+    image = np.clip(
+        np.nan_to_num(image.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0),
+        0.0,
+        1.0,
+    )
+    return 0.2126 * image[..., 0] + 0.7152 * image[..., 1] + 0.0722 * image[..., 2]
+
+
+def _fal_target_to_luma_preview(
+    target: np.ndarray, target_representation: str
+) -> np.ndarray:
+    linear = _fal_target_to_linear(target, target_representation)
+    linear = np.maximum(
+        np.nan_to_num(linear.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0), 0.0
+    )
+    scale = float(np.percentile(linear, 99.5)) if linear.size else 1.0
+    scale = max(scale, 1.0e-6)
+    preview = np.log1p(linear) / np.log1p(scale)
+    return _fal_hwc_to_luma_preview(preview)
+
+
+def _fal_luma_quality_stats(luma: np.ndarray) -> dict[str, float]:
+    luma = np.nan_to_num(luma.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+    if max(luma.shape[:2]) > 768:
+        scale = 768.0 / float(max(luma.shape[:2]))
+        resized = cv2.resize(
+            luma,
+            (
+                max(1, int(round(luma.shape[1] * scale))),
+                max(1, int(round(luma.shape[0] * scale))),
+            ),
+            interpolation=cv2.INTER_AREA,
+        )
+        luma = resized.astype(np.float32)
+    std = float(np.std(luma))
+    if luma.shape[0] < 2 or luma.shape[1] < 2:
+        hf = 0.0
+    else:
+        dx = float(np.mean(np.abs(luma[:, 1:] - luma[:, :-1])))
+        dy = float(np.mean(np.abs(luma[1:, :] - luma[:-1, :])))
+        hf = 0.5 * (dx + dy)
+    return {
+        "luma_std": std,
+        "luma_hf": hf,
+        "noise_hf_ratio": float(hf / max(std, 1.0e-6)),
+    }
+
+
+def _fal_sample_quality_is_usable(
+    input_image: np.ndarray,
+    target_image: np.ndarray,
+    *,
+    target_representation: str,
+    min_luma_std: float,
+    max_luma_hf: float,
+    max_noise_hf_ratio: float,
+) -> tuple[bool, dict[str, float]]:
+    input_stats = _fal_luma_quality_stats(_fal_hwc_to_luma_preview(input_image))
+    target_stats = _fal_luma_quality_stats(
+        _fal_target_to_luma_preview(target_image, target_representation)
+    )
+    stats = {
+        "input_luma_std": input_stats["luma_std"],
+        "input_luma_hf": input_stats["luma_hf"],
+        "input_noise_hf_ratio": input_stats["noise_hf_ratio"],
+        "target_luma_std": target_stats["luma_std"],
+        "target_luma_hf": target_stats["luma_hf"],
+        "target_noise_hf_ratio": target_stats["noise_hf_ratio"],
+    }
+    usable = (
+        input_stats["luma_std"] >= min_luma_std
+        and target_stats["luma_std"] >= min_luma_std
+        and input_stats["luma_hf"] <= max_luma_hf
+        and target_stats["luma_hf"] <= max_luma_hf
+        and input_stats["noise_hf_ratio"] <= max_noise_hf_ratio
+        and target_stats["noise_hf_ratio"] <= max_noise_hf_ratio
+    )
+    return usable, stats
+
+
+def _fal_tensor_to_input_hwc(tensor: torch.Tensor) -> np.ndarray:
+    frame = tensor.detach().float()
+    if frame.ndim == 4:
+        frame = frame[len(frame) // 2]
+    return frame.clamp(-1.0, 1.0).add(1.0).mul(0.5).cpu().numpy().transpose(1, 2, 0)
+
+
+def _fal_tensor_to_target_hwc(tensor: torch.Tensor) -> np.ndarray:
+    frame = tensor.detach().float()
+    if frame.ndim == 4:
+        frame = frame[len(frame) // 2]
+    return frame.cpu().numpy().transpose(1, 2, 0)
+
+
+def _fal_tensor_sample_quality_is_usable(
+    sample: dict[str, torch.Tensor | str],
+    dataset,
+) -> tuple[bool, dict[str, float]]:
+    return _fal_sample_quality_is_usable(
+        _fal_tensor_to_input_hwc(sample["input_sdr"]),
+        _fal_tensor_to_target_hwc(sample["target"]),
+        target_representation=dataset.target_representation,
+        min_luma_std=dataset.bad_sample_min_luma_std,
+        max_luma_hf=dataset.bad_sample_max_luma_hf,
+        max_noise_hf_ratio=dataset.bad_sample_max_noise_hf_ratio,
+    )
+
+
+def _fal_format_quality_stats(stats: dict[str, float]) -> str:
+    return " ".join(f"{key}={value:.4f}" for key, value in sorted(stats.items()))
 
 
 _FalBaseImageDataset = SeedVRHDRImageDataset
@@ -1642,7 +1833,9 @@ def _fal_load_hdr_source(
             f"Failed to load HDR source for {sample.sample_id} "
             f"(frame_index={frame_index}): {last_error}"
         ) from last_error
-    raise ValueError(f"Sample {sample.sample_id} does not provide an HDR source path/url")
+    raise ValueError(
+        f"Sample {sample.sample_id} does not provide an HDR source path/url"
+    )
 
 
 def _fal_load_cached_or_rendered_input(
@@ -1658,7 +1851,9 @@ def _fal_load_cached_or_rendered_input(
             f"Sample {sample.sample_id} is missing camera_response/exposure_ev required for SDR synthesis"
         )
     gamma = sample.gamma if sample.gamma is not None else 2.2
-    quantization_bits = sample.quantization_bits if sample.quantization_bits is not None else 8
+    quantization_bits = (
+        sample.quantization_bits if sample.quantization_bits is not None else 8
+    )
     cache_key = self._cache_identity(
         sample,
         purpose="rendered_input",
@@ -1931,7 +2126,9 @@ def _fal_video_dataset_getitem(self, index: int) -> dict[str, torch.Tensor | str
                 frame_index=frame_index,
             )
         else:
-            hdr, hdr_source_path = self._load_hdr_source(sample, frame_index=frame_index)
+            hdr, hdr_source_path = self._load_hdr_source(
+                sample, frame_index=frame_index
+            )
             input_image = self._load_cached_or_rendered_input(
                 sample,
                 hdr=hdr,
@@ -1967,7 +2164,9 @@ def _fal_video_dataset_getitem(self, index: int) -> dict[str, torch.Tensor | str
             )
         else:
             if hdr is None or hdr_source_path is None:
-                hdr, hdr_source_path = self._load_hdr_source(sample, frame_index=frame_index)
+                hdr, hdr_source_path = self._load_hdr_source(
+                    sample, frame_index=frame_index
+                )
             target_image = self._load_cached_or_compressed_target(
                 sample,
                 hdr=hdr,
@@ -2029,8 +2228,12 @@ def _fal_video_dataset_getitem(self, index: int) -> dict[str, torch.Tensor | str
 
 
 _SeedVRHDRDatasetBase._load_hdr_source = _fal_load_hdr_source
-_SeedVRHDRDatasetBase._load_cached_or_rendered_input = _fal_load_cached_or_rendered_input
-_SeedVRHDRDatasetBase._load_cached_or_compressed_target = _fal_load_cached_or_compressed_target
+_SeedVRHDRDatasetBase._load_cached_or_rendered_input = (
+    _fal_load_cached_or_rendered_input
+)
+_SeedVRHDRDatasetBase._load_cached_or_compressed_target = (
+    _fal_load_cached_or_compressed_target
+)
 _FalBaseImageDataset.__getitem__ = _fal_image_dataset_getitem
 _FalBaseVideoDataset.__getitem__ = _fal_video_dataset_getitem
 
@@ -2045,6 +2248,11 @@ class SeedVRHDRImageDataset(_FalBaseImageDataset):
         jpeg_roundtrip_prob: float = 0.0,
         jpeg_roundtrip_min_quality: int = 75,
         jpeg_roundtrip_max_quality: int = 95,
+        filter_bad_samples: bool = True,
+        bad_sample_max_retries: int = 32,
+        bad_sample_min_luma_std: float = 0.015,
+        bad_sample_max_luma_hf: float = 0.18,
+        bad_sample_max_noise_hf_ratio: float = 0.95,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -2054,6 +2262,11 @@ class SeedVRHDRImageDataset(_FalBaseImageDataset):
         self.jpeg_roundtrip_prob = jpeg_roundtrip_prob
         self.jpeg_roundtrip_min_quality = jpeg_roundtrip_min_quality
         self.jpeg_roundtrip_max_quality = jpeg_roundtrip_max_quality
+        self.filter_bad_samples = filter_bad_samples
+        self.bad_sample_max_retries = bad_sample_max_retries
+        self.bad_sample_min_luma_std = bad_sample_min_luma_std
+        self.bad_sample_max_luma_hf = bad_sample_max_luma_hf
+        self.bad_sample_max_noise_hf_ratio = bad_sample_max_noise_hf_ratio
 
     def _resolve_direct_target_path(self, sample: ManifestSample) -> Path | None:
         if self.target_representation in {"pq_1000", "logc3"}:
@@ -2090,7 +2303,7 @@ class SeedVRHDRImageDataset(_FalBaseImageDataset):
             return None
         return super()._resolve_direct_target_path(sample)
 
-    def __getitem__(self, index: int) -> dict[str, torch.Tensor | str]:
+    def _load_augmented_sample(self, index: int) -> dict[str, torch.Tensor | str]:
         sample = super().__getitem__(index)
         if not self.random_crop:
             return sample
@@ -2114,6 +2327,40 @@ class SeedVRHDRImageDataset(_FalBaseImageDataset):
         sample["target"] = target_tensor
         return sample
 
+    def __getitem__(self, index: int) -> dict[str, torch.Tensor | str]:
+        if not self.filter_bad_samples:
+            return self._load_augmented_sample(index)
+        attempts = max(1, int(self.bad_sample_max_retries))
+        last_sample: dict[str, torch.Tensor | str] | None = None
+        last_stats: dict[str, float] | None = None
+        for attempt in range(attempts):
+            candidate_index = (index + attempt) % len(self.samples)
+            sample = self._load_augmented_sample(candidate_index)
+            usable, stats = _fal_tensor_sample_quality_is_usable(sample, self)
+            if usable:
+                if attempt > 0:
+                    print(
+                        "[seedvr-hdr][stage=dataset_quality_filter] "
+                        f"index={index} replacement_index={candidate_index} "
+                        f"attempt={attempt + 1}/{attempts}"
+                    )
+                return sample
+            last_sample = sample
+            last_stats = stats
+            print(
+                "[seedvr-hdr][stage=dataset_quality_filter] rejected "
+                f"index={candidate_index} sample={sample.get('sample_id', '')} "
+                f"{_fal_format_quality_stats(stats)}"
+            )
+        if last_sample is None:
+            raise RuntimeError(f"Failed to load any dataset sample for index={index}")
+        print(
+            "[seedvr-hdr][stage=dataset_quality_filter] warning using rejected sample "
+            f"index={index} after {attempts} attempts "
+            f"{_fal_format_quality_stats(last_stats or {})}"
+        )
+        return last_sample
+
 
 class SeedVRHDRVideoDataset(_FalBaseVideoDataset):
     def __init__(
@@ -2125,6 +2372,11 @@ class SeedVRHDRVideoDataset(_FalBaseVideoDataset):
         jpeg_roundtrip_prob: float = 0.0,
         jpeg_roundtrip_min_quality: int = 75,
         jpeg_roundtrip_max_quality: int = 95,
+        filter_bad_samples: bool = True,
+        bad_sample_max_retries: int = 32,
+        bad_sample_min_luma_std: float = 0.015,
+        bad_sample_max_luma_hf: float = 0.18,
+        bad_sample_max_noise_hf_ratio: float = 0.95,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -2134,8 +2386,15 @@ class SeedVRHDRVideoDataset(_FalBaseVideoDataset):
         self.jpeg_roundtrip_prob = jpeg_roundtrip_prob
         self.jpeg_roundtrip_min_quality = jpeg_roundtrip_min_quality
         self.jpeg_roundtrip_max_quality = jpeg_roundtrip_max_quality
+        self.filter_bad_samples = filter_bad_samples
+        self.bad_sample_max_retries = bad_sample_max_retries
+        self.bad_sample_min_luma_std = bad_sample_min_luma_std
+        self.bad_sample_max_luma_hf = bad_sample_max_luma_hf
+        self.bad_sample_max_noise_hf_ratio = bad_sample_max_noise_hf_ratio
 
-    def _direct_target_pairs(self, sample: ManifestSample) -> list[tuple[str | None, str | None]]:
+    def _direct_target_pairs(
+        self, sample: ManifestSample
+    ) -> list[tuple[str | None, str | None]]:
         if self.target_representation in {"pq_1000", "logc3"}:
             for pairs in [
                 self._pair_list(sample, "target_hdr_npy"),
@@ -2160,7 +2419,7 @@ class SeedVRHDRVideoDataset(_FalBaseVideoDataset):
             return []
         return super()._direct_target_pairs(sample)
 
-    def __getitem__(self, index: int) -> dict[str, torch.Tensor | str]:
+    def _load_augmented_sample(self, index: int) -> dict[str, torch.Tensor | str]:
         sample = super().__getitem__(index)
         if not self.random_crop:
             return sample
@@ -2183,3 +2442,37 @@ class SeedVRHDRVideoDataset(_FalBaseVideoDataset):
         sample["input_sdr"] = input_tensor
         sample["target"] = target_tensor
         return sample
+
+    def __getitem__(self, index: int) -> dict[str, torch.Tensor | str]:
+        if not self.filter_bad_samples:
+            return self._load_augmented_sample(index)
+        attempts = max(1, int(self.bad_sample_max_retries))
+        last_sample: dict[str, torch.Tensor | str] | None = None
+        last_stats: dict[str, float] | None = None
+        for attempt in range(attempts):
+            candidate_index = (index + attempt) % len(self.samples)
+            sample = self._load_augmented_sample(candidate_index)
+            usable, stats = _fal_tensor_sample_quality_is_usable(sample, self)
+            if usable:
+                if attempt > 0:
+                    print(
+                        "[seedvr-hdr][stage=dataset_quality_filter] "
+                        f"index={index} replacement_index={candidate_index} "
+                        f"attempt={attempt + 1}/{attempts}"
+                    )
+                return sample
+            last_sample = sample
+            last_stats = stats
+            print(
+                "[seedvr-hdr][stage=dataset_quality_filter] rejected "
+                f"index={candidate_index} sample={sample.get('sample_id', '')} "
+                f"{_fal_format_quality_stats(stats)}"
+            )
+        if last_sample is None:
+            raise RuntimeError(f"Failed to load any dataset sample for index={index}")
+        print(
+            "[seedvr-hdr][stage=dataset_quality_filter] warning using rejected sample "
+            f"index={index} after {attempts} attempts "
+            f"{_fal_format_quality_stats(last_stats or {})}"
+        )
+        return last_sample

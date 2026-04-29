@@ -40,7 +40,13 @@ BASE_MODEL_SPECS: dict[str, CheckpointSpec] = {
     ),
 }
 
-SUPPORTED_TARGET_REPRESENTATIONS = {"raw_hdr", "mu_law_mu5000", "log_hdr", "pq_1000", "logc3"}
+SUPPORTED_TARGET_REPRESENTATIONS = {
+    "raw_hdr",
+    "mu_law_mu5000",
+    "log_hdr",
+    "pq_1000",
+    "logc3",
+}
 
 
 @dataclass
@@ -171,6 +177,11 @@ class TrainingConfig:
     validation_preview_min_luma_std: float = 0.015
     validation_preview_max_luma_hf: float = 0.18
     validation_preview_max_noise_hf_ratio: float = 0.95
+    filter_bad_samples: bool = True
+    bad_sample_max_retries: int = 32
+    bad_sample_min_luma_std: float = 0.015
+    bad_sample_max_luma_hf: float = 0.18
+    bad_sample_max_noise_hf_ratio: float = 0.95
     extra_validation_datasets: list[ExtraValidationConfig] = field(default_factory=list)
 
     def __post_init__(self) -> None:
@@ -193,7 +204,11 @@ class TrainingConfig:
         with open(path) as file:
             data = json.load(file)
         data["extra_validation_datasets"] = [
-            item if isinstance(item, ExtraValidationConfig) else ExtraValidationConfig(**item)
+            (
+                item
+                if isinstance(item, ExtraValidationConfig)
+                else ExtraValidationConfig(**item)
+            )
             for item in data.get("extra_validation_datasets", [])
         ]
         return cls(**data)
