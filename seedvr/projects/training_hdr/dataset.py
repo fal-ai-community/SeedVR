@@ -1261,6 +1261,26 @@ def _fal_default_suffix(value: str, fallback: str = ".exr") -> str:
     return suffix or fallback
 
 
+def _fal_path_for_inference(value: str) -> Path:
+    parsed_path = urllib.parse.urlparse(value).path if "://" in value else value
+    return Path(parsed_path)
+
+
+def _fal_can_use_compressed_target_for_transcode(
+    sample: ManifestSample,
+    pair: tuple[str | None, str | None],
+    target_representation: str,
+) -> bool:
+    raw_path, raw_url = pair
+    if not raw_path and not raw_url:
+        return False
+    declared = sample.compressed_target_space
+    if declared in {"mu_law_mu5000", target_representation}:
+        return True
+    value = raw_path or raw_url or ""
+    return _fal_infer_target_representation_from_path(_fal_path_for_inference(value)) is not None
+
+
 def _read_target_for_representation(path: Path, target_representation: str) -> np.ndarray:
     if path.suffix.lower() == ".npy":
         encoded = _read_target_array(path)
@@ -1973,14 +1993,13 @@ class SeedVRHDRImageDataset(_FalBaseImageDataset):
                 self._optional_field_pair(sample, "target_mu_law"),
                 self._optional_field_pair(sample, "target_log_hdr"),
             ]
-            if sample.compressed_target_space in {
-                "raw_hdr",
-                "mu_law_mu5000",
-                "log_hdr",
-                "pq_1000",
-                "logc3",
-            }:
-                candidates.append(self._optional_field_pair(sample, "compressed_target"))
+            compressed_pair = self._optional_field_pair(sample, "compressed_target")
+            if _fal_can_use_compressed_target_for_transcode(
+                sample,
+                compressed_pair,
+                self.target_representation,
+            ):
+                candidates.append(compressed_pair)
             for raw_path, raw_url in candidates:
                 if raw_path or raw_url:
                     suffix_source = raw_path or raw_url or ""
@@ -2054,16 +2073,17 @@ class SeedVRHDRVideoDataset(_FalBaseVideoDataset):
             ]:
                 if pairs:
                     return pairs
-            if sample.compressed_target_space in {
-                "raw_hdr",
-                "mu_law_mu5000",
-                "log_hdr",
-                "pq_1000",
-                "logc3",
-            }:
-                pairs = self._pair_list(sample, "compressed_target")
-                if pairs:
-                    return pairs
+            pairs = [
+                pair
+                for pair in self._pair_list(sample, "compressed_target")
+                if _fal_can_use_compressed_target_for_transcode(
+                    sample,
+                    pair,
+                    self.target_representation,
+                )
+            ]
+            if pairs:
+                return pairs
             return []
         return super()._direct_target_pairs(sample)
 
