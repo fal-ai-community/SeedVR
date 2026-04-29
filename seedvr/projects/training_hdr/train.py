@@ -1454,7 +1454,7 @@ def build_validation_dataloader(
         phase_jitter=False,
         size_jitter_steps=0,
         jpeg_roundtrip_prob=0.0,
-        filter_bad_samples=config.filter_bad_samples,
+        filter_bad_samples=False,
         bad_sample_max_retries=config.bad_sample_max_retries,
         bad_sample_min_luma_std=config.bad_sample_min_luma_std,
         bad_sample_max_luma_hf=config.bad_sample_max_luma_hf,
