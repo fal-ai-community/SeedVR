@@ -1673,10 +1673,12 @@ def maybe_resume_training(
     )
     resumed_step = int(checkpoint.get("step", 0))
     if resumed_step >= config.steps:
-        raise ValueError(
+        print(
             f"Resume checkpoint is already at step {resumed_step}, "
-            f"which is not below requested steps={config.steps}."
+            f"which is not below requested steps={config.steps}; writing result "
+            "manifest without additional training."
         )
+        return resumed_step + 1, checkpoint.get("metrics") or {}
     resumed_metrics = checkpoint.get("metrics") or {}
     print(
         f"[seedvr-hdr] resumed from checkpoint={config.resume_from_checkpoint} "
@@ -1779,6 +1781,27 @@ def main() -> None:
         torch.cuda.reset_peak_memory_stats(device)
     if config.debug_cuda_memory:
         log_cuda_memory("train_start", device)
+
+    if start_step > config.steps and config.resume_from_checkpoint:
+        final_metrics = dict(resumed_metrics)
+        write_result_manifest(
+            path=args.result_manifest,
+            checkpoint_path=Path(config.resume_from_checkpoint),
+            config_path=config_copy_path,
+            validation_preview_paths=[],
+            metrics=final_metrics,
+            extra={"completed_from_resume": True},
+        )
+        if wandb_run is not None:
+            try:
+                wandb.log(final_metrics)
+                wandb.finish()
+            except Exception as exc:
+                print(
+                    "[seedvr-hdr] W&B finalization failed after completed "
+                    f"resume manifest write: {exc}"
+                )
+        return
 
     for step in range(start_step, config.steps + 1):
         step_started_at = perf_counter()
