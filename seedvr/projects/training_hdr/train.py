@@ -535,6 +535,24 @@ def single_sample_to_batch(sample: dict[str, Any]) -> dict[str, Any]:
     return batch
 
 
+def aggregate_metric_rows(
+    rows: list[dict[str, float]],
+    *,
+    prefix: str,
+) -> dict[str, float]:
+    metrics: dict[str, float] = {}
+    metric_names = sorted(set().union(*(set(row) for row in rows)))
+    for name in metric_names:
+        values = [float(row[name]) for row in rows if name in row]
+        finite_values = [value for value in values if np.isfinite(value)]
+        if finite_values:
+            metrics[f"{prefix}_{name}"] = float(np.mean(finite_values))
+        invalid_count = len(rows) - len(finite_values)
+        if invalid_count:
+            metrics[f"{prefix}_{name}_invalid_count"] = float(invalid_count)
+    return metrics
+
+
 def evaluate_validation_batch(
     *,
     config: TrainingConfig,
@@ -1464,13 +1482,9 @@ def run_validation(
         f"{metric_prefix}_denoise_loss": float(np.mean(losses)) if losses else 0.0,
     }
     if hdr_metric_rows:
-        metric_names = sorted(set.intersection(*(set(row) for row in hdr_metric_rows)))
-        for name in metric_names:
-            metrics[f"{metric_prefix}_{name}"] = float(np.mean([row[name] for row in hdr_metric_rows]))
+        metrics.update(aggregate_metric_rows(hdr_metric_rows, prefix=metric_prefix))
     if sampler_metric_rows:
-        metric_names = sorted(set.intersection(*(set(row) for row in sampler_metric_rows)))
-        for name in metric_names:
-            metrics[f"{sampler_metric_prefix}_{name}"] = float(np.mean([row[name] for row in sampler_metric_rows]))
+        metrics.update(aggregate_metric_rows(sampler_metric_rows, prefix=sampler_metric_prefix))
     if config.debug_cuda_memory:
         log_cuda_memory("validation_end", device, step)
         if device.type == "cuda":

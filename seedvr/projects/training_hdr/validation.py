@@ -19,6 +19,13 @@ _CVVDP_UNAVAILABLE = False
 # Highlight-specific validation MAE was constant on this dataset, so do not log it.
 
 
+def _finite_tensor(tensor: torch.Tensor, *, min_value: float | None = None) -> torch.Tensor:
+    tensor = torch.nan_to_num(tensor.float(), nan=0.0, posinf=PU21_L_MAX, neginf=0.0)
+    if min_value is not None:
+        tensor = torch.clamp(tensor, min=min_value)
+    return tensor
+
+
 def _input_tensor_to_uint8_image(tensor: torch.Tensor) -> np.ndarray:
     array = tensor.detach().float().clamp(-1.0, 1.0).add(1.0).mul(127.5)
     array = array.round().to(torch.uint8).cpu().numpy()
@@ -58,14 +65,14 @@ def linear_hdr_from_target_tensor(
     tensor: torch.Tensor,
     target_representation: str,
 ) -> torch.Tensor:
-    tensor = tensor.detach().float()
+    tensor = _finite_tensor(tensor.detach())
     if target_representation == "raw_hdr":
         return torch.clamp(tensor, min=0.0)
     if target_representation == "mu_law_mu5000":
         normalized = tensor.clamp(-1.0, 1.0).add(1.0).mul(0.5)
-        return torch.expm1(normalized * np.log1p(MU_LAW_MU)) / MU_LAW_MU
+        return _finite_tensor(torch.expm1(normalized * np.log1p(MU_LAW_MU)) / MU_LAW_MU, min_value=0.0)
     if target_representation == "log_hdr":
-        return torch.clamp(torch.exp(tensor) - LOG_HDR_EPS, min=0.0)
+        return _finite_tensor(torch.exp(tensor) - LOG_HDR_EPS, min_value=0.0)
     if target_representation == "pq_1000":
         normalized = tensor.clamp(-1.0, 1.0).add(1.0).mul(0.5)
         m1 = 2610.0 / 16384.0
@@ -77,7 +84,7 @@ def linear_hdr_from_target_tensor(
         numerator = torch.clamp(powered - c1, min=0.0)
         denominator = torch.clamp(c2 - c3 * powered, min=1.0e-8)
         nits = torch.pow(numerator / denominator, 1.0 / m1) * 10000.0
-        return nits / 1000.0
+        return _finite_tensor(nits / 1000.0, min_value=0.0)
     if target_representation == "logc3":
         normalized = tensor.clamp(-1.0, 1.0).add(1.0).mul(0.5)
         cut = 0.010591
@@ -93,12 +100,12 @@ def linear_hdr_from_target_tensor(
             (torch.pow(torch.tensor(10.0, device=normalized.device), (normalized - d) / c) - b) / a,
             (normalized - f) / e,
         )
-        return torch.clamp(linear, min=0.0)
+        return _finite_tensor(linear, min_value=0.0)
     raise ValueError(f"Unsupported target_representation: {target_representation}")
 
 
 def _robust_tonemap(linear_hdr: torch.Tensor) -> torch.Tensor:
-    linear_hdr = torch.clamp(linear_hdr, min=0.0)
+    linear_hdr = _finite_tensor(linear_hdr, min_value=0.0)
     flat = linear_hdr.reshape(-1)
     if flat.numel() == 0:
         return torch.zeros_like(linear_hdr)
@@ -125,7 +132,8 @@ def _luminance(rgb: torch.Tensor) -> torch.Tensor:
 
 
 def _linear_hdr_to_absolute_nits(linear_hdr: torch.Tensor) -> torch.Tensor:
-    return torch.clamp(linear_hdr.float() * PU21_PEAK_NITS, min=PU21_L_MIN, max=PU21_L_MAX)
+    linear_hdr = _finite_tensor(linear_hdr, min_value=0.0)
+    return torch.clamp(linear_hdr * PU21_PEAK_NITS, min=PU21_L_MIN, max=PU21_L_MAX)
 
 
 def _pu21_encode(luminance_nits: torch.Tensor) -> torch.Tensor:
@@ -141,20 +149,37 @@ def _pu21_encode(luminance_nits: torch.Tensor) -> torch.Tensor:
             596.3148142,
         ]
     )
-    y = torch.clamp(luminance_nits, PU21_L_MIN, PU21_L_MAX)
+    y = torch.clamp(
+        torch.nan_to_num(luminance_nits.float(), nan=PU21_L_MIN, posinf=PU21_L_MAX, neginf=PU21_L_MIN),
+        PU21_L_MIN,
+        PU21_L_MAX,
+    )
     encoded = p[6] * (((p[0] + p[1] * y.pow(p[3])) / (1.0 + p[2] * y.pow(p[3]))).pow(p[4]) - p[5])
-    return torch.clamp(encoded, min=0.0)
+    return torch.clamp(torch.nan_to_num(encoded, nan=0.0, posinf=1023.0, neginf=0.0), min=0.0)
 
 
-def _pu21_psnr(predicted_linear: torch.Tensor, target_linear: torch.Tensor) -> float:
+def _finite_mse(prediction: torch.Tensor, target: torch.Tensor) -> float | None:
+    diff = prediction.float() - target.float()
+    valid = torch.isfinite(diff)
+    if not bool(valid.any().item()):
+        return None
+    return float(torch.mean(diff[valid] ** 2).item())
+
+
+def _psnr_from_mse(mse: float | None, data_range: float) -> float | None:
+    if mse is None or not np.isfinite(mse):
+        return None
+    if mse <= 1.0e-12:
+        return float("inf")
+    return float(10.0 * np.log10((data_range**2) / mse))
+
+
+def _pu21_psnr(predicted_linear: torch.Tensor, target_linear: torch.Tensor) -> float | None:
     pred_luminance = _linear_hdr_to_absolute_nits(_luminance(predicted_linear))
     target_luminance = _linear_hdr_to_absolute_nits(_luminance(target_linear))
     pred_pu = _pu21_encode(pred_luminance)
     target_pu = _pu21_encode(target_luminance)
-    mse = torch.mean((pred_pu - target_pu) ** 2).item()
-    if mse <= 1.0e-12:
-        return float("inf")
-    return float(10.0 * np.log10((1023.0**2) / mse))
+    return _psnr_from_mse(_finite_mse(pred_pu, target_pu), data_range=1023.0)
 
 
 def _lpips_distance(predicted_linear: torch.Tensor, target_linear: torch.Tensor) -> float | None:
@@ -249,10 +274,8 @@ def save_triptych(
 
 
 def _psnr(prediction: torch.Tensor, target: torch.Tensor, data_range: float = 1.0) -> float:
-    mse = torch.mean((prediction - target) ** 2).item()
-    if mse <= 1.0e-12:
-        return float("inf")
-    return float(10.0 * np.log10((data_range**2) / mse))
+    psnr = _psnr_from_mse(_finite_mse(prediction, target), data_range=data_range)
+    return 0.0 if psnr is None else psnr
 
 
 def compute_hdr_metrics(
@@ -306,8 +329,10 @@ def _compute_hdr_metrics_chw(
         "hdr_log_mae": float(log_diff.mean().item()),
         "hdr_log_psnr": _psnr(predicted_log, target_log, data_range=max(1.0, float(target_log.max().item()))),
         "tonemap_psnr": _psnr(preview_prediction, preview_target, data_range=1.0),
-        "pu21_psnr": _pu21_psnr(predicted_linear, target_linear),
     }
+    pu21_psnr = _pu21_psnr(predicted_linear, target_linear)
+    if pu21_psnr is not None:
+        metrics["pu21_psnr"] = pu21_psnr
     lpips_value = _lpips_distance(predicted_linear, target_linear)
     if lpips_value is not None:
         metrics["lpips"] = lpips_value
