@@ -3,8 +3,11 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import os
 import random
 import re
+import time
+import uuid
 from pathlib import Path
 from time import perf_counter
 from typing import Any
@@ -338,14 +341,37 @@ def maybe_init_wandb(config: TrainingConfig) -> Any | None:
     if wandb is None:
         print("[seedvr-hdr] wandb requested but not installed; continuing without it.")
         return None
-    run = wandb.init(
-        project=config.wandb_project,
-        entity=config.wandb_entity,
-        name=config.wandb_run_name or config.experiment_name,
-        tags=config.wandb_tags or [],
-        config=config.to_dict(),
-    )
-    return run
+    wandb_dir = Path(config.output_dir) / "wandb"
+    wandb_dir.mkdir(parents=True, exist_ok=True)
+    run_id = f"{re.sub(r'[^A-Za-z0-9_-]+', '-', config.experiment_name)[:96]}-{uuid.uuid4().hex[:8]}"
+    os.environ.setdefault("WANDB_START_METHOD", "thread")
+    os.environ.setdefault("WANDB_INIT_TIMEOUT", "300")
+    for attempt in range(1, 4):
+        try:
+            return wandb.init(
+                project=config.wandb_project,
+                entity=config.wandb_entity,
+                name=config.wandb_run_name or config.experiment_name,
+                id=run_id,
+                resume="never",
+                reinit=True,
+                dir=str(wandb_dir),
+                tags=config.wandb_tags or [],
+                config=config.to_dict(),
+            )
+        except Exception as exc:  # pragma: no cover - network/runtime fallback
+            print(
+                "[seedvr-hdr] wandb init failed "
+                f"attempt={attempt}/3 error={type(exc).__name__}: {exc}"
+            )
+            try:
+                wandb.finish(exit_code=1, quiet=True)
+            except Exception:
+                pass
+            if attempt < 3:
+                time.sleep(5 * attempt)
+    print("[seedvr-hdr] disabling wandb for this run after init failures.")
+    return None
 
 
 def build_wandb_train_metrics(
