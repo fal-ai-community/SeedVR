@@ -38,7 +38,11 @@ from seedvr.projects.training_hdr.losses import (
     fft_high_frequency_loss,
     total_variation_map,
 )
-from seedvr.projects.training_hdr.validation import compute_hdr_metrics, save_triptych
+from seedvr.projects.training_hdr.validation import (
+    compute_hdr_metrics,
+    save_dataset_sample_preview,
+    save_triptych,
+)
 from seedvr.projects.video_diffusion_sr.infer import VideoDiffusionInfer
 
 try:
@@ -466,6 +470,58 @@ def log_validation_previews_to_wandb(
         for idx, path in enumerate(preview_paths)
     ]
     wandb.log({"step": step, "validation_previews": images})
+
+
+def log_dataset_samples_to_wandb(
+    wandb_run: Any | None,
+    config: TrainingConfig,
+    dataset: Dataset,
+    *,
+    split_name: str,
+    step: int = 0,
+) -> None:
+    if (
+        wandb_run is None
+        or wandb is None
+        or config.wandb_dataset_sample_count <= 0
+        or len(dataset) == 0
+    ):
+        return
+    sample_dir = config.output_path / "dataset_samples" / split_name
+    sample_paths: list[Path] = []
+    captions: list[str] = []
+    indices = build_preview_indices(
+        dataset_size=len(dataset),
+        num_previews=config.wandb_dataset_sample_count,
+        step=step,
+        validate_every=config.validate_every,
+    )
+    for preview_index, sample_index in enumerate(indices):
+        sample = dataset[sample_index]
+        preview_path = save_dataset_sample_preview(
+            sample_dir / f"{split_name}_{preview_index:02d}_idx_{sample_index:06d}.png",
+            sample["input_sdr"],
+            sample["target"],
+            config.target_representation,
+        )
+        sample_paths.append(preview_path)
+        captions.append(
+            " ".join(
+                part
+                for part in [
+                    f"split={split_name}",
+                    f"index={sample_index}",
+                    f"scene={sample.get('scene_id', '')}",
+                    f"sample={sample.get('sample_id', '')}",
+                ]
+                if part
+            )
+        )
+    images = [
+        wandb.Image(str(path), caption=captions[index])
+        for index, path in enumerate(sample_paths)
+    ]
+    wandb.log({"step": step, f"dataset_samples/{split_name}": images})
 
 
 def build_preview_indices(
@@ -1621,6 +1677,20 @@ def main() -> None:
     runtime_info["resume_from_checkpoint"] = config.resume_from_checkpoint
     runtime_info["start_step"] = start_step
     wandb_run = maybe_init_wandb(config)
+    log_dataset_samples_to_wandb(
+        wandb_run,
+        config,
+        train_loader.dataset,
+        split_name="train",
+        step=start_step - 1,
+    )
+    log_dataset_samples_to_wandb(
+        wandb_run,
+        config,
+        val_loader.dataset,
+        split_name="val",
+        step=start_step - 1,
+    )
     lpips_model = build_lpips_model(config, device)
 
     text_pos_embeds, text_pos_shapes = positive_embeddings

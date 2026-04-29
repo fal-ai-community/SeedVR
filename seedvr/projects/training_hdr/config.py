@@ -90,6 +90,7 @@ class TrainingConfig:
     wandb_entity: str | None = None
     wandb_run_name: str | None = None
     wandb_tags: list[str] | None = None
+    wandb_dataset_sample_count: int = 0
     use_torch_compile: bool = True
     torch_compile_mode: str = "max-autotune"
     torch_compile_fullgraph: bool = False

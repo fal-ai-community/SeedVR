@@ -273,6 +273,29 @@ def save_triptych(
     return output_path
 
 
+def save_dataset_sample_preview(
+    output_path: str | Path,
+    input_image: torch.Tensor,
+    target_image: torch.Tensor,
+    target_representation: str,
+) -> Path:
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    input_image = _select_preview_frame(input_image)
+    target_image = _select_preview_frame(target_image)
+    target_linear = linear_hdr_from_target_tensor(target_image, target_representation)
+    panels = [
+        _input_tensor_to_uint8_image(input_image),
+        _preview_uint8_from_linear_hdr(target_linear),
+    ]
+    panels = _add_panel_labels(panels, ["input", "ground_truth"])
+    canvas = np.concatenate(panels, axis=1)
+    canvas_bgr = cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR)
+    cv2.imwrite(str(output_path), canvas_bgr)
+    return output_path
+
+
 def _psnr(prediction: torch.Tensor, target: torch.Tensor, data_range: float = 1.0) -> float:
     psnr = _psnr_from_mse(_finite_mse(prediction, target), data_range=data_range)
     return 0.0 if psnr is None else psnr
