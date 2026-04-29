@@ -754,17 +754,6 @@ def build_quality_preview_indices(
                     ),
                 )
             )
-    if len(selected) < count:
-        for index in build_preview_indices(
-            dataset_size=dataset_size,
-            num_previews=count,
-            step=step,
-            validate_every=validate_every,
-        ):
-            if index not in selected:
-                selected.append(index)
-                if len(selected) >= count:
-                    break
     if rejected:
         preview = "; ".join(f"idx={index} {reason}" for index, reason in rejected[:5])
         suffix = "" if len(rejected) <= 5 else f"; +{len(rejected) - 5} more"
@@ -1459,6 +1448,10 @@ def build_validation_dataloader(
         bad_sample_min_luma_std=config.bad_sample_min_luma_std,
         bad_sample_max_luma_hf=config.bad_sample_max_luma_hf,
         bad_sample_max_noise_hf_ratio=config.bad_sample_max_noise_hf_ratio,
+        use_quality_cache=False,
+        quality_cache_root=config.quality_cache_root,
+        quality_cache_rebuild=False,
+        quality_cache_build_on_init=False,
     )
     worker_count = min(2, config.num_workers)
     return DataLoader(
@@ -1522,6 +1515,10 @@ def build_dataloaders(config: TrainingConfig) -> tuple[DataLoader, DataLoader]:
         bad_sample_min_luma_std=config.bad_sample_min_luma_std,
         bad_sample_max_luma_hf=config.bad_sample_max_luma_hf,
         bad_sample_max_noise_hf_ratio=config.bad_sample_max_noise_hf_ratio,
+        use_quality_cache=config.use_quality_cache,
+        quality_cache_root=config.quality_cache_root,
+        quality_cache_rebuild=config.quality_cache_rebuild,
+        quality_cache_build_on_init=config.quality_cache_build_on_init,
     )
     train_loader = DataLoader(
         train_dataset,

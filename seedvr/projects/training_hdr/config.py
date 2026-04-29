@@ -182,6 +182,10 @@ class TrainingConfig:
     bad_sample_min_luma_std: float = 0.015
     bad_sample_max_luma_hf: float = 0.18
     bad_sample_max_noise_hf_ratio: float = 0.95
+    use_quality_cache: bool = True
+    quality_cache_root: str = "/data/seedvr_hdr_quality_cache"
+    quality_cache_rebuild: bool = False
+    quality_cache_build_on_init: bool = True
     extra_validation_datasets: list[ExtraValidationConfig] = field(default_factory=list)
 
     def __post_init__(self) -> None:

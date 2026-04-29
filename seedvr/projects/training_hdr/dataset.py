@@ -558,6 +558,7 @@ class _SeedVRHDRDatasetBase(Dataset):
         cache_compressed_targets: bool,
     ) -> None:
         self.dataset_root = Path(dataset_root)
+        self.manifest_path = Path(manifest_path)
         self.samples = load_manifest(manifest_path)
         self.train_height = train_height
         self.train_width = train_width
@@ -1704,6 +1705,158 @@ def _fal_should_log_quality_rejection(attempt: int, attempts: int) -> bool:
     return attempt == 0 or attempt + 1 == attempts or (attempt + 1) % 16 == 0
 
 
+def _fal_manifest_digest(path: Path) -> str:
+    digest = hashlib.sha1()
+    with open(path, "rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _fal_quality_cache_config(dataset) -> dict[str, Any]:
+    return {
+        "version": 2,
+        "manifest_digest": _fal_manifest_digest(dataset.manifest_path),
+        "sample_count": len(dataset.samples),
+        "target_representation": dataset.target_representation,
+        "train_height": dataset.train_height,
+        "train_width": dataset.train_width,
+        "random_crop": bool(dataset.random_crop),
+        "seed": int(dataset.seed),
+        "phase_jitter": bool(getattr(dataset, "phase_jitter", False)),
+        "phase_jitter_max_pixels": int(getattr(dataset, "phase_jitter_max_pixels", 0)),
+        "size_jitter_steps": int(getattr(dataset, "size_jitter_steps", 0)),
+        "jpeg_roundtrip_prob": float(getattr(dataset, "jpeg_roundtrip_prob", 0.0)),
+        "jpeg_roundtrip_min_quality": int(
+            getattr(dataset, "jpeg_roundtrip_min_quality", 0)
+        ),
+        "jpeg_roundtrip_max_quality": int(
+            getattr(dataset, "jpeg_roundtrip_max_quality", 0)
+        ),
+        "bad_sample_min_luma_std": float(dataset.bad_sample_min_luma_std),
+        "bad_sample_max_luma_hf": float(dataset.bad_sample_max_luma_hf),
+        "bad_sample_max_noise_hf_ratio": float(dataset.bad_sample_max_noise_hf_ratio),
+    }
+
+
+def _fal_quality_cache_path(dataset) -> Path:
+    root = Path(dataset.quality_cache_root)
+    config_blob = json.dumps(_fal_quality_cache_config(dataset), sort_keys=True)
+    cache_key = _sha1_text(config_blob)
+    stem = dataset.manifest_path.stem.replace("/", "_")
+    return root / cache_key[:2] / f"{stem}-{cache_key}.json"
+
+
+def _fal_load_quality_cache(dataset) -> bool:
+    if not dataset.use_quality_cache:
+        return False
+    path = _fal_quality_cache_path(dataset)
+    if dataset.quality_cache_rebuild or not path.exists():
+        return False
+    with open(path) as file:
+        payload = json.load(file)
+    expected = _fal_quality_cache_config(dataset)
+    if payload.get("config") != expected:
+        return False
+    good_indices = [int(index) for index in payload.get("good_indices", [])]
+    dataset.quality_cache_path = path
+    dataset.quality_good_indices = good_indices
+    dataset.quality_good_index_set = set(good_indices)
+    dataset.quality_bad_count = int(payload.get("bad_count", 0))
+    print(
+        "[seedvr-hdr][stage=dataset_quality_cache] loaded "
+        f"path={path} good={len(good_indices)} bad={dataset.quality_bad_count}"
+    )
+    return bool(good_indices)
+
+
+def _fal_write_quality_cache(dataset, path: Path) -> None:
+    good_indices: list[int] = []
+    entries: list[dict[str, Any]] = []
+    start = time.monotonic()
+    for index in range(len(dataset.samples)):
+        sample_id = ""
+        try:
+            sample = dataset._load_augmented_sample(index)
+            sample_id = str(sample.get("sample_id", ""))
+            usable, stats = _fal_tensor_sample_quality_is_usable(sample, dataset)
+            error = None
+        except Exception as exc:
+            usable = False
+            stats = {}
+            error = f"{type(exc).__name__}: {exc}"
+            sample_id = getattr(dataset.samples[index], "sample_id", "")
+        if usable:
+            good_indices.append(index)
+        entries.append(
+            {
+                "index": index,
+                "sample_id": sample_id,
+                "usable": bool(usable),
+                "stats": stats,
+                "error": error,
+            }
+        )
+        if index > 0 and index % 1000 == 0:
+            print(
+                "[seedvr-hdr][stage=dataset_quality_cache] building "
+                f"path={path} checked={index}/{len(dataset.samples)} "
+                f"good={len(good_indices)}"
+            )
+    payload = {
+        "config": _fal_quality_cache_config(dataset),
+        "created_at_unix": time.time(),
+        "duration_seconds": time.monotonic() - start,
+        "good_indices": good_indices,
+        "bad_count": len(dataset.samples) - len(good_indices),
+        "entries": entries,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="w", dir=path.parent, suffix=".json", delete=False
+    ) as tmp_file:
+        tmp_path = Path(tmp_file.name)
+        json.dump(payload, tmp_file)
+    try:
+        os.replace(tmp_path, path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+
+def _fal_prepare_quality_cache(dataset) -> None:
+    dataset.quality_cache_path = None
+    dataset.quality_good_indices = []
+    dataset.quality_good_index_set = set()
+    dataset.quality_bad_count = 0
+    if not dataset.use_quality_cache or not dataset.quality_cache_build_on_init:
+        return
+    path = _fal_quality_cache_path(dataset)
+    if _fal_load_quality_cache(dataset):
+        return
+    lock_path = path.with_suffix(".lock")
+    with _file_lock(lock_path):
+        if _fal_load_quality_cache(dataset):
+            return
+        print(
+            "[seedvr-hdr][stage=dataset_quality_cache] building "
+            f"path={path} samples={len(dataset.samples)}"
+        )
+        _fal_write_quality_cache(dataset, path)
+        if not _fal_load_quality_cache(dataset):
+            raise RuntimeError(f"Built empty dataset quality cache: {path}")
+
+
+def _fal_cached_quality_candidate_index(dataset, index: int, attempt: int) -> int | None:
+    good_indices = getattr(dataset, "quality_good_indices", []) or []
+    if not good_indices:
+        return None
+    if attempt == 0 and index in dataset.quality_good_index_set:
+        return index
+    candidate_slot = _fal_quality_filter_candidate_index(index, attempt + 1, len(good_indices))
+    return int(good_indices[candidate_slot])
+
+
 _FalBaseImageDataset = SeedVRHDRImageDataset
 _FalBaseVideoDataset = SeedVRHDRVideoDataset
 
@@ -2266,6 +2419,10 @@ class SeedVRHDRImageDataset(_FalBaseImageDataset):
         bad_sample_min_luma_std: float = 0.015,
         bad_sample_max_luma_hf: float = 0.18,
         bad_sample_max_noise_hf_ratio: float = 0.95,
+        use_quality_cache: bool = True,
+        quality_cache_root: str | Path = "/data/seedvr_hdr_quality_cache",
+        quality_cache_rebuild: bool = False,
+        quality_cache_build_on_init: bool = True,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -2280,6 +2437,11 @@ class SeedVRHDRImageDataset(_FalBaseImageDataset):
         self.bad_sample_min_luma_std = bad_sample_min_luma_std
         self.bad_sample_max_luma_hf = bad_sample_max_luma_hf
         self.bad_sample_max_noise_hf_ratio = bad_sample_max_noise_hf_ratio
+        self.use_quality_cache = use_quality_cache
+        self.quality_cache_root = quality_cache_root
+        self.quality_cache_rebuild = quality_cache_rebuild
+        self.quality_cache_build_on_init = quality_cache_build_on_init
+        _fal_prepare_quality_cache(self)
 
     def _resolve_direct_target_path(self, sample: ManifestSample) -> Path | None:
         if self.target_representation in {"pq_1000", "logc3"}:
@@ -2347,10 +2509,21 @@ class SeedVRHDRImageDataset(_FalBaseImageDataset):
         last_sample: dict[str, torch.Tensor | str] | None = None
         last_stats: dict[str, float] | None = None
         for attempt in range(attempts):
-            candidate_index = _fal_quality_filter_candidate_index(
-                index, attempt, len(self.samples)
+            cached_index = _fal_cached_quality_candidate_index(self, index, attempt)
+            candidate_index = (
+                cached_index
+                if cached_index is not None
+                else _fal_quality_filter_candidate_index(index, attempt, len(self.samples))
             )
             sample = self._load_augmented_sample(candidate_index)
+            if cached_index is not None:
+                if candidate_index != index:
+                    print(
+                        "[seedvr-hdr][stage=dataset_quality_filter] "
+                        f"index={index} cached_replacement_index={candidate_index} "
+                        f"attempt={attempt + 1}/{attempts}"
+                    )
+                return sample
             usable, stats = _fal_tensor_sample_quality_is_usable(sample, self)
             if usable:
                 if attempt > 0:
@@ -2394,6 +2567,10 @@ class SeedVRHDRVideoDataset(_FalBaseVideoDataset):
         bad_sample_min_luma_std: float = 0.015,
         bad_sample_max_luma_hf: float = 0.18,
         bad_sample_max_noise_hf_ratio: float = 0.95,
+        use_quality_cache: bool = True,
+        quality_cache_root: str | Path = "/data/seedvr_hdr_quality_cache",
+        quality_cache_rebuild: bool = False,
+        quality_cache_build_on_init: bool = True,
         **kwargs,
     ) -> None:
         super().__init__(*args, **kwargs)
@@ -2408,6 +2585,11 @@ class SeedVRHDRVideoDataset(_FalBaseVideoDataset):
         self.bad_sample_min_luma_std = bad_sample_min_luma_std
         self.bad_sample_max_luma_hf = bad_sample_max_luma_hf
         self.bad_sample_max_noise_hf_ratio = bad_sample_max_noise_hf_ratio
+        self.use_quality_cache = use_quality_cache
+        self.quality_cache_root = quality_cache_root
+        self.quality_cache_rebuild = quality_cache_rebuild
+        self.quality_cache_build_on_init = quality_cache_build_on_init
+        _fal_prepare_quality_cache(self)
 
     def _direct_target_pairs(
         self, sample: ManifestSample
@@ -2467,10 +2649,21 @@ class SeedVRHDRVideoDataset(_FalBaseVideoDataset):
         last_sample: dict[str, torch.Tensor | str] | None = None
         last_stats: dict[str, float] | None = None
         for attempt in range(attempts):
-            candidate_index = _fal_quality_filter_candidate_index(
-                index, attempt, len(self.samples)
+            cached_index = _fal_cached_quality_candidate_index(self, index, attempt)
+            candidate_index = (
+                cached_index
+                if cached_index is not None
+                else _fal_quality_filter_candidate_index(index, attempt, len(self.samples))
             )
             sample = self._load_augmented_sample(candidate_index)
+            if cached_index is not None:
+                if candidate_index != index:
+                    print(
+                        "[seedvr-hdr][stage=dataset_quality_filter] "
+                        f"index={index} cached_replacement_index={candidate_index} "
+                        f"attempt={attempt + 1}/{attempts}"
+                    )
+                return sample
             usable, stats = _fal_tensor_sample_quality_is_usable(sample, self)
             if usable:
                 if attempt > 0:
