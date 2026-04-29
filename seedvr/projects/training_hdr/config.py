@@ -81,6 +81,7 @@ class TrainingConfig:
     resume_optimizer_state: bool = True
     resume_scheduler_state: bool = True
     resume_rng_state: bool = True
+    base_checkpoint_cache_root: str = "/data/seedvr_hdr_base_checkpoints"
     checkpoint_repo_id: str | None = None
     dit_filename: str | None = None
     vae_filename: str | None = None
@@ -129,6 +130,7 @@ class TrainingConfig:
     tv_lpips_loss_warmup_steps: int = 0
     tv_lpips_gamma: float = 0.5
     sampler_validation_samples: int = 0
+    sampler_validate_every: int = 0
     sampler_validation_guidance_scale: float = 1.0
     sampler_validation_seed: int = 2079280474
     banding_loss_weight: float = 0.0
@@ -156,6 +158,8 @@ class TrainingConfig:
     log_every: int = 10
     validate_every: int = 100
     save_every: int = 500
+    model_checkpoint_every: int = 0
+    full_checkpoint_every: int = 0
     debug_cuda_memory: bool = False
     cuda_cleanup_every: int = 100
     vae_use_tiling: bool = False

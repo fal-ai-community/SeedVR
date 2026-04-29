@@ -23,33 +23,42 @@ def save_checkpoint(
     scheduler: torch.optim.lr_scheduler.LRScheduler | None,
     metrics: dict[str, float],
     config: dict[str, Any],
+    include_optimizer: bool = True,
+    include_scheduler: bool = True,
+    include_rng: bool = True,
+    suffix: str = "",
 ) -> Path:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint_path = output_dir / f"seedvr_hdr_step_{step:06d}.pt"
+    suffix_part = f"_{suffix}" if suffix else ""
+    checkpoint_path = output_dir / f"seedvr_hdr_step_{step:06d}{suffix_part}.pt"
     model_to_save = unwrap_compiled_module(model)
+    payload: dict[str, Any] = {
+        "step": step,
+        "model": model_to_save.state_dict(),
+        "optimizer": optimizer.state_dict() if include_optimizer else None,
+        "scheduler": (
+            scheduler.state_dict()
+            if include_scheduler and scheduler is not None
+            else None
+        ),
+        "metrics": metrics,
+        "config": config,
+        "checkpoint_kind": "full" if include_optimizer else "model",
+    }
+    if include_rng:
+        payload["rng_state"] = {
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "torch": torch.get_rng_state(),
+            "cuda": (
+                torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+            ),
+        }
     with tempfile.NamedTemporaryFile(dir=output_dir, suffix=".pt", delete=False) as tmp_file:
         tmp_path = Path(tmp_file.name)
     try:
-        torch.save(
-            {
-                "step": step,
-                "model": model_to_save.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "scheduler": scheduler.state_dict() if scheduler is not None else None,
-                "metrics": metrics,
-                "config": config,
-                "rng_state": {
-                    "python": random.getstate(),
-                    "numpy": np.random.get_state(),
-                    "torch": torch.get_rng_state(),
-                    "cuda": (
-                        torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
-                    ),
-                },
-            },
-            tmp_path,
-        )
+        torch.save(payload, tmp_path)
         os.replace(tmp_path, checkpoint_path)
     finally:
         if tmp_path.exists():

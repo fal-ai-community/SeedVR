@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import gc
 import json
 import os
@@ -86,20 +88,47 @@ def get_device() -> torch.device:
     return torch.device("cuda", 0)
 
 
+@contextlib.contextmanager
+def file_lock(lock_path: Path):
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "w") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
 def download_checkpoints(config: TrainingConfig, repo_root: Path) -> tuple[Path, Path, Path]:
     spec = config.resolve_checkpoint_spec()
-    ckpt_dir = repo_root / "ckpts" / spec.repo_id.replace("/", "__")
+    cache_root = Path(config.base_checkpoint_cache_root)
+    if str(cache_root).startswith("/data"):
+        ckpt_root = cache_root
+    else:
+        ckpt_root = repo_root / "ckpts"
+    ckpt_dir = ckpt_root / spec.repo_id.replace("/", "__")
     ckpt_dir.mkdir(parents=True, exist_ok=True)
-    snapshot_download(
-        repo_id=spec.repo_id,
-        local_dir=str(ckpt_dir),
-        local_dir_use_symlinks=False,
-        resume_download=True,
-        allow_patterns=[
-            spec.dit_filename,
-            spec.vae_filename,
-        ],
-    )
+    required_paths = [ckpt_dir / spec.dit_filename, ckpt_dir / spec.vae_filename]
+    if not all(path.exists() and path.stat().st_size > 0 for path in required_paths):
+        lock_path = cache_root / "locks" / f"{spec.repo_id.replace('/', '__')}.lock"
+        with file_lock(lock_path):
+            if not all(path.exists() and path.stat().st_size > 0 for path in required_paths):
+                print(
+                    "[seedvr-hdr] downloading base checkpoints "
+                    f"repo={spec.repo_id} cache_dir={ckpt_dir}"
+                )
+                snapshot_download(
+                    repo_id=spec.repo_id,
+                    local_dir=str(ckpt_dir),
+                    local_dir_use_symlinks=False,
+                    resume_download=True,
+                    allow_patterns=[
+                        spec.dit_filename,
+                        spec.vae_filename,
+                    ],
+                )
+    else:
+        print(f"[seedvr-hdr] reusing base checkpoint cache dir={ckpt_dir}")
     config_path = repo_root / spec.config_path
     if not config_path.exists():
         raise FileNotFoundError(f"Missing SeedVR config path: {config_path}")
@@ -1428,6 +1457,13 @@ def run_validation(
         if sampler_validation_samples is None
         else sampler_validation_samples
     )
+    sampler_validate_every = int(config.sampler_validate_every or config.validate_every)
+    run_sampler_validation = (
+        sampler_count > 0
+        and (step % sampler_validate_every == 0 or step == config.steps)
+    )
+    if not run_sampler_validation:
+        sampler_count = 0
     preview_dir = config.output_path / preview_subdir
     preview_dir.mkdir(parents=True, exist_ok=True)
     metric_limit = validation_count
@@ -2003,7 +2039,32 @@ def main() -> None:
                         preview_captions=extra_preview_captions,
                     )
 
-        if step % config.save_every == 0 or step == config.steps:
+        model_checkpoint_every = int(config.model_checkpoint_every or 0)
+        full_checkpoint_every = int(config.full_checkpoint_every or config.save_every)
+        save_full_checkpoint = step % full_checkpoint_every == 0 or step == config.steps
+        save_model_checkpoint = (
+            model_checkpoint_every > 0
+            and step % model_checkpoint_every == 0
+            and not save_full_checkpoint
+        )
+        if save_model_checkpoint:
+            save_checkpoint(
+                output_dir=config.output_path / "checkpoints",
+                step=step,
+                model=runner.dit,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                metrics=final_metrics,
+                config=config.to_dict() | runtime_info,
+                include_optimizer=False,
+                include_scheduler=False,
+                include_rng=False,
+                suffix="model",
+            )
+            if config.debug_cuda_memory:
+                log_cuda_memory("model_checkpoint_saved", device, step)
+
+        if save_full_checkpoint:
             checkpoint_path = save_checkpoint(
                 output_dir=config.output_path / "checkpoints",
                 step=step,
@@ -2014,7 +2075,7 @@ def main() -> None:
                 config=config.to_dict() | runtime_info,
             )
             if config.debug_cuda_memory:
-                log_cuda_memory("checkpoint_saved", device, step)
+                log_cuda_memory("full_checkpoint_saved", device, step)
 
         del (
             batch,
