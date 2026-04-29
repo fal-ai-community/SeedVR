@@ -43,8 +43,6 @@ from seedvr.projects.training_hdr.validation import (
     save_dataset_sample_preview,
     save_triptych,
 )
-from seedvr.projects.video_diffusion_sr.infer import VideoDiffusionInfer
-
 try:
     import wandb
 except ImportError:  # pragma: no cover - optional at runtime
@@ -1275,6 +1273,8 @@ def build_runner(
     repo_root: Path,
     device: torch.device,
 ) -> tuple[VideoDiffusionInfer, tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor], dict[str, Any]]:
+    from seedvr.projects.video_diffusion_sr.infer import VideoDiffusionInfer
+
     if not config.freeze_vae:
         raise NotImplementedError(
             "Phase-1 SeedVR HDR training currently supports freeze_vae=True only."
