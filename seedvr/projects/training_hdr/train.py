@@ -1624,6 +1624,21 @@ def main() -> None:
     set_seed(config.seed)
     device = get_device()
     train_loader, val_loader = build_dataloaders(config)
+    wandb_run = maybe_init_wandb(config)
+    log_dataset_samples_to_wandb(
+        wandb_run,
+        config,
+        train_loader.dataset,
+        split_name="train",
+        step=0,
+    )
+    log_dataset_samples_to_wandb(
+        wandb_run,
+        config,
+        val_loader.dataset,
+        split_name="val",
+        step=0,
+    )
     extra_validation_loaders = build_extra_validation_dataloaders(config)
     runner, positive_embeddings, _negative_embeddings, runtime_info = build_runner(
         config=config,
@@ -1676,21 +1691,6 @@ def main() -> None:
     )
     runtime_info["resume_from_checkpoint"] = config.resume_from_checkpoint
     runtime_info["start_step"] = start_step
-    wandb_run = maybe_init_wandb(config)
-    log_dataset_samples_to_wandb(
-        wandb_run,
-        config,
-        train_loader.dataset,
-        split_name="train",
-        step=start_step - 1,
-    )
-    log_dataset_samples_to_wandb(
-        wandb_run,
-        config,
-        val_loader.dataset,
-        split_name="val",
-        step=start_step - 1,
-    )
     lpips_model = build_lpips_model(config, device)
 
     text_pos_embeds, text_pos_shapes = positive_embeddings
