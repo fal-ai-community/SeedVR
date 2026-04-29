@@ -1707,6 +1707,10 @@ def _fal_should_log_quality_rejection(attempt: int, attempts: int) -> bool:
     return attempt == 0 or attempt + 1 == attempts or (attempt + 1) % 16 == 0
 
 
+def _fal_should_log_cached_quality_replacement(index: int, attempt: int) -> bool:
+    return attempt > 0 or index % 1000 == 0
+
+
 def _fal_manifest_digest(path: Path) -> str:
     digest = hashlib.sha1()
     with open(path, "rb") as file:
@@ -2550,7 +2554,9 @@ class SeedVRHDRImageDataset(_FalBaseImageDataset):
             )
             sample = self._load_augmented_sample(candidate_index)
             if cached_index is not None:
-                if candidate_index != index:
+                if candidate_index != index and _fal_should_log_cached_quality_replacement(
+                    index, attempt
+                ):
                     print(
                         "[seedvr-hdr][stage=dataset_quality_filter] "
                         f"index={index} cached_replacement_index={candidate_index} "
@@ -2692,7 +2698,9 @@ class SeedVRHDRVideoDataset(_FalBaseVideoDataset):
             )
             sample = self._load_augmented_sample(candidate_index)
             if cached_index is not None:
-                if candidate_index != index:
+                if candidate_index != index and _fal_should_log_cached_quality_replacement(
+                    index, attempt
+                ):
                     print(
                         "[seedvr-hdr][stage=dataset_quality_filter] "
                         f"index={index} cached_replacement_index={candidate_index} "
