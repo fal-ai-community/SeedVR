@@ -157,6 +157,10 @@ class TrainingConfig:
     jpeg_roundtrip_prob: float = 0.0
     jpeg_roundtrip_min_quality: int = 75
     jpeg_roundtrip_max_quality: int = 95
+    poisson_noise_prob: float = 0.0
+    poisson_noise_scale_min: float = 50.0
+    poisson_noise_scale_max: float = 200.0
+    chroma_subsample_prob: float = 0.0
     grad_clip_norm: float = 1.0
     adam_beta1: float = 0.9
     adam_beta2: float = 0.95

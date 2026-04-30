@@ -1581,6 +1581,77 @@ def _fal_apply_input_jpeg_roundtrip(
     return output
 
 
+def _fal_apply_input_poisson_noise(
+    input_tensor: torch.Tensor,
+    *,
+    prob: float,
+    scale_min: float,
+    scale_max: float,
+    rng: random.Random,
+) -> torch.Tensor:
+    """Simulate sensor shot noise via Poisson sampling on the SDR input.
+
+    Higher `scale` values mean a brighter scene with proportionally less noise
+    per pixel; lower values yield heavier noise, like a high-ISO low-light shot.
+    Operates per-frame on tensors in [-1, +1] range.
+    """
+    if prob <= 0.0 or rng.random() >= prob:
+        return input_tensor
+    scale = float(rng.uniform(scale_min, scale_max))
+    if scale <= 0.0:
+        return input_tensor
+    np_rng = np.random.default_rng(rng.randint(0, 2**32 - 1))
+    original_shape = tuple(input_tensor.shape)
+    frames = input_tensor.unsqueeze(0) if input_tensor.ndim == 3 else input_tensor
+    output_frames: list[torch.Tensor] = []
+    for frame in frames:
+        arr01 = frame.detach().float().clamp(-1.0, 1.0).add(1.0).mul(0.5).cpu().numpy()
+        noisy = np_rng.poisson(np.clip(arr01, 0.0, 1.0) * scale).astype(np.float32) / scale
+        noisy = np.clip(noisy, 0.0, 1.0)
+        out = torch.from_numpy(noisy).to(dtype=frame.dtype, device=frame.device)
+        output_frames.append(out.mul(2.0).sub(1.0))
+    output = torch.stack(output_frames, dim=0).to(dtype=input_tensor.dtype)
+    if len(original_shape) == 3:
+        output = output.squeeze(0)
+    return output
+
+
+def _fal_apply_input_chroma_subsample_420(
+    input_tensor: torch.Tensor,
+    *,
+    prob: float,
+    rng: random.Random,
+) -> torch.Tensor:
+    """Simulate 4:2:0 chroma subsampling (the codec quantization characteristic
+    of consumer JPEG / H.264). Y channel is preserved; Cb/Cr are downsampled
+    by 2 in each direction then upsampled back via bilinear interpolation."""
+    if prob <= 0.0 or rng.random() >= prob:
+        return input_tensor
+    original_shape = tuple(input_tensor.shape)
+    frames = input_tensor.unsqueeze(0) if input_tensor.ndim == 3 else input_tensor
+    output_frames: list[torch.Tensor] = []
+    for frame in frames:
+        arr01 = frame.detach().float().clamp(-1.0, 1.0).add(1.0).mul(0.5).cpu().numpy()
+        rgb_u8 = (np.clip(arr01.transpose(1, 2, 0), 0.0, 1.0) * 255.0).round().astype(np.uint8)
+        ycrcb = cv2.cvtColor(rgb_u8, cv2.COLOR_RGB2YCrCb)
+        h, w = ycrcb.shape[:2]
+        h2 = max(1, h // 2)
+        w2 = max(1, w // 2)
+        cr_small = cv2.resize(ycrcb[..., 1], (w2, h2), interpolation=cv2.INTER_AREA)
+        cb_small = cv2.resize(ycrcb[..., 2], (w2, h2), interpolation=cv2.INTER_AREA)
+        cr_up = cv2.resize(cr_small, (w, h), interpolation=cv2.INTER_LINEAR)
+        cb_up = cv2.resize(cb_small, (w, h), interpolation=cv2.INTER_LINEAR)
+        ycrcb[..., 1] = cr_up
+        ycrcb[..., 2] = cb_up
+        rgb_back = cv2.cvtColor(ycrcb, cv2.COLOR_YCrCb2RGB).astype(np.float32) / 255.0
+        out = torch.from_numpy(rgb_back.transpose(2, 0, 1)).to(dtype=frame.dtype, device=frame.device)
+        output_frames.append(out.mul(2.0).sub(1.0))
+    output = torch.stack(output_frames, dim=0).to(dtype=input_tensor.dtype)
+    if len(original_shape) == 3:
+        output = output.squeeze(0)
+    return output
+
+
 def _fal_hwc_to_luma_preview(image: np.ndarray) -> np.ndarray:
     image = np.clip(
         np.nan_to_num(image.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0),
@@ -2449,6 +2520,10 @@ class SeedVRHDRImageDataset(_FalBaseImageDataset):
         jpeg_roundtrip_prob: float = 0.0,
         jpeg_roundtrip_min_quality: int = 75,
         jpeg_roundtrip_max_quality: int = 95,
+        poisson_noise_prob: float = 0.0,
+        poisson_noise_scale_min: float = 50.0,
+        poisson_noise_scale_max: float = 200.0,
+        chroma_subsample_prob: float = 0.0,
         filter_bad_samples: bool = True,
         bad_sample_max_retries: int = 32,
         bad_sample_min_luma_std: float = 0.015,
@@ -2468,6 +2543,10 @@ class SeedVRHDRImageDataset(_FalBaseImageDataset):
         self.jpeg_roundtrip_prob = jpeg_roundtrip_prob
         self.jpeg_roundtrip_min_quality = jpeg_roundtrip_min_quality
         self.jpeg_roundtrip_max_quality = jpeg_roundtrip_max_quality
+        self.poisson_noise_prob = poisson_noise_prob
+        self.poisson_noise_scale_min = poisson_noise_scale_min
+        self.poisson_noise_scale_max = poisson_noise_scale_max
+        self.chroma_subsample_prob = chroma_subsample_prob
         self.filter_bad_samples = filter_bad_samples
         self.bad_sample_max_retries = bad_sample_max_retries
         self.bad_sample_min_luma_std = bad_sample_min_luma_std
@@ -2533,6 +2612,18 @@ class SeedVRHDRImageDataset(_FalBaseImageDataset):
             prob=self.jpeg_roundtrip_prob,
             min_quality=self.jpeg_roundtrip_min_quality,
             max_quality=self.jpeg_roundtrip_max_quality,
+            rng=rng,
+        )
+        input_tensor = _fal_apply_input_poisson_noise(
+            input_tensor,
+            prob=self.poisson_noise_prob,
+            scale_min=self.poisson_noise_scale_min,
+            scale_max=self.poisson_noise_scale_max,
+            rng=rng,
+        )
+        input_tensor = _fal_apply_input_chroma_subsample_420(
+            input_tensor,
+            prob=self.chroma_subsample_prob,
             rng=rng,
         )
         sample["input_sdr"] = input_tensor
@@ -2601,6 +2692,10 @@ class SeedVRHDRVideoDataset(_FalBaseVideoDataset):
         jpeg_roundtrip_prob: float = 0.0,
         jpeg_roundtrip_min_quality: int = 75,
         jpeg_roundtrip_max_quality: int = 95,
+        poisson_noise_prob: float = 0.0,
+        poisson_noise_scale_min: float = 50.0,
+        poisson_noise_scale_max: float = 200.0,
+        chroma_subsample_prob: float = 0.0,
         filter_bad_samples: bool = True,
         bad_sample_max_retries: int = 32,
         bad_sample_min_luma_std: float = 0.015,
@@ -2620,6 +2715,10 @@ class SeedVRHDRVideoDataset(_FalBaseVideoDataset):
         self.jpeg_roundtrip_prob = jpeg_roundtrip_prob
         self.jpeg_roundtrip_min_quality = jpeg_roundtrip_min_quality
         self.jpeg_roundtrip_max_quality = jpeg_roundtrip_max_quality
+        self.poisson_noise_prob = poisson_noise_prob
+        self.poisson_noise_scale_min = poisson_noise_scale_min
+        self.poisson_noise_scale_max = poisson_noise_scale_max
+        self.chroma_subsample_prob = chroma_subsample_prob
         self.filter_bad_samples = filter_bad_samples
         self.bad_sample_max_retries = bad_sample_max_retries
         self.bad_sample_min_luma_std = bad_sample_min_luma_std
@@ -2677,6 +2776,18 @@ class SeedVRHDRVideoDataset(_FalBaseVideoDataset):
             prob=self.jpeg_roundtrip_prob,
             min_quality=self.jpeg_roundtrip_min_quality,
             max_quality=self.jpeg_roundtrip_max_quality,
+            rng=rng,
+        )
+        input_tensor = _fal_apply_input_poisson_noise(
+            input_tensor,
+            prob=self.poisson_noise_prob,
+            scale_min=self.poisson_noise_scale_min,
+            scale_max=self.poisson_noise_scale_max,
+            rng=rng,
+        )
+        input_tensor = _fal_apply_input_chroma_subsample_420(
+            input_tensor,
+            prob=self.chroma_subsample_prob,
             rng=rng,
         )
         sample["input_sdr"] = input_tensor
