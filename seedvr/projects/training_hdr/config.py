@@ -161,6 +161,9 @@ class TrainingConfig:
     poisson_noise_scale_min: float = 50.0
     poisson_noise_scale_max: float = 200.0
     chroma_subsample_prob: float = 0.0
+    joint_exposure_prob: float = 0.0
+    joint_exposure_ev_min: float = -1.0
+    joint_exposure_ev_max: float = 1.0
     grad_clip_norm: float = 1.0
     adam_beta1: float = 0.9
     adam_beta2: float = 0.95

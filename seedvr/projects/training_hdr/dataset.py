@@ -1652,6 +1652,87 @@ def _fal_apply_input_chroma_subsample_420(
     return output
 
 
+def _fal_apply_joint_exposure_pair(
+    input_tensor: torch.Tensor,
+    target_tensor: torch.Tensor,
+    *,
+    target_representation: str,
+    prob: float,
+    ev_min: float,
+    ev_max: float,
+    rng: random.Random,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """LumiVid-style joint exposure shift.
+
+    Multiplies BOTH the SDR input (in linear-clipped [0,1] space) and the
+    HDR target (in linear-HDR space) by the same 2^EV factor, so the model
+    learns that absolute brightness is preserved end-to-end and only the
+    dynamic-range expansion is its job.
+
+    For the HDR target this requires decoding from the encoded representation
+    (mu_law / pq / logc3 / log_hdr / raw_hdr) back to linear, multiplying, and
+    re-encoding via the existing `_compress_target_from_hdr`. For SDR the
+    multiply is in [0,1] space with clipping at the bright end.
+    """
+    if prob <= 0.0 or rng.random() >= prob:
+        return input_tensor, target_tensor
+    ev = float(rng.uniform(ev_min, ev_max))
+    if abs(ev) < 1.0e-6:
+        return input_tensor, target_tensor
+    factor = 2.0 ** ev
+
+    # SDR side: tensor is [-1, +1]. Map to [0, 1], scale, clip, back.
+    sdr01 = input_tensor.detach().float().clamp(-1.0, 1.0).add(1.0).mul(0.5)
+    sdr01_shifted = sdr01.mul(factor).clamp(0.0, 1.0)
+    new_input = sdr01_shifted.mul(2.0).sub(1.0).to(
+        dtype=input_tensor.dtype, device=input_tensor.device
+    )
+
+    # Target side: depends on representation.
+    if target_representation == "raw_hdr":
+        new_target = (target_tensor.detach().float() * factor).clamp(min=0.0)
+        return new_input, new_target.to(
+            dtype=target_tensor.dtype, device=target_tensor.device
+        )
+
+    arr = target_tensor.detach().float().cpu().numpy()
+    is_chw = arr.ndim == 3 and arr.shape[0] in {1, 3} and arr.shape[-1] not in {1, 3}
+    if is_chw:
+        arr = np.moveaxis(arr, 0, -1)
+
+    if target_representation == "mu_law_mu5000":
+        normalized = (np.clip(arr, -1.0, 1.0) + 1.0) * 0.5
+        linear = np.maximum(
+            np.expm1(normalized * np.log1p(MU_LAW_MU)) / MU_LAW_MU, 0.0
+        )
+    elif target_representation == "log_hdr":
+        linear = np.maximum(np.exp(arr) - LOG_HDR_EPS, 0.0)
+    elif target_representation == "pq_1000":
+        normalized = (np.clip(arr, -1.0, 1.0) + 1.0) * 0.5
+        linear = _fal_pq_eotf(normalized) / 1000.0
+    elif target_representation == "logc3":
+        normalized = (np.clip(arr, -1.0, 1.0) + 1.0) * 0.5
+        linear = _fal_logc3_decode(normalized)
+    else:
+        return input_tensor, target_tensor
+
+    linear_shifted = np.maximum(linear * factor, 0.0)
+    encoded = _compress_target_from_hdr(linear_shifted, target_representation)
+
+    if target_representation in {"mu_law_mu5000", "pq_1000", "logc3"}:
+        encoded_arr = encoded * 2.0 - 1.0
+    else:  # log_hdr passes through
+        encoded_arr = encoded
+
+    if is_chw and encoded_arr.ndim == 3:
+        encoded_arr = np.moveaxis(encoded_arr, -1, 0)
+
+    new_target = torch.from_numpy(np.ascontiguousarray(encoded_arr.astype(np.float32))).to(
+        dtype=target_tensor.dtype, device=target_tensor.device
+    )
+    return new_input, new_target
+
+
 def _fal_hwc_to_luma_preview(image: np.ndarray) -> np.ndarray:
     image = np.clip(
         np.nan_to_num(image.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0),
@@ -2524,6 +2605,9 @@ class SeedVRHDRImageDataset(_FalBaseImageDataset):
         poisson_noise_scale_min: float = 50.0,
         poisson_noise_scale_max: float = 200.0,
         chroma_subsample_prob: float = 0.0,
+        joint_exposure_prob: float = 0.0,
+        joint_exposure_ev_min: float = -1.0,
+        joint_exposure_ev_max: float = 1.0,
         filter_bad_samples: bool = True,
         bad_sample_max_retries: int = 32,
         bad_sample_min_luma_std: float = 0.015,
@@ -2547,6 +2631,9 @@ class SeedVRHDRImageDataset(_FalBaseImageDataset):
         self.poisson_noise_scale_min = poisson_noise_scale_min
         self.poisson_noise_scale_max = poisson_noise_scale_max
         self.chroma_subsample_prob = chroma_subsample_prob
+        self.joint_exposure_prob = joint_exposure_prob
+        self.joint_exposure_ev_min = joint_exposure_ev_min
+        self.joint_exposure_ev_max = joint_exposure_ev_max
         self.filter_bad_samples = filter_bad_samples
         self.bad_sample_max_retries = bad_sample_max_retries
         self.bad_sample_min_luma_std = bad_sample_min_luma_std
@@ -2599,9 +2686,18 @@ class SeedVRHDRImageDataset(_FalBaseImageDataset):
         if not self.random_crop:
             return sample
         rng = random.Random((self.seed * 1_000_000) + index)
-        input_tensor, target_tensor = _fal_apply_spatial_jitter_pair(
+        input_tensor, target_tensor = _fal_apply_joint_exposure_pair(
             sample["input_sdr"],
             sample["target"],
+            target_representation=self.target_representation,
+            prob=self.joint_exposure_prob,
+            ev_min=self.joint_exposure_ev_min,
+            ev_max=self.joint_exposure_ev_max,
+            rng=rng,
+        )
+        input_tensor, target_tensor = _fal_apply_spatial_jitter_pair(
+            input_tensor,
+            target_tensor,
             phase_jitter=self.phase_jitter,
             phase_jitter_max_pixels=self.phase_jitter_max_pixels,
             size_jitter_steps=self.size_jitter_steps,
@@ -2696,6 +2792,9 @@ class SeedVRHDRVideoDataset(_FalBaseVideoDataset):
         poisson_noise_scale_min: float = 50.0,
         poisson_noise_scale_max: float = 200.0,
         chroma_subsample_prob: float = 0.0,
+        joint_exposure_prob: float = 0.0,
+        joint_exposure_ev_min: float = -1.0,
+        joint_exposure_ev_max: float = 1.0,
         filter_bad_samples: bool = True,
         bad_sample_max_retries: int = 32,
         bad_sample_min_luma_std: float = 0.015,
@@ -2719,6 +2818,9 @@ class SeedVRHDRVideoDataset(_FalBaseVideoDataset):
         self.poisson_noise_scale_min = poisson_noise_scale_min
         self.poisson_noise_scale_max = poisson_noise_scale_max
         self.chroma_subsample_prob = chroma_subsample_prob
+        self.joint_exposure_prob = joint_exposure_prob
+        self.joint_exposure_ev_min = joint_exposure_ev_min
+        self.joint_exposure_ev_max = joint_exposure_ev_max
         self.filter_bad_samples = filter_bad_samples
         self.bad_sample_max_retries = bad_sample_max_retries
         self.bad_sample_min_luma_std = bad_sample_min_luma_std
@@ -2763,9 +2865,18 @@ class SeedVRHDRVideoDataset(_FalBaseVideoDataset):
         if not self.random_crop:
             return sample
         rng = random.Random((self.seed * 1_000_000) + index)
-        input_tensor, target_tensor = _fal_apply_spatial_jitter_pair(
+        input_tensor, target_tensor = _fal_apply_joint_exposure_pair(
             sample["input_sdr"],
             sample["target"],
+            target_representation=self.target_representation,
+            prob=self.joint_exposure_prob,
+            ev_min=self.joint_exposure_ev_min,
+            ev_max=self.joint_exposure_ev_max,
+            rng=rng,
+        )
+        input_tensor, target_tensor = _fal_apply_spatial_jitter_pair(
+            input_tensor,
+            target_tensor,
             phase_jitter=self.phase_jitter,
             phase_jitter_max_pixels=self.phase_jitter_max_pixels,
             size_jitter_steps=self.size_jitter_steps,
