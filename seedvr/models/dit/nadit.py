@@ -33,11 +33,31 @@ from .normalization import get_norm_layer
 from .patch import NaPatchIn, NaPatchOut
 
 
-# Fake func, no checkpointing is required for inference
 def gradient_checkpointing(
-    module: Callable | nn.Module, *args, enabled: bool, **kwargs
+    module: Callable | nn.Module,
+    *args,
+    enabled: bool,
+    use_reentrant: bool = False,
+    preserve_rng_state: bool = True,
+    **kwargs,
 ):
-    return module(*args, **kwargs)
+    """Wrap ``module`` with torch.utils.checkpoint when ``enabled`` is True.
+
+    Defaults to the modern non-reentrant impl which supports non-tensor kwargs
+    (NaDiT block forward takes ``vid_shape``/``txt_shape``/``cache``).
+    Inference and disabled-checkpoint paths bypass the wrapper for zero overhead.
+    """
+    if not enabled:
+        return module(*args, **kwargs)
+    from torch.utils.checkpoint import checkpoint as _torch_checkpoint
+
+    return _torch_checkpoint(
+        module,
+        *args,
+        use_reentrant=use_reentrant,
+        preserve_rng_state=preserve_rng_state,
+        **kwargs,
+    )
 
 
 @dataclass
@@ -51,7 +71,15 @@ class NaDiT(PretrainedMixin, FlashPackDiffusersModelMixin, ConfigMixin):
     """
 
     config_name = "config.json"
-    gradient_checkpointing = False
+    # Per-block selector. Empty set or False means disabled. Use
+    # ``set_gradient_checkpointing`` to populate.
+    gradient_checkpointing: "set[int] | bool" = False
+    gradient_checkpointing_use_reentrant: bool = False
+    # Optional sub-module restriction: when set to "mlp_only" / "attn_only",
+    # the per-block forward in NaMMSRTransformerBlock will route only the named
+    # sub-call through torch.utils.checkpoint instead of wrapping the whole
+    # block. None means whole-block (default).
+    gradient_checkpointing_submodule: "str | None" = None
 
     @register_to_config
     def __init__(
@@ -161,8 +189,37 @@ class NaDiT(PretrainedMixin, FlashPackDiffusersModelMixin, ConfigMixin):
             "mmdit_stwin_3d_spatial",
         ]
 
-    def set_gradient_checkpointing(self, enable: bool):
-        self.gradient_checkpointing = enable
+    def set_gradient_checkpointing(
+        self,
+        enable: "bool | set[int] | list[int]",
+        *,
+        use_reentrant: bool = False,
+        submodule: "str | None" = None,
+    ):
+        """Enable activation checkpointing on a subset of trunk blocks.
+
+        Args:
+            enable: ``True``/``False`` for whole-trunk on/off, or an explicit
+                set/list of block indices to checkpoint. Out-of-range indices
+                are silently dropped (caller already validated).
+            use_reentrant: forwarded to torch.utils.checkpoint.
+            submodule: ``None`` (default) wraps the whole NaMMSRTransformerBlock.
+                ``"mlp_only"`` / ``"attn_only"`` route only that sub-call through
+                checkpoint inside the block forward.
+        """
+        if isinstance(enable, bool):
+            self.gradient_checkpointing = enable
+        else:
+            n = len(self.blocks)
+            self.gradient_checkpointing = {i for i in enable if 0 <= i < n}
+        self.gradient_checkpointing_use_reentrant = bool(use_reentrant)
+        self.gradient_checkpointing_submodule = submodule
+
+    def _block_checkpoint_enabled(self, block_index: int) -> bool:
+        flag = self.gradient_checkpointing
+        if isinstance(flag, bool):
+            return flag and self.training
+        return bool(flag) and (block_index in flag) and self.training
 
     def forward(
         self,
@@ -193,7 +250,8 @@ class NaDiT(PretrainedMixin, FlashPackDiffusersModelMixin, ConfigMixin):
         cache = Cache(disable=disable_cache)
         for i, block in enumerate(self.blocks):
             vid, txt, vid_shape, txt_shape = gradient_checkpointing(
-                enabled=(self.gradient_checkpointing and self.training),
+                enabled=self._block_checkpoint_enabled(i),
+                use_reentrant=self.gradient_checkpointing_use_reentrant,
                 module=block,
                 vid=vid,
                 txt=txt,
@@ -212,7 +270,9 @@ class NaDiTUpscaler(nn.Module):
     Native Resolution Diffusers Transformer (NaDiT)
     """
 
-    gradient_checkpointing = False
+    gradient_checkpointing: "set[int] | bool" = False
+    gradient_checkpointing_use_reentrant: bool = False
+    gradient_checkpointing_submodule: "str | None" = None
 
     def __init__(
         self,
@@ -321,8 +381,26 @@ class NaDiTUpscaler(nn.Module):
             "mmdit_stwin_3d_spatial",
         ]
 
-    def set_gradient_checkpointing(self, enable: bool):
-        self.gradient_checkpointing = enable
+    def set_gradient_checkpointing(
+        self,
+        enable: "bool | set[int] | list[int]",
+        *,
+        use_reentrant: bool = False,
+        submodule: "str | None" = None,
+    ):
+        if isinstance(enable, bool):
+            self.gradient_checkpointing = enable
+        else:
+            n = len(self.blocks)
+            self.gradient_checkpointing = {i for i in enable if 0 <= i < n}
+        self.gradient_checkpointing_use_reentrant = bool(use_reentrant)
+        self.gradient_checkpointing_submodule = submodule
+
+    def _block_checkpoint_enabled(self, block_index: int) -> bool:
+        flag = self.gradient_checkpointing
+        if isinstance(flag, bool):
+            return flag and self.training
+        return bool(flag) and (block_index in flag) and self.training
 
     def forward(
         self,
@@ -357,7 +435,8 @@ class NaDiTUpscaler(nn.Module):
         cache = Cache(disable=disable_cache)
         for i, block in enumerate(self.blocks):
             vid, txt, vid_shape, txt_shape = gradient_checkpointing(
-                enabled=(self.gradient_checkpointing and self.training),
+                enabled=self._block_checkpoint_enabled(i),
+                use_reentrant=self.gradient_checkpointing_use_reentrant,
                 module=block,
                 vid=vid,
                 txt=txt,

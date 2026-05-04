@@ -103,6 +103,10 @@ class TrainingConfig:
     torch_compile_fullgraph: bool = False
     use_fa3: bool = True
     allow_attention_fallback: bool = True
+    gradient_checkpointing: bool = False
+    gradient_checkpointing_preset: str = "all"
+    gradient_checkpointing_block_indices: list[int] = field(default_factory=list)
+    gradient_checkpointing_use_reentrant: bool = False
     use_mxfp8: bool = False
     optimizer_type: str = "adamw"
     scheduler_type: str = "cosine"
@@ -210,6 +214,49 @@ class TrainingConfig:
             raise ValueError("clip_length must be >= 1")
         if self.frame_stride < 1:
             raise ValueError("frame_stride must be >= 1")
+        valid_gc_presets = {
+            "none",
+            "all",
+            "every_other_block",
+            "first_half",
+            "last_half",
+            "mlp_only",
+            "attn_only",
+            "custom",
+        }
+        if self.gradient_checkpointing_preset not in valid_gc_presets:
+            raise ValueError(
+                f"Unsupported gradient_checkpointing_preset "
+                f"'{self.gradient_checkpointing_preset}'. "
+                f"Expected one of: {sorted(valid_gc_presets)}"
+            )
+        if self.gradient_checkpointing_preset == "custom":
+            if not self.gradient_checkpointing_block_indices:
+                raise ValueError(
+                    "gradient_checkpointing_preset='custom' requires a "
+                    "non-empty gradient_checkpointing_block_indices list."
+                )
+            indices = self.gradient_checkpointing_block_indices
+            if any(idx < 0 for idx in indices):
+                raise ValueError(
+                    "gradient_checkpointing_block_indices must be non-negative."
+                )
+            if len(set(indices)) != len(indices):
+                raise ValueError(
+                    "gradient_checkpointing_block_indices must be unique."
+                )
+            if list(indices) != sorted(indices):
+                raise ValueError(
+                    "gradient_checkpointing_block_indices must be sorted "
+                    "ascending."
+                )
+            # Upper-bound check against num_layers happens in train.py once
+            # the DiT model config is loaded (num_layers is not known here).
+        elif self.gradient_checkpointing_block_indices:
+            raise ValueError(
+                "gradient_checkpointing_block_indices is only honored when "
+                "gradient_checkpointing_preset == 'custom'."
+            )
 
     @classmethod
     def from_path(cls, path: str | Path) -> "TrainingConfig":

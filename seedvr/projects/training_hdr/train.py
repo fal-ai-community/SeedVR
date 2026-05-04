@@ -350,11 +350,55 @@ def maybe_enable_mxfp8_training(
     return model, True
 
 
+def resolve_checkpoint_indices(
+    preset: str, num_layers: int, custom_indices: list[int]
+) -> set[int]:
+    """Map a preset string to the set of block indices to checkpoint."""
+    if preset == "none":
+        return set()
+    if preset == "all":
+        return set(range(num_layers))
+    if preset == "every_other_block":
+        return set(range(0, num_layers, 2))
+    if preset == "first_half":
+        return set(range(0, num_layers // 2))
+    if preset == "last_half":
+        return set(range(num_layers // 2, num_layers))
+    if preset in ("mlp_only", "attn_only"):
+        # All blocks; submodule selection is handled by set_gradient_checkpointing.
+        return set(range(num_layers))
+    if preset == "custom":
+        return set(custom_indices)
+    raise ValueError(f"unknown gradient_checkpointing_preset: {preset}")
+
+
 def maybe_compile_dit(
     model: torch.nn.Module, config: TrainingConfig
 ) -> tuple[torch.nn.Module, bool]:
     if not config.use_torch_compile or not hasattr(torch, "compile"):
         return model, False
+    # Hard cap: never run max-autotune; we want fast warm-ups.
+    effective_mode = (
+        config.torch_compile_mode
+        if config.torch_compile_mode != "max-autotune"
+        else "reduce-overhead"
+    )
+    if effective_mode != config.torch_compile_mode:
+        print(
+            "[seedvr-hdr] torch.compile mode 'max-autotune' is disabled by "
+            "policy (slow warm-ups); downgrading to 'reduce-overhead'."
+        )
+    # SAC x compile flakiness (PyTorch issue #161889): if gradient
+    # checkpointing is on, avoid max-autotune (already capped above) and
+    # also downgrade if the user explicitly selected max-autotune via some
+    # other path; reduce-overhead is the safe choice.
+    if config.gradient_checkpointing and effective_mode == "max-autotune":
+        print(
+            "[seedvr-hdr] gradient_checkpointing=True is incompatible with "
+            "torch.compile mode='max-autotune' (PyTorch issue #161889); "
+            "downgrading to 'reduce-overhead'."
+        )
+        effective_mode = "reduce-overhead"
     try:
         try:
             import torch._dynamo as dynamo
@@ -372,7 +416,7 @@ def maybe_compile_dit(
             pass
         compiled = torch.compile(
             model,
-            mode=config.torch_compile_mode,
+            mode=effective_mode,
             fullgraph=config.torch_compile_fullgraph,
         )
     except Exception as exc:  # pragma: no cover - runtime fallback
@@ -1270,30 +1314,18 @@ def build_optimizer(
             return heavyball.LaProp(trainable_params, **common_kwargs)
         if config.optimizer_type == "heavyball_muonadamw":
             return heavyball.MuonAdamW(trainable_params, **common_kwargs)
+        # heavyball>=3.0.0 removed `warmup_steps` from these constructors —
+        # it lives on the LR scheduler now. Passing it raises TypeError at
+        # optimizer init, surfacing as ISE within seconds. Rely on the
+        # external LR scheduler (cosine_with_warmup_steps) for warmup.
         if config.optimizer_type == "heavyball_sfadamw":
-            return heavyball.SFAdamW(
-                trainable_params,
-                warmup_steps=config.warmup_steps,
-                **common_kwargs,
-            )
+            return heavyball.SFAdamW(trainable_params, **common_kwargs)
         if config.optimizer_type == "heavyball_soap":
-            return heavyball.SOAP(
-                trainable_params,
-                warmup_steps=config.warmup_steps,
-                **common_kwargs,
-            )
+            return heavyball.SOAP(trainable_params, **common_kwargs)
         if config.optimizer_type == "heavyball_psgdkron":
-            return heavyball.PSGDKron(
-                trainable_params,
-                warmup_steps=config.warmup_steps,
-                **common_kwargs,
-            )
+            return heavyball.PSGDKron(trainable_params, **common_kwargs)
         if config.optimizer_type == "heavyball_lather":
-            return heavyball.LATHER(
-                trainable_params,
-                warmup_steps=config.warmup_steps,
-                **common_kwargs,
-            )
+            return heavyball.LATHER(trainable_params, **common_kwargs)
 
     if config.optimizer_type == "adamw":
         return torch.optim.AdamW(
@@ -1638,6 +1670,47 @@ def build_runner(
     runner.dit, mxfp8_active = maybe_enable_mxfp8_training(runner.dit, config)
     runtime_info["mxfp8_requested"] = config.use_mxfp8
     runtime_info["mxfp8_active"] = mxfp8_active
+    if config.gradient_checkpointing:
+        num_layers = len(runner.dit.blocks)
+        if (
+            config.gradient_checkpointing_preset == "custom"
+            and config.gradient_checkpointing_block_indices
+            and max(config.gradient_checkpointing_block_indices) >= num_layers
+        ):
+            raise ValueError(
+                "gradient_checkpointing_block_indices contains index "
+                f"{max(config.gradient_checkpointing_block_indices)} >= "
+                f"num_layers={num_layers}."
+            )
+        indices = resolve_checkpoint_indices(
+            config.gradient_checkpointing_preset,
+            num_layers=num_layers,
+            custom_indices=config.gradient_checkpointing_block_indices,
+        )
+        submodule = (
+            config.gradient_checkpointing_preset
+            if config.gradient_checkpointing_preset in ("mlp_only", "attn_only")
+            else None
+        )
+        runner.dit.set_gradient_checkpointing(
+            indices,
+            use_reentrant=config.gradient_checkpointing_use_reentrant,
+            submodule=submodule,
+        )
+        print(
+            "[seedvr-hdr] gradient_checkpointing enabled: "
+            f"preset={config.gradient_checkpointing_preset} "
+            f"blocks={sorted(indices)} submodule={submodule} "
+            f"use_reentrant={config.gradient_checkpointing_use_reentrant}"
+        )
+        runtime_info["gradient_checkpointing"] = True
+        runtime_info["gradient_checkpointing_preset"] = (
+            config.gradient_checkpointing_preset
+        )
+        runtime_info["gradient_checkpointing_blocks"] = sorted(indices)
+        runtime_info["gradient_checkpointing_submodule"] = submodule
+    else:
+        runtime_info["gradient_checkpointing"] = False
     runner.dit, compiled = maybe_compile_dit(runner.dit, config)
     runtime_info["torch_compile_active"] = compiled
     runtime_info["model_config_path"] = str(model_config_path)
@@ -2178,13 +2251,23 @@ def main() -> None:
             total_loss = total_loss + lpips_value * lpips_weight
             aux_metrics["lpips_loss"] = float(lpips_value.item())
             aux_metrics["lpips_loss_weight"] = float(lpips_weight)
+        # NaN-safe + magnitude-capped accumulation for high-frequency aux
+        # losses. Without this, dwt_hf weights ≥1.5 or dwt_hf+fft_hf combos
+        # explode in the first weighted backward step (b03/b04/a04/j01/j03
+        # crashed within seconds at sweep_v7). Cap each scaled term at 100
+        # so a transient loss spike can't dominate the total.
+        _AUX_HF_LOSS_CLIP = 100.0
         if dwt_hf_weight > 0.0 and predicted_images is not None:
             dwt_hf_value = dwt_high_frequency_loss(
                 predicted_images,
                 target_images,
                 levels=config.dwt_hf_levels,
             )
-            total_loss = total_loss + dwt_hf_value * dwt_hf_weight
+            dwt_hf_value = torch.nan_to_num(
+                dwt_hf_value, nan=0.0, posinf=_AUX_HF_LOSS_CLIP, neginf=0.0
+            )
+            scaled = (dwt_hf_value * dwt_hf_weight).clamp(max=_AUX_HF_LOSS_CLIP)
+            total_loss = total_loss + scaled
             aux_metrics["dwt_hf_loss"] = float(dwt_hf_value.item())
             aux_metrics["dwt_hf_loss_weight"] = float(dwt_hf_weight)
         if fft_hf_weight > 0.0 and predicted_images is not None:
@@ -2193,7 +2276,11 @@ def main() -> None:
                 target_images,
                 min_freq=config.fft_hf_min_freq,
             )
-            total_loss = total_loss + fft_hf_value * fft_hf_weight
+            fft_hf_value = torch.nan_to_num(
+                fft_hf_value, nan=0.0, posinf=_AUX_HF_LOSS_CLIP, neginf=0.0
+            )
+            scaled = (fft_hf_value * fft_hf_weight).clamp(max=_AUX_HF_LOSS_CLIP)
+            total_loss = total_loss + scaled
             aux_metrics["fft_hf_loss"] = float(fft_hf_value.item())
             aux_metrics["fft_hf_loss_weight"] = float(fft_hf_weight)
         if (

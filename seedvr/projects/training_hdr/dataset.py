@@ -1319,7 +1319,12 @@ def _compress_target_from_hdr(
     if target_representation == "log_hdr":
         return np.log(hdr + LOG_HDR_EPS)
     if target_representation == "pq_1000":
-        return _fal_pq_oetf(hdr * 1000.0)
+        # Mu-law-decoded inputs occasionally produce near-infinity reconstructions
+        # for clipped highlights; PQ OETF on inf gives NaN. Clamp + nan_to_num
+        # keep the encoded target in [0, 1].
+        clamped = np.clip(hdr, 0.0, 1.0)
+        encoded = _fal_pq_oetf(clamped * 1000.0)
+        return np.nan_to_num(encoded, nan=0.0, posinf=1.0, neginf=0.0)
     if target_representation == "logc3":
         return _fal_logc3_encode(hdr)
     raise ValueError(f"Unsupported target_representation: {target_representation}")
