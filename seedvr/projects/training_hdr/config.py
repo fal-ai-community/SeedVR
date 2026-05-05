@@ -198,6 +198,13 @@ class TrainingConfig:
     quality_cache_rebuild: bool = False
     quality_cache_build_on_init: bool = True
     quality_cache_workers: int = 16
+    # Streaming HDR video dataset over HuggingFace CDN. When set (e.g.,
+    # "hf://lpj990/hdr-video-dataset"), the train_loader bypasses the
+    # filesystem-backed video dataset entirely and streams paired HDR/SDR
+    # mp4 clips, decodes inline, and yields tensors in the same shape as
+    # SeedVRHDRVideoDataset. Only honored when data_mode="video".
+    streaming_dataset_url: str | None = None
+    streaming_frames_per_clip: int = 25
     extra_validation_datasets: list[ExtraValidationConfig] = field(default_factory=list)
 
     def __post_init__(self) -> None:

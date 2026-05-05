@@ -1573,6 +1573,45 @@ def build_extra_validation_dataloaders(
 
 
 def build_dataloaders(config: TrainingConfig) -> tuple[DataLoader, DataLoader]:
+    # Streaming HDR video dataset over HuggingFace CDN. Bypasses the
+    # filesystem-backed video dataset; ignores augmentations and
+    # quality-cache fields (those are filesystem-only).
+    if config.streaming_dataset_url and config.data_mode == "video":
+        from seedvr.projects.training_hdr.streaming_dataset import (
+            StreamingHDRVideoDataset,
+        )
+
+        train_dataset = StreamingHDRVideoDataset(
+            target_representation=config.target_representation,
+            train_height=config.train_height,
+            train_width=config.train_width,
+            frames_per_clip=config.streaming_frames_per_clip,
+            streaming_dataset_url=config.streaming_dataset_url,
+        )
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=config.batch_size,
+            num_workers=config.num_workers,
+            pin_memory=True,
+            persistent_workers=bool(
+                config.dataloader_persistent_workers and config.num_workers > 0
+            ),
+            prefetch_factor=(
+                config.dataloader_prefetch_factor if config.num_workers > 0 else None
+            ),
+            # Streaming = IterableDataset; shuffle is not supported and
+            # randomization comes from worker shard assignment + tar order.
+        )
+        # Validation loader still reads from a manifest path (extra_validation_datasets
+        # or config.val_manifest); the streaming source is training-only for now.
+        val_loader = build_validation_dataloader(
+            config,
+            dataset_root=config.dataset_root,
+            manifest_path=config.val_manifest,
+            data_mode=config.data_mode,
+        )
+        return train_loader, val_loader
+
     dataset_cls = (
         SeedVRHDRVideoDataset if config.data_mode == "video" else SeedVRHDRImageDataset
     )
