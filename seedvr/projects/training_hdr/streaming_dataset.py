@@ -179,6 +179,7 @@ class _ConcatHTTPStream(io.RawIOBase):
         self._advance_part()
 
     def _advance_part(self) -> None:
+        import sys, time
         if self._cur is not None:
             try:
                 self._cur.close()
@@ -191,13 +192,22 @@ class _ConcatHTTPStream(io.RawIOBase):
         while self._idx < len(self._urls):
             url = self._urls[self._idx]
             try:
+                t0 = time.monotonic()
                 resp = urllib.request.urlopen(url, timeout=self._timeout)
                 self._cur = resp
                 length = resp.headers.get("Content-Length")
                 self._cur_len = int(length) if length else None
+                print(
+                    f"[stream-http] opened part_idx={self._idx} "
+                    f"size={self._cur_len} in {time.monotonic()-t0:.2f}s",
+                    file=sys.stderr, flush=True,
+                )
                 return
             except urllib.error.URLError as exc:
-                print(f"  [stream] fail open part {self._idx}: {exc}", flush=True)
+                print(
+                    f"[stream-http] fail open part_idx={self._idx}: {exc}",
+                    file=sys.stderr, flush=True,
+                )
                 self._idx += 1
         self._cur = None
 
@@ -346,12 +356,26 @@ class StreamingHDRVideoDataset(IterableDataset):
         self._captions = _load_captions_for_repo(repo)
 
     def __iter__(self) -> Iterator[dict[str, torch.Tensor | str]]:
+        import sys
+        import time
+
+        def _log(msg: str) -> None:
+            # Force-flush so DataLoader worker stdout reaches the runner log.
+            print(f"[stream {wid}] {msg}", file=sys.stderr, flush=True)
+            sys.stderr.flush()
+
         try:
             worker_info = torch.utils.data.get_worker_info()
         except Exception:
             worker_info = None
         worker_id = 0 if worker_info is None else worker_info.id
         num_workers = 1 if worker_info is None else worker_info.num_workers
+        wid = f"w{worker_id}/{num_workers}"
+        _log(
+            f"__iter__ entered: target_repr={self._cfg.target_representation} "
+            f"target={self._cfg.train_width}x{self._cfg.train_height} "
+            f"frames={self._cfg.frames_per_clip} repo={self._cfg.repo}"
+        )
 
         # Shard HDR parts across workers
         hdr_parts = list(self._cfg.hdr_parts)
@@ -362,28 +386,30 @@ class StreamingHDRVideoDataset(IterableDataset):
         if start >= n_parts:
             return
         my_hdr_parts = hdr_parts[start:end]
+        _log(f"shard: hdr_parts[{start}:{end}] = {my_hdr_parts}")
 
         # Infinite iteration: when one full pass through the tar parts ends,
         # reopen the streams and start over. Training step counts (config.steps)
         # bound total work, not the iterator.
         total_yielded = 0
         epoch = 0
+        last_log_ts = time.monotonic()
         while True:
             epoch += 1
-            print(
-                f"  [stream] worker={worker_id} epoch={epoch} "
-                f"hdr_parts={my_hdr_parts}",
-                flush=True,
-            )
+            _log(f"epoch={epoch} opening streams")
+            t0 = time.monotonic()
             hdr_stream = _ConcatHTTPStream(my_hdr_parts, repo=self._cfg.repo)
             sdr_stream = _ConcatHTTPStream(
                 list(self._cfg.sdr_parts), repo=self._cfg.repo
             )
+            _log(f"epoch={epoch} streams opened in {time.monotonic()-t0:.2f}s")
             hdr_tf = None
             sdr_tf = None
             try:
+                t0 = time.monotonic()
                 hdr_tf = tarfile.open(fileobj=hdr_stream, mode="r|")
                 sdr_tf = tarfile.open(fileobj=sdr_stream, mode="r|")
+                _log(f"epoch={epoch} tar headers parsed in {time.monotonic()-t0:.2f}s")
                 sdr_iter = iter(sdr_tf)
                 sdr_pending: dict[str, bytes] = {}
 
@@ -454,6 +480,14 @@ class StreamingHDRVideoDataset(IterableDataset):
                         continue
                     if sample is None:
                         continue
+                    now = time.monotonic()
+                    if total_yielded < 5 or (now - last_log_ts) > 30:
+                        _log(
+                            f"yield #{total_yielded+1} clip={sample['scene_id']} "
+                            f"epoch={epoch} dt_since_last={now-last_log_ts:.1f}s "
+                            f"target_shape={tuple(sample['target'].shape)}"
+                        )
+                        last_log_ts = now
                     yield sample
                     total_yielded += 1
                     if (
