@@ -152,28 +152,82 @@ def _load_captions_for_repo(repo: str = HF_CDN_REPO) -> dict[str, str]:
 # Concatenated HTTP stream over multiple HF tar parts
 # ---------------------------------------------------------------------
 class _ConcatHTTPStream(io.RawIOBase):
-    def __init__(self, filenames: list[str], repo: str, timeout: int = 120):
+    """Concatenate HF tar parts into one read-only stream with byte-range
+    resumption on transient CloudFront drops.
+
+    Tracks Content-Length and bytes-read per part. If `urlopen.read()`
+    returns short while the current part has more bytes left, the stream
+    automatically reconnects using `Range: bytes=<offset>-` and continues
+    from the last byte. Only advances to the next part when the current
+    one's entire Content-Length has been consumed.
+    """
+
+    def __init__(
+        self,
+        filenames: list[str],
+        repo: str,
+        timeout: int = 120,
+        max_retries: int = 5,
+    ):
         self._urls = [_hf_url(n, repo=repo) for n in filenames]
         self._timeout = timeout
-        self._idx = 0
+        self._max_retries = max_retries
+        self._idx = -1                 # current part index (-1 = before first)
         self._cur: io.IOBase | None = None
-        self._open_next()
+        self._cur_len: int | None = None  # Content-Length of current part
+        self._cur_pos = 0              # bytes already read from current part
+        self._advance_part()
 
-    def _open_next(self) -> None:
+    def _advance_part(self) -> None:
         if self._cur is not None:
             try:
                 self._cur.close()
             except Exception:
                 pass
             self._cur = None
+        self._cur_len = None
+        self._cur_pos = 0
+        self._idx += 1
         while self._idx < len(self._urls):
             url = self._urls[self._idx]
             try:
-                self._cur = urllib.request.urlopen(url, timeout=self._timeout)
-                self._idx += 1
+                resp = urllib.request.urlopen(url, timeout=self._timeout)
+                self._cur = resp
+                length = resp.headers.get("Content-Length")
+                self._cur_len = int(length) if length else None
                 return
-            except urllib.error.URLError:
+            except urllib.error.URLError as exc:
+                print(f"  [stream] fail open part {self._idx}: {exc}", flush=True)
                 self._idx += 1
+        self._cur = None
+
+    def _resume_part(self) -> None:
+        """Reconnect to the current part starting at self._cur_pos via Range."""
+        if self._idx < 0 or self._idx >= len(self._urls):
+            self._cur = None
+            return
+        url = self._urls[self._idx]
+        for attempt in range(self._max_retries):
+            try:
+                req = urllib.request.Request(
+                    url, headers={"Range": f"bytes={self._cur_pos}-"}
+                )
+                resp = urllib.request.urlopen(req, timeout=self._timeout)
+                if self._cur is not None:
+                    try:
+                        self._cur.close()
+                    except Exception:
+                        pass
+                self._cur = resp
+                # Don't trust new Content-Length on a Range response; keep _cur_len.
+                return
+            except urllib.error.URLError as exc:
+                print(
+                    f"  [stream] resume attempt {attempt+1} part {self._idx} "
+                    f"@offset={self._cur_pos} failed: {exc}",
+                    flush=True,
+                )
+        # All retries failed; abandon this part
         self._cur = None
 
     def readable(self) -> bool:
@@ -185,11 +239,27 @@ class _ConcatHTTPStream(io.RawIOBase):
             if self._cur is None:
                 break
             need = -1 if size < 0 else (size - len(out))
-            chunk = self._cur.read(need if need > 0 else -1)
-            if not chunk:
-                self._open_next()
+            try:
+                chunk = self._cur.read(need if need > 0 else -1)
+            except Exception as exc:
+                print(
+                    f"  [stream] read() raised on part {self._idx} "
+                    f"@offset={self._cur_pos}: {exc}; resuming",
+                    flush=True,
+                )
+                chunk = b""
+            if chunk:
+                out.extend(chunk)
+                self._cur_pos += len(chunk)
                 continue
-            out.extend(chunk)
+            # Empty chunk: end-of-response. Decide if part is fully drained.
+            if self._cur_len is not None and self._cur_pos < self._cur_len:
+                # Truncated mid-part — resume via Range.
+                self._resume_part()
+                if self._cur is None:
+                    break
+            else:
+                self._advance_part()
         return bytes(out)
 
     def close(self) -> None:
@@ -321,18 +391,46 @@ class StreamingHDRVideoDataset(IterableDataset):
                 return None
 
             yielded = 0
-            for hm in hdr_tf:
+            tar_iter = iter(hdr_tf)
+            while True:
+                try:
+                    hm = next(tar_iter)
+                except StopIteration:
+                    break
+                except (tarfile.ReadError, OSError) as exc:
+                    # Stream got corrupted (CloudFront drop, partial read, etc.).
+                    # The tar parser state is unrecoverable for this stream, so
+                    # we stop this worker's shard. PyTorch DataLoader will
+                    # restart the iterator on the next epoch.
+                    print(
+                        f"  [stream] hdr tar read error after {yielded} clips: {exc}; "
+                        f"ending this worker shard",
+                        flush=True,
+                    )
+                    break
                 if not hm.isfile() or not hm.name.lower().endswith(".mp4"):
                     continue
-                f = hdr_tf.extractfile(hm)
-                if f is None:
+                try:
+                    f = hdr_tf.extractfile(hm)
+                    if f is None:
+                        continue
+                    hdr_blob = f.read()
+                except Exception as exc:
+                    print(f"  [stream] extract {hm.name}: {exc}; skip", flush=True)
                     continue
-                hdr_blob = f.read()
                 hdr_name = Path(hm.name).name
-                sdr_blob = _advance_sdr_until(hdr_name)
+                try:
+                    sdr_blob = _advance_sdr_until(hdr_name)
+                except (tarfile.ReadError, OSError) as exc:
+                    print(f"  [stream] sdr lookup for {hdr_name}: {exc}; skip", flush=True)
+                    continue
                 if sdr_blob is None:
                     continue
-                sample = self._decode_one(hdr_name, hdr_blob, sdr_blob)
+                try:
+                    sample = self._decode_one(hdr_name, hdr_blob, sdr_blob)
+                except Exception as exc:
+                    print(f"  [stream] decode {hdr_name}: {exc}; skip", flush=True)
+                    continue
                 if sample is None:
                     continue
                 yield sample
