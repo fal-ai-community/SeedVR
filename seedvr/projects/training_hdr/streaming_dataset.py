@@ -363,94 +363,117 @@ class StreamingHDRVideoDataset(IterableDataset):
             return
         my_hdr_parts = hdr_parts[start:end]
 
-        hdr_stream = _ConcatHTTPStream(my_hdr_parts, repo=self._cfg.repo)
-        sdr_stream = _ConcatHTTPStream(list(self._cfg.sdr_parts), repo=self._cfg.repo)
-
-        try:
-            hdr_tf = tarfile.open(fileobj=hdr_stream, mode="r|")
-            sdr_tf = tarfile.open(fileobj=sdr_stream, mode="r|")
-            sdr_iter = iter(sdr_tf)
-            sdr_pending: dict[str, bytes] = {}
-
-            def _advance_sdr_until(target_name: str) -> bytes | None:
-                if target_name in sdr_pending:
-                    return sdr_pending.pop(target_name)
-                for sm in sdr_iter:
-                    if not sm.isfile() or not sm.name.lower().endswith(".mp4"):
-                        continue
-                    f = sdr_tf.extractfile(sm)
-                    if f is None:
-                        continue
-                    blob = f.read()
-                    name = Path(sm.name).name
-                    if name == target_name:
-                        return blob
-                    sdr_pending[name] = blob
-                    if len(sdr_pending) > 64:
-                        sdr_pending.pop(next(iter(sdr_pending)))
-                return None
-
-            yielded = 0
-            tar_iter = iter(hdr_tf)
-            while True:
-                try:
-                    hm = next(tar_iter)
-                except StopIteration:
-                    break
-                except (tarfile.ReadError, OSError) as exc:
-                    # Stream got corrupted (CloudFront drop, partial read, etc.).
-                    # The tar parser state is unrecoverable for this stream, so
-                    # we stop this worker's shard. PyTorch DataLoader will
-                    # restart the iterator on the next epoch.
-                    print(
-                        f"  [stream] hdr tar read error after {yielded} clips: {exc}; "
-                        f"ending this worker shard",
-                        flush=True,
-                    )
-                    break
-                if not hm.isfile() or not hm.name.lower().endswith(".mp4"):
-                    continue
-                try:
-                    f = hdr_tf.extractfile(hm)
-                    if f is None:
-                        continue
-                    hdr_blob = f.read()
-                except Exception as exc:
-                    print(f"  [stream] extract {hm.name}: {exc}; skip", flush=True)
-                    continue
-                hdr_name = Path(hm.name).name
-                try:
-                    sdr_blob = _advance_sdr_until(hdr_name)
-                except (tarfile.ReadError, OSError) as exc:
-                    print(f"  [stream] sdr lookup for {hdr_name}: {exc}; skip", flush=True)
-                    continue
-                if sdr_blob is None:
-                    continue
-                try:
-                    sample = self._decode_one(hdr_name, hdr_blob, sdr_blob)
-                except Exception as exc:
-                    print(f"  [stream] decode {hdr_name}: {exc}; skip", flush=True)
-                    continue
-                if sample is None:
-                    continue
-                yield sample
-                yielded += 1
-                if (
-                    self._cfg.max_clips_per_worker
-                    and yielded >= self._cfg.max_clips_per_worker
-                ):
-                    return
-        finally:
+        # Infinite iteration: when one full pass through the tar parts ends,
+        # reopen the streams and start over. Training step counts (config.steps)
+        # bound total work, not the iterator.
+        total_yielded = 0
+        epoch = 0
+        while True:
+            epoch += 1
+            print(
+                f"  [stream] worker={worker_id} epoch={epoch} "
+                f"hdr_parts={my_hdr_parts}",
+                flush=True,
+            )
+            hdr_stream = _ConcatHTTPStream(my_hdr_parts, repo=self._cfg.repo)
+            sdr_stream = _ConcatHTTPStream(
+                list(self._cfg.sdr_parts), repo=self._cfg.repo
+            )
+            hdr_tf = None
+            sdr_tf = None
             try:
-                hdr_tf.close()
-            except Exception:
-                pass
-            try:
-                sdr_tf.close()
-            except Exception:
-                pass
-            hdr_stream.close()
-            sdr_stream.close()
+                hdr_tf = tarfile.open(fileobj=hdr_stream, mode="r|")
+                sdr_tf = tarfile.open(fileobj=sdr_stream, mode="r|")
+                sdr_iter = iter(sdr_tf)
+                sdr_pending: dict[str, bytes] = {}
+
+                def _advance_sdr_until(target_name: str) -> bytes | None:
+                    if target_name in sdr_pending:
+                        return sdr_pending.pop(target_name)
+                    for sm in sdr_iter:
+                        if not sm.isfile() or not sm.name.lower().endswith(".mp4"):
+                            continue
+                        f = sdr_tf.extractfile(sm)
+                        if f is None:
+                            continue
+                        blob = f.read()
+                        name = Path(sm.name).name
+                        if name == target_name:
+                            return blob
+                        sdr_pending[name] = blob
+                        if len(sdr_pending) > 64:
+                            sdr_pending.pop(next(iter(sdr_pending)))
+                    return None
+
+                tar_iter = iter(hdr_tf)
+                while True:
+                    try:
+                        hm = next(tar_iter)
+                    except StopIteration:
+                        break
+                    except (tarfile.ReadError, OSError) as exc:
+                        print(
+                            f"  [stream] hdr tar read error after "
+                            f"{total_yielded} clips total: {exc}; "
+                            f"ending epoch {epoch}",
+                            flush=True,
+                        )
+                        break
+                    if not hm.isfile() or not hm.name.lower().endswith(".mp4"):
+                        continue
+                    try:
+                        f = hdr_tf.extractfile(hm)
+                        if f is None:
+                            continue
+                        hdr_blob = f.read()
+                    except Exception as exc:
+                        print(
+                            f"  [stream] extract {hm.name}: {exc}; skip",
+                            flush=True,
+                        )
+                        continue
+                    hdr_name = Path(hm.name).name
+                    try:
+                        sdr_blob = _advance_sdr_until(hdr_name)
+                    except (tarfile.ReadError, OSError) as exc:
+                        print(
+                            f"  [stream] sdr lookup for {hdr_name}: {exc}; "
+                            f"skip",
+                            flush=True,
+                        )
+                        continue
+                    if sdr_blob is None:
+                        continue
+                    try:
+                        sample = self._decode_one(hdr_name, hdr_blob, sdr_blob)
+                    except Exception as exc:
+                        print(
+                            f"  [stream] decode {hdr_name}: {exc}; skip",
+                            flush=True,
+                        )
+                        continue
+                    if sample is None:
+                        continue
+                    yield sample
+                    total_yielded += 1
+                    if (
+                        self._cfg.max_clips_per_worker
+                        and total_yielded >= self._cfg.max_clips_per_worker
+                    ):
+                        return
+            finally:
+                if hdr_tf is not None:
+                    try:
+                        hdr_tf.close()
+                    except Exception:
+                        pass
+                if sdr_tf is not None:
+                    try:
+                        sdr_tf.close()
+                    except Exception:
+                        pass
+                hdr_stream.close()
+                sdr_stream.close()
 
     def _decode_one(
         self, hdr_name: str, hdr_blob: bytes, sdr_blob: bytes
