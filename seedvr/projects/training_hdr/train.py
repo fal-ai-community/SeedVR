@@ -1588,19 +1588,25 @@ def build_dataloaders(config: TrainingConfig) -> tuple[DataLoader, DataLoader]:
             frames_per_clip=config.streaming_frames_per_clip,
             streaming_dataset_url=config.streaming_dataset_url,
         )
+        # Force single-worker for streaming. Multi-part split tar archives
+        # can't be sharded by parts (workers >0 would start mid-archive
+        # and hit "invalid header"). True random-access sharding requires
+        # a pre-built byte-offset index, which is a follow-up. For a
+        # single-worker streamer the GPU is the bottleneck anyway (7B
+        # model, ~10s/step), so prefetch_factor + persistent_workers can
+        # still hide most of the per-clip decode latency.
+        streaming_workers = 1 if config.num_workers > 0 else 0
         train_loader = DataLoader(
             train_dataset,
             batch_size=config.batch_size,
-            num_workers=config.num_workers,
+            num_workers=streaming_workers,
             pin_memory=True,
             persistent_workers=bool(
-                config.dataloader_persistent_workers and config.num_workers > 0
+                config.dataloader_persistent_workers and streaming_workers > 0
             ),
             prefetch_factor=(
-                config.dataloader_prefetch_factor if config.num_workers > 0 else None
+                config.dataloader_prefetch_factor if streaming_workers > 0 else None
             ),
-            # Streaming = IterableDataset; shuffle is not supported and
-            # randomization comes from worker shard assignment + tar order.
         )
         # Validation loader still reads from a manifest path (extra_validation_datasets
         # or config.val_manifest); the streaming source is training-only for now.
