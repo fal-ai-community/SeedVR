@@ -50,6 +50,7 @@ from seedvr.projects.training_hdr.validation import (
     linear_hdr_from_target_tensor,
     save_dataset_sample_preview,
     save_triptych,
+    save_triptych_video,
 )
 
 try:
@@ -1836,10 +1837,11 @@ def run_validation(
     preview_subdir: str = "validation",
     num_validation_samples: int | None = None,
     sampler_validation_samples: int | None = None,
-) -> tuple[dict[str, float], list[Path], list[str]]:
+) -> tuple[dict[str, float], list[Path], list[str], list[Path]]:
     text_pos_embeds, text_pos_shapes = positive_embeddings
     preview_paths: list[Path] = []
     preview_captions: list[str] = []
+    video_paths: list[Path] = []
     losses: list[float] = []
     hdr_metric_rows: list[dict[str, float]] = []
     sampler_metric_rows: list[dict[str, float]] = []
@@ -1903,6 +1905,16 @@ def run_validation(
                 base_predicted_image=(base_prediction_cache or {}).get(sample_index),
             )
             preview_paths.append(preview_path)
+            video_path = save_triptych_video(
+                preview_dir / f"step_{step:06d}_{len(preview_paths)-1:02d}.mp4",
+                input_images[0].cpu(),
+                predicted_images[0].cpu(),
+                target_images[0].cpu(),
+                target_representation=config.target_representation,
+                base_predicted_image=(base_prediction_cache or {}).get(sample_index),
+            )
+            if video_path is not None:
+                video_paths.append(video_path)
             preview_captions.append(
                 " ".join(
                     part
@@ -1961,6 +1973,18 @@ def run_validation(
                     ),
                 )
                 preview_paths.append(preview_path)
+                video_path = save_triptych_video(
+                    preview_dir / f"step_{step:06d}_sampler_{sampler_index:02d}.mp4",
+                    input_images[0].cpu(),
+                    predicted_images[0].cpu(),
+                    target_images[0].cpu(),
+                    target_representation=config.target_representation,
+                    base_predicted_image=(base_prediction_cache or {}).get(
+                        sample_index
+                    ),
+                )
+                if video_path is not None:
+                    video_paths.append(video_path)
                 preview_captions.append(
                     " ".join(
                         part
@@ -1995,7 +2019,7 @@ def run_validation(
         log_cuda_memory("validation_end", device, step)
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
-    return metrics, preview_paths, preview_captions
+    return metrics, preview_paths, preview_captions, video_paths
 
 
 def maybe_resume_training(
@@ -2381,7 +2405,7 @@ def main() -> None:
                 )
 
         if step % config.validate_every == 0 or step == config.steps:
-            val_metrics, latest_preview_paths, latest_preview_captions = run_validation(
+            val_metrics, latest_preview_paths, latest_preview_captions, latest_video_paths = run_validation(
                 config=config,
                 runner=runner,
                 positive_embeddings=positive_embeddings,
@@ -2401,9 +2425,19 @@ def main() -> None:
                     step=step,
                     preview_captions=latest_preview_captions,
                 )
+                if latest_video_paths:
+                    wandb.log(
+                        {
+                            "step": step,
+                            "validation_videos": [
+                                wandb.Video(str(p), fps=4, format="mp4")
+                                for p in latest_video_paths
+                            ],
+                        }
+                    )
             for extra, extra_loader in extra_validation_loaders:
                 extra_name = metric_safe_name(extra.name)
-                extra_metrics, extra_preview_paths, extra_preview_captions = (
+                extra_metrics, extra_preview_paths, extra_preview_captions, extra_video_paths = (
                     run_validation(
                         config=config,
                         runner=runner,
@@ -2425,6 +2459,7 @@ def main() -> None:
                 final_metrics.update(extra_metrics)
                 latest_preview_paths.extend(extra_preview_paths)
                 latest_preview_captions.extend(extra_preview_captions)
+                latest_video_paths.extend(extra_video_paths)
                 print(
                     "[seedvr-hdr] extra validation "
                     f"name={extra.name} step={step} metrics={extra_metrics}"
@@ -2437,6 +2472,16 @@ def main() -> None:
                         step=step,
                         preview_captions=extra_preview_captions,
                     )
+                    if extra_video_paths:
+                        wandb.log(
+                            {
+                                "step": step,
+                                f"validation_videos_{extra_name}": [
+                                    wandb.Video(str(p), fps=4, format="mp4")
+                                    for p in extra_video_paths
+                                ],
+                            }
+                        )
 
         model_checkpoint_every = int(config.model_checkpoint_every or 0)
         full_checkpoint_every = int(config.full_checkpoint_every or config.save_every)

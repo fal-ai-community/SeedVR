@@ -9,7 +9,7 @@ workers, and yields tensors in the same shape as `SeedVRHDRVideoDataset`.
 Key properties:
 - ZERO bulk pre-download. Tar parts streamed on demand. Disk usage ~10 MB
   (just metadata.csv cache).
-- HDR-correct: PyAV decodes HDR clips to rgb48le (16-bit), applies BT.2100
+- HDR-correct: PyAV decodes HDR clips to gbrp16le (16-bit planar), applies BT.2100
   PQ inverse EOTF, robust-normalizes per clip, then encodes to the
   configured target representation (LogC3 / mu_law / etc.). The SDR side
   decodes to rgb24 (8-bit, BT.709, the original encoding) for the input
@@ -123,7 +123,7 @@ def _decode_video(blob: bytes, *, pix_fmt: str) -> np.ndarray:
             for frame in packet.decode():
                 frames.append(frame.to_ndarray(format=pix_fmt))
     if not frames:
-        return np.empty((0, 0, 0, 0), dtype=np.uint16 if pix_fmt == "rgb48le" else np.uint8)
+        return np.empty((0, 0, 0, 0), dtype=np.uint16 if "16" in pix_fmt else np.uint8)
     return np.stack(frames, axis=0)
 
 
@@ -537,7 +537,13 @@ class StreamingHDRVideoDataset(IterableDataset):
     ) -> tuple[dict[str, torch.Tensor | str] | None, str | None]:
         """Returns (sample, fail_reason). On success, fail_reason is None."""
         try:
-            hdr_u16 = _decode_video(hdr_blob, pix_fmt="rgb48le")
+            # NOTE: PyAV's "rgb48le" / "rgb48be" produce mangled output for
+            # 10-bit HEVC (yuv420p10le) HDR sources — channels are not in the
+            # documented R-G-B order and the decode is silently corrupt.
+            # gbrp16le (planar G-B-R 16-bit) round-trips correctly through
+            # libswscale and PyAV's to_ndarray remaps it to (H, W, 3) with
+            # values matching an 8-bit rgb24 decode of the same frame.
+            hdr_u16 = _decode_video(hdr_blob, pix_fmt="gbrp16le")
         except Exception as exc:
             return None, f"hdr_decode_exception: {type(exc).__name__}: {exc}"
         try:

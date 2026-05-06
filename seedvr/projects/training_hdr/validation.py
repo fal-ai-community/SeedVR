@@ -294,6 +294,65 @@ def save_triptych(
     return output_path
 
 
+def save_triptych_video(
+    output_path: str | Path,
+    input_image: torch.Tensor,
+    predicted_image: torch.Tensor,
+    target_image: torch.Tensor,
+    target_representation: str,
+    base_predicted_image: torch.Tensor | None = None,
+    fps: int = 4,
+) -> Path | None:
+    """Render a per-frame triptych (input | prediction | ground_truth | base) as
+    an MP4. Returns None for single-frame inputs (use save_triptych instead).
+    """
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    input_frames = _as_chw_frames(input_image)
+    pred_frames = _as_chw_frames(predicted_image)
+    target_frames = _as_chw_frames(target_image)
+    base_frames = (
+        _as_chw_frames(base_predicted_image)
+        if base_predicted_image is not None
+        else None
+    )
+    T = min(len(input_frames), len(pred_frames), len(target_frames))
+    if T <= 1:
+        return None
+
+    composed_frames: list[np.ndarray] = []
+    for t in range(T):
+        pred_lin = linear_hdr_from_target_tensor(pred_frames[t], target_representation)
+        target_lin = linear_hdr_from_target_tensor(target_frames[t], target_representation)
+        panels = [
+            _input_tensor_to_uint8_image(input_frames[t]),
+            _preview_uint8_from_linear_hdr(pred_lin),
+            _preview_uint8_from_linear_hdr(target_lin),
+        ]
+        labels = ["input", "prediction", "ground_truth"]
+        if base_frames is not None and t < len(base_frames):
+            base_lin = linear_hdr_from_target_tensor(
+                base_frames[t], target_representation
+            )
+            panels.append(_preview_uint8_from_linear_hdr(base_lin))
+            labels.append("base_seedvr")
+        panels = _add_panel_labels(panels, labels)
+        composed_frames.append(np.concatenate(panels, axis=1))
+
+    height, width, _ = composed_frames[0].shape
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(str(output_path), fourcc, float(fps), (width, height))
+    if not writer.isOpened():
+        return None
+    try:
+        for frame_rgb in composed_frames:
+            writer.write(cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR))
+    finally:
+        writer.release()
+    return output_path
+
+
 def save_dataset_sample_preview(
     output_path: str | Path,
     input_image: torch.Tensor,
