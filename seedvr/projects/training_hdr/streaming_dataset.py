@@ -394,6 +394,22 @@ class StreamingHDRVideoDataset(IterableDataset):
         total_yielded = 0
         epoch = 0
         last_log_ts = time.monotonic()
+        # Per-reason skip counters; keep cumulative across epochs.
+        skip_counts: dict[str, int] = {
+            "no_sdr_match": 0,
+            "decode_exception": 0,
+            "empty_decode": 0,
+            "extract_error": 0,
+            "sdr_tar_error": 0,
+        }
+        first_skip_logged: set[str] = set()
+
+        def _log_skip(reason: str, detail: str) -> None:
+            skip_counts[reason] = skip_counts.get(reason, 0) + 1
+            if reason not in first_skip_logged:
+                first_skip_logged.add(reason)
+                _log(f"first skip[{reason}]: {detail}")
+
         while True:
             epoch += 1
             _log(f"epoch={epoch} opening streams")
@@ -405,13 +421,13 @@ class StreamingHDRVideoDataset(IterableDataset):
             _log(f"epoch={epoch} streams opened in {time.monotonic()-t0:.2f}s")
             hdr_tf = None
             sdr_tf = None
+            sdr_pending: dict[str, bytes] = {}
             try:
                 t0 = time.monotonic()
                 hdr_tf = tarfile.open(fileobj=hdr_stream, mode="r|")
                 sdr_tf = tarfile.open(fileobj=sdr_stream, mode="r|")
                 _log(f"epoch={epoch} tar headers parsed in {time.monotonic()-t0:.2f}s")
                 sdr_iter = iter(sdr_tf)
-                sdr_pending: dict[str, bytes] = {}
 
                 def _advance_sdr_until(target_name: str) -> bytes | None:
                     if target_name in sdr_pending:
@@ -438,11 +454,9 @@ class StreamingHDRVideoDataset(IterableDataset):
                     except StopIteration:
                         break
                     except (tarfile.ReadError, OSError) as exc:
-                        print(
-                            f"  [stream] hdr tar read error after "
-                            f"{total_yielded} clips total: {exc}; "
-                            f"ending epoch {epoch}",
-                            flush=True,
+                        _log(
+                            f"hdr tar read error after {total_yielded} "
+                            f"clips total: {exc!r}; ending epoch {epoch}"
                         )
                         break
                     if not hm.isfile() or not hm.name.lower().endswith(".mp4"):
@@ -453,38 +467,42 @@ class StreamingHDRVideoDataset(IterableDataset):
                             continue
                         hdr_blob = f.read()
                     except Exception as exc:
-                        print(
-                            f"  [stream] extract {hm.name}: {exc}; skip",
-                            flush=True,
-                        )
+                        _log_skip("extract_error", f"{hm.name}: {exc!r}")
                         continue
                     hdr_name = Path(hm.name).name
                     try:
                         sdr_blob = _advance_sdr_until(hdr_name)
                     except (tarfile.ReadError, OSError) as exc:
-                        print(
-                            f"  [stream] sdr lookup for {hdr_name}: {exc}; "
-                            f"skip",
-                            flush=True,
+                        _log_skip(
+                            "sdr_tar_error", f"{hdr_name}: {exc!r}"
                         )
                         continue
                     if sdr_blob is None:
+                        _log_skip(
+                            "no_sdr_match",
+                            f"{hdr_name} (sdr_pending size={len(sdr_pending)})",
+                        )
                         continue
                     try:
-                        sample = self._decode_one(hdr_name, hdr_blob, sdr_blob)
+                        sample, decode_fail = self._decode_one(
+                            hdr_name, hdr_blob, sdr_blob
+                        )
                     except Exception as exc:
-                        print(
-                            f"  [stream] decode {hdr_name}: {exc}; skip",
-                            flush=True,
+                        _log_skip(
+                            "decode_exception",
+                            f"{hdr_name}: outer {exc!r}",
                         )
                         continue
                     if sample is None:
+                        bucket = (decode_fail or "decode_exception").split(":", 1)[0]
+                        _log_skip(bucket, f"{hdr_name}: {decode_fail}")
                         continue
                     now = time.monotonic()
                     if total_yielded < 5 or (now - last_log_ts) > 30:
                         _log(
                             f"yield #{total_yielded+1} clip={sample['scene_id']} "
                             f"epoch={epoch} dt_since_last={now-last_log_ts:.1f}s "
+                            f"skips={dict(skip_counts)} "
                             f"target_shape={tuple(sample['target'].shape)}"
                         )
                         last_log_ts = now
@@ -496,6 +514,11 @@ class StreamingHDRVideoDataset(IterableDataset):
                     ):
                         return
             finally:
+                _log(
+                    f"epoch={epoch} ended: yielded_total={total_yielded} "
+                    f"skips={dict(skip_counts)} "
+                    f"sdr_pending_size={len(sdr_pending)}"
+                )
                 if hdr_tf is not None:
                     try:
                         hdr_tf.close()
@@ -511,14 +534,22 @@ class StreamingHDRVideoDataset(IterableDataset):
 
     def _decode_one(
         self, hdr_name: str, hdr_blob: bytes, sdr_blob: bytes
-    ) -> dict[str, torch.Tensor | str] | None:
+    ) -> tuple[dict[str, torch.Tensor | str] | None, str | None]:
+        """Returns (sample, fail_reason). On success, fail_reason is None."""
         try:
             hdr_u16 = _decode_video(hdr_blob, pix_fmt="rgb48le")
+        except Exception as exc:
+            return None, f"hdr_decode_exception: {type(exc).__name__}: {exc}"
+        try:
             sdr_u8 = _decode_video(sdr_blob, pix_fmt="rgb24")
-        except Exception:
-            return None
+        except Exception as exc:
+            return None, f"sdr_decode_exception: {type(exc).__name__}: {exc}"
         if hdr_u16.shape[0] == 0 or sdr_u8.shape[0] == 0:
-            return None
+            return (
+                None,
+                f"empty_decode: hdr_T={hdr_u16.shape[0]} sdr_T={sdr_u8.shape[0]} "
+                f"hdr_blob={len(hdr_blob)} sdr_blob={len(sdr_blob)}",
+            )
         T = min(hdr_u16.shape[0], sdr_u8.shape[0])
         hdr_u16 = hdr_u16[:T]
         sdr_u8 = sdr_u8[:T]
@@ -569,7 +600,7 @@ class StreamingHDRVideoDataset(IterableDataset):
         input_t = torch.from_numpy(sdr_u8).permute(0, 3, 1, 2).contiguous().float() / 255.0
 
         clip_id = hdr_name.replace(".mp4", "")
-        return {
+        sample = {
             "input_sdr": input_t,
             "target": target_t,
             "scene_id": clip_id,
@@ -577,6 +608,7 @@ class StreamingHDRVideoDataset(IterableDataset):
             "variant_id": "",
             "caption": self._captions.get(hdr_name, ""),
         }
+        return sample, None
 
 
 __all__ = ["StreamingHDRVideoDataset"]
