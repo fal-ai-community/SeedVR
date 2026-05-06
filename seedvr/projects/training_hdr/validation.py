@@ -377,6 +377,166 @@ def save_triptych_video(
     return output_path
 
 
+# ---------------------------------------------------------------------
+# HDR10 PQ-encoded MP4 preview (HEVC main10, BT.2020 NCL, SMPTE 2084 PQ).
+# Plays correctly on HDR-capable players; regular browsers render it
+# tonemapped at best, but the file preserves the actual HDR signal.
+# ---------------------------------------------------------------------
+_PQ_M1 = 2610.0 / 16384.0
+_PQ_M2 = 2523.0 / 4096.0 * 128.0
+_PQ_C1 = 3424.0 / 4096.0
+_PQ_C2 = 2413.0 / 4096.0 * 32.0
+_PQ_C3 = 2392.0 / 4096.0 * 32.0
+_HDR_PEAK_NITS = 1000.0
+_PQ_OETF_PEAK_NITS = 10_000.0
+# BT.709 → BT.2020 chromaticity matrix (linear light)
+_BT709_TO_BT2020 = (
+    (0.6274040, 0.3292820, 0.0433136),
+    (0.0690970, 0.9195400, 0.0113612),
+    (0.0163916, 0.0880132, 0.8955950),
+)
+
+
+def _apply_pq_oetf_np(linear: np.ndarray) -> np.ndarray:
+    """SMPTE ST 2084 PQ OETF. 1.0 input = 10,000 cd/m²."""
+    y = np.clip(linear.astype(np.float32, copy=False), 0.0, 1.0)
+    ym = np.power(y, _PQ_M1)
+    return np.power((_PQ_C1 + _PQ_C2 * ym) / (1.0 + _PQ_C3 * ym), _PQ_M2)
+
+
+def _input_tensor_to_linear_bt2020_np(tensor: torch.Tensor) -> np.ndarray:
+    """SDR input ([-1, 1]) → linear sRGB → BT.2020 linear, modest HDR
+    brightness (~100 nits) so it sits next to the HDR panels without
+    clipping the display."""
+    arr = tensor.detach().float().clamp(-1.0, 1.0).add(1.0).mul(0.5).cpu().numpy()
+    # CHW → HWC
+    arr = np.transpose(arr, (1, 2, 0))
+    # Approx sRGB → linear with gamma 2.2 (close enough for preview use)
+    linear_srgb = np.power(np.clip(arr, 0.0, 1.0), 2.2)
+    m = np.array(_BT709_TO_BT2020, dtype=np.float32)
+    h, w, _ = linear_srgb.shape
+    linear_bt2020 = (linear_srgb.reshape(-1, 3) @ m.T).reshape(h, w, 3)
+    # Scale to 100 nits / 1000 = 0.1 of peak so input is dim vs HDR panels
+    return np.clip(linear_bt2020, 0.0, None) * 0.1
+
+
+def _hdr_panel_label(canvas: np.ndarray, label: str) -> np.ndarray:
+    """Burn-in label tinted to remain readable in HDR (low-brightness white)."""
+    if canvas.ndim != 3 or canvas.shape[2] != 3:
+        return canvas
+    # Draw label in 8-bit space then composite at ~150 nits white.
+    overlay_u8 = np.zeros((min(canvas.shape[0], 28), min(canvas.shape[1], 220), 3), dtype=np.uint8)
+    cv2.rectangle(overlay_u8, (0, 0), (overlay_u8.shape[1], overlay_u8.shape[0]), (0, 0, 0), thickness=-1)
+    cv2.putText(
+        overlay_u8, label, (8, 20),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255),
+        thickness=1, lineType=cv2.LINE_AA,
+    )
+    label_linear = (overlay_u8.astype(np.float32) / 255.0) ** 2.2 * 0.15
+    canvas[: overlay_u8.shape[0], : overlay_u8.shape[1]] = label_linear
+    return canvas
+
+
+def save_triptych_video_hdr(
+    output_path: str | Path,
+    input_image: torch.Tensor,
+    predicted_image: torch.Tensor,
+    target_image: torch.Tensor,
+    target_representation: str,
+    base_predicted_image: torch.Tensor | None = None,
+    fps: int = 4,
+    peak_nits: float = _HDR_PEAK_NITS,
+) -> Path | None:
+    """HDR10 PQ-encoded MP4 of the per-frame triptych. Input panel is
+    sRGB→BT.2020 at ~100 nits; HDR panels are linear BT.2020 [0, 1]
+    treated as 0–``peak_nits`` cd/m². T<=1 returns None.
+    """
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    input_frames = _as_chw_frames(input_image)
+    pred_frames = _as_chw_frames(predicted_image)
+    target_frames = _as_chw_frames(target_image)
+    base_frames = (
+        _as_chw_frames(base_predicted_image)
+        if base_predicted_image is not None
+        else None
+    )
+    T = min(len(input_frames), len(pred_frames), len(target_frames))
+    if T <= 1:
+        return None
+
+    composed_u16: list[np.ndarray] = []
+    for t in range(T):
+        in_lin = _input_tensor_to_linear_bt2020_np(input_frames[t])
+        pred_lin = (
+            linear_hdr_from_target_tensor(pred_frames[t], target_representation)
+            .detach().cpu().numpy().transpose(1, 2, 0)
+        )
+        target_lin = (
+            linear_hdr_from_target_tensor(target_frames[t], target_representation)
+            .detach().cpu().numpy().transpose(1, 2, 0)
+        )
+        panels = [in_lin, pred_lin, target_lin]
+        labels = ["input", "prediction", "ground_truth"]
+        if base_frames is not None and t < len(base_frames):
+            base_lin = (
+                linear_hdr_from_target_tensor(base_frames[t], target_representation)
+                .detach().cpu().numpy().transpose(1, 2, 0)
+            )
+            panels.append(base_lin)
+            labels.append("base_seedvr")
+        # Burn-in labels (linear-space)
+        panels = [_hdr_panel_label(np.ascontiguousarray(p, dtype=np.float32), lab) for p, lab in zip(panels, labels)]
+        canvas = np.concatenate(panels, axis=1)
+        # Linear → PQ OETF: scale by peak_nits/10_000 so 1.0 = peak_nits cd/m²
+        canvas_for_oetf = np.clip(canvas, 0.0, None) * np.float32(peak_nits / _PQ_OETF_PEAK_NITS)
+        encoded = _apply_pq_oetf_np(canvas_for_oetf)
+        u16 = np.clip(encoded * 65535.0 + 0.5, 0.0, 65535.0).astype(np.uint16)
+        composed_u16.append(u16)
+
+    import av  # type: ignore
+
+    height, width, _ = composed_u16[0].shape
+    even_h = height - (height % 2)
+    even_w = width - (width % 2)
+    container = av.open(str(output_path), mode="w", format="mp4")
+    try:
+        stream = container.add_stream("libx265", rate=int(fps))
+        stream.width = even_w
+        stream.height = even_h
+        stream.pix_fmt = "yuv420p10le"
+        stream.options = {
+            "x265-params": (
+                "colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc"
+                ":range=limited:hdr10=1:hdr10-opt=1"
+            ),
+            "profile": "main10",
+            "crf": "22",
+            "preset": "medium",
+            "movflags": "+faststart",
+            "tag:v": "hvc1",
+        }
+        for u16_frame in composed_u16:
+            if (u16_frame.shape[0], u16_frame.shape[1]) != (even_h, even_w):
+                u16_frame = u16_frame[:even_h, :even_w]
+            video_frame = av.VideoFrame.from_ndarray(
+                np.ascontiguousarray(u16_frame), format="rgb48le"
+            )
+            for packet in stream.encode(video_frame):
+                container.mux(packet)
+        for packet in stream.encode():
+            container.mux(packet)
+    except Exception:
+        try:
+            container.close()
+        except Exception:
+            pass
+        return None
+    container.close()
+    return output_path
+
+
 def save_dataset_sample_preview(
     output_path: str | Path,
     input_image: torch.Tensor,
