@@ -117,8 +117,29 @@ def _robust_tonemap(linear_hdr: torch.Tensor) -> torch.Tensor:
     return mapped
 
 
+_BT2020_TO_BT709 = (
+    (1.66049100, -0.58764114, -0.07284986),
+    (-0.12455047, 1.13289990, -0.00834942),
+    (-0.01815076, -0.10057890, 1.11872966),
+)
+
+
+def _bt2020_linear_to_bt709_linear(linear_bt2020: torch.Tensor) -> torch.Tensor:
+    """ITU-R BT.2087 matrix; clip out-of-gamut to non-negative."""
+    m = torch.tensor(_BT2020_TO_BT709, dtype=linear_bt2020.dtype, device=linear_bt2020.device)
+    if linear_bt2020.ndim == 3:
+        c, h, w = linear_bt2020.shape
+        flat = linear_bt2020.reshape(c, h * w)
+        out = m @ flat
+        return out.clamp(min=0.0).reshape(c, h, w)
+    flat = linear_bt2020.reshape(linear_bt2020.shape[0], -1)
+    out = m @ flat
+    return out.clamp(min=0.0).reshape(linear_bt2020.shape)
+
+
 def _preview_uint8_from_linear_hdr(linear_hdr: torch.Tensor) -> np.ndarray:
-    preview = _robust_tonemap(linear_hdr)
+    bt709 = _bt2020_linear_to_bt709_linear(linear_hdr)
+    preview = _robust_tonemap(bt709)
     preview = preview.clamp(0.0, 1.0).mul(255.0).round().to(torch.uint8).cpu().numpy()
     return np.transpose(preview, (1, 2, 0))
 
@@ -325,12 +346,70 @@ def compute_hdr_metrics(
             for predicted_frame, target_frame in zip(predicted_frames, target_frames)
         ]
         metric_names = sorted(set.intersection(*(set(row) for row in frame_metrics)))
-        return {
+        aggregated = {
             name: float(np.mean([row[name] for row in frame_metrics]))
             for name in metric_names
         }
+        # Video-temporal metrics (paper §4: F2F-PSNR + Flicker). Require T>1.
+        aggregated.update(
+            _compute_video_metrics(
+                predicted_frames, target_frames, target_representation
+            )
+        )
+        return aggregated
 
     return _compute_hdr_metrics_chw(predicted_frames[0], target_frames[0], target_representation)
+
+
+def _compute_video_metrics(
+    predicted_frames: list[torch.Tensor],
+    target_frames: list[torch.Tensor],
+    target_representation: str,
+) -> dict[str, float]:
+    """F2F-PSNR (consecutive-frame PSNR in tonemapped sRGB) + Flicker
+    (luminance temporal stddev / mean), computed on linear HDR values
+    after BT.2020→BT.709 + Reinhard tonemap. Returns empty dict for T<=1.
+    """
+    if len(predicted_frames) <= 1:
+        return {}
+    pred_tm = torch.stack(
+        [
+            _robust_tonemap(
+                _bt2020_linear_to_bt709_linear(
+                    linear_hdr_from_target_tensor(f, target_representation)
+                )
+            )
+            for f in predicted_frames
+        ],
+        dim=0,
+    )
+    tgt_tm = torch.stack(
+        [
+            _robust_tonemap(
+                _bt2020_linear_to_bt709_linear(
+                    linear_hdr_from_target_tensor(f, target_representation)
+                )
+            )
+            for f in target_frames
+        ],
+        dim=0,
+    )
+    # F2F-PSNR: PSNR between consecutive frames within each sequence
+    pred_f2f = [_psnr(pred_tm[t], pred_tm[t + 1], data_range=1.0) for t in range(pred_tm.shape[0] - 1)]
+    tgt_f2f = [_psnr(tgt_tm[t], tgt_tm[t + 1], data_range=1.0) for t in range(tgt_tm.shape[0] - 1)]
+    # Flicker: per-pixel temporal stddev of luminance / mean luminance
+    pred_lum = (0.2126 * pred_tm[:, 0] + 0.7152 * pred_tm[:, 1] + 0.0722 * pred_tm[:, 2])
+    tgt_lum = (0.2126 * tgt_tm[:, 0] + 0.7152 * tgt_tm[:, 1] + 0.0722 * tgt_tm[:, 2])
+    eps = 1.0e-3
+    pred_flicker = float((pred_lum.std(dim=0) / (pred_lum.mean(dim=0) + eps)).mean().item())
+    tgt_flicker = float((tgt_lum.std(dim=0) / (tgt_lum.mean(dim=0) + eps)).mean().item())
+    return {
+        "f2f_psnr_pred": float(np.mean(pred_f2f)),
+        "f2f_psnr_target": float(np.mean(tgt_f2f)),
+        "f2f_psnr_diff": float(np.mean(pred_f2f) - np.mean(tgt_f2f)),
+        "flicker_pred": pred_flicker,
+        "flicker_target": tgt_flicker,
+    }
 
 
 def _compute_hdr_metrics_chw(
