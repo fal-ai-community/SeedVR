@@ -597,6 +597,13 @@ class StreamingHDRVideoDataset(IterableDataset):
 
         # To tensors. Output (T, C, H, W).
         target_t = torch.from_numpy(target).permute(0, 3, 1, 2).contiguous().float()
+        # Match disk-backed dataset.py:_to_target_tensor normalization: bounded
+        # representations are mapped from [0, 1] → [-1, 1] before training.
+        # Without this, the validator's inverse transform (clamp(-1,1)+1)*0.5
+        # double-undoes the missing scale, producing wrong linear-HDR values
+        # and color-cast previews.
+        if self._cfg.target_representation in {"mu_law_mu5000", "pq_1000", "logc3"}:
+            target_t = target_t.mul(2.0).sub(1.0)
         input_t = torch.from_numpy(sdr_u8).permute(0, 3, 1, 2).contiguous().float() / 255.0
 
         clip_id = hdr_name.replace(".mp4", "")
