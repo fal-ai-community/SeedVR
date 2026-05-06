@@ -340,16 +340,40 @@ def save_triptych_video(
         panels = _add_panel_labels(panels, labels)
         composed_frames.append(np.concatenate(panels, axis=1))
 
+    # Encode H.264 via PyAV/libx264. cv2's mp4v fourcc produces MPEG-4 Part 2
+    # which HTML5 <video> (and thus WandB's web preview) cannot decode — that
+    # was rendering as solid colors / pure noise.
+    import av  # type: ignore
+
     height, width, _ = composed_frames[0].shape
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(str(output_path), fourcc, float(fps), (width, height))
-    if not writer.isOpened():
-        return None
+    # libx264 requires even dimensions
+    even_h = height - (height % 2)
+    even_w = width - (width % 2)
+    container = av.open(str(output_path), mode="w", format="mp4")
     try:
+        stream = container.add_stream("libx264", rate=int(fps))
+        stream.width = even_w
+        stream.height = even_h
+        stream.pix_fmt = "yuv420p"
+        # Keep CRF reasonable for small previews; faststart so WandB streams.
+        stream.options = {"crf": "20", "preset": "medium", "movflags": "+faststart"}
         for frame_rgb in composed_frames:
-            writer.write(cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR))
-    finally:
-        writer.release()
+            if (frame_rgb.shape[0], frame_rgb.shape[1]) != (even_h, even_w):
+                frame_rgb = frame_rgb[:even_h, :even_w]
+            video_frame = av.VideoFrame.from_ndarray(
+                np.ascontiguousarray(frame_rgb), format="rgb24"
+            )
+            for packet in stream.encode(video_frame):
+                container.mux(packet)
+        for packet in stream.encode():
+            container.mux(packet)
+    except Exception:
+        try:
+            container.close()
+        except Exception:
+            pass
+        return None
+    container.close()
     return output_path
 
 
