@@ -406,6 +406,16 @@ def maybe_compile_dit(
             import torch._dynamo as dynamo
 
             dynamo.config.suppress_errors = True
+            # SeedVR DiT uses varlen attention with cu_seqlens whose values
+            # are data-dependent. Without these flags the inductor backend
+            # crashes with "_make_data_dependent_error" instead of graph
+            # breaking around the offending op.
+            for attr, value in (
+                ("capture_scalar_outputs", True),
+                ("capture_dynamic_output_shape_ops", True),
+            ):
+                if hasattr(dynamo.config, attr):
+                    setattr(dynamo.config, attr, value)
         except Exception:
             pass
         try:
