@@ -29,8 +29,10 @@ from seedvr.models.dit import na
 from seedvr.models.embeds import PrecomputedEmbeddings
 from seedvr.models.video_vae_v3.modules.types import MemoryState
 from seedvr.projects.training_hdr.checkpointing import (
+    drain_pending_async_saves,
     load_checkpoint,
     save_checkpoint,
+    save_checkpoint_async,
     write_result_manifest,
 )
 from seedvr.projects.training_hdr.config import ExtraValidationConfig, TrainingConfig
@@ -2102,6 +2104,27 @@ def main() -> None:
     with open(config_copy_path, "w") as file:
         json.dump(config.to_dict(), file, indent=2)
 
+    # On request timeout / cancel, fal sends SIGTERM. Flush any pending async
+    # checkpoint writes before the process is reaped.
+    import signal as _signal
+    import sys as _sys
+
+    def _flush_and_exit(signum, _frame):
+        print(
+            f"[seedvr-hdr] received signal {signum}; draining pending checkpoint saves",
+            flush=True,
+        )
+        try:
+            drain_pending_async_saves(timeout=300.0)
+        finally:
+            _sys.exit(0)
+
+    for _sig in (_signal.SIGTERM, _signal.SIGINT):
+        try:
+            _signal.signal(_sig, _flush_and_exit)
+        except (ValueError, OSError):
+            pass
+
     set_seed(config.seed)
     device = get_device()
     train_loader, val_loader = build_dataloaders(config)
@@ -2536,6 +2559,30 @@ def main() -> None:
                                 ],
                             }
                         )
+
+            # Async resume-able checkpoint after every validation pass. The synchronous
+            # snapshot to CPU blocks for a few seconds; the actual disk write happens on
+            # a background thread so training resumes immediately. Skipped when this
+            # step will also hit the synchronous full-checkpoint path below (avoids
+            # duplicate writes at step == config.steps).
+            if (
+                getattr(config, "save_on_validation", True)
+                and step != config.steps
+                and step % int(config.full_checkpoint_every or config.save_every) != 0
+            ):
+                save_checkpoint_async(
+                    output_dir=config.output_path / "checkpoints",
+                    step=step,
+                    model=runner.dit,
+                    optimizer=optimizer,
+                    scheduler=scheduler,
+                    metrics=final_metrics,
+                    config=config.to_dict() | runtime_info,
+                    include_optimizer=True,
+                    include_scheduler=True,
+                    include_rng=True,
+                    keep_last=int(getattr(config, "async_checkpoint_keep_last", 3) or 3),
+                )
 
         model_checkpoint_every = int(config.model_checkpoint_every or 0)
         full_checkpoint_every = int(config.full_checkpoint_every or config.save_every)

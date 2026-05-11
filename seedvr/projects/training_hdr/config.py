@@ -177,6 +177,8 @@ class TrainingConfig:
     save_every: int = 500
     model_checkpoint_every: int = 0
     full_checkpoint_every: int = 0
+    save_on_validation: bool = True
+    async_checkpoint_keep_last: int = 3
     debug_cuda_memory: bool = False
     cuda_cleanup_every: int = 100
     vae_use_tiling: bool = False
