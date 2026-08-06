@@ -12,10 +12,18 @@
 # // See the License for the specific language governing permissions and
 # // limitations under the License.
 
+import inspect
+
 import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.nn.attention.varlen import varlen_attn
+
+# torch <= 2.10 exposes `is_causal`; torch >= 2.11 removed it in favor of
+# `window_size`, where (-1, 0) means causal and (-1, -1) means full attention.
+_VARLEN_ATTN_HAS_IS_CAUSAL = (
+    "is_causal" in inspect.signature(varlen_attn).parameters
+)
 
 
 class TorchAttention(nn.Module):
@@ -55,6 +63,12 @@ class VarlenAttention(nn.Module):
         if query is None or key is None or value is None:
             raise ValueError("query, key, value must be provided")
 
+        is_causal = kwargs.pop("is_causal", False)
+        if _VARLEN_ATTN_HAS_IS_CAUSAL:
+            causal_kwargs = {"is_causal": is_causal}
+        else:
+            causal_kwargs = {"window_size": (-1, 0) if is_causal else (-1, -1)}
+
         return varlen_attn(
             query=query,
             key=key,
@@ -63,6 +77,6 @@ class VarlenAttention(nn.Module):
             cu_seq_k=kwargs.pop("cu_seqlens_k"),
             max_q=kwargs.pop("max_seqlen_q"),
             max_k=kwargs.pop("max_seqlen_k"),
-            is_causal=kwargs.pop("is_causal", False),
             return_aux=kwargs.pop("return_aux", None),
+            **causal_kwargs,
         )
