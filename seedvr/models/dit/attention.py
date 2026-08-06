@@ -12,10 +12,14 @@
 # // See the License for the specific language governing permissions and
 # // limitations under the License.
 
+import inspect
 import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.nn.attention.varlen import varlen_attn
+
+VARLEN_SIGNATURE = inspect.signature(varlen_attn)
+SUPPORTS_CAUSAL = "is_causal" in VARLEN_SIGNATURE.parameters
 
 
 class TorchAttention(nn.Module):
@@ -65,14 +69,16 @@ class VarlenAttention(nn.Module):
         if query is None or key is None or value is None:
             raise ValueError("query, key, value must be provided")
 
+        kwargs = {k: v for k, v in kwargs.items() if k != "is_causal"}
+        is_causal = kwargs.pop("is_causal", False)
+        if is_causal and not SUPPORTS_CAUSAL:
+            raise ValueError("is_causal is not supported for this model")
+        else:
+            kwargs["is_causal"] = is_causal
+
         return varlen_attn(
             query=query,
             key=key,
             value=value,
-            cu_seq_q=kwargs.pop("cu_seqlens_q"),
-            cu_seq_k=kwargs.pop("cu_seqlens_k"),
-            max_q=kwargs.pop("max_seqlen_q"),
-            max_k=kwargs.pop("max_seqlen_k"),
-            is_causal=kwargs.pop("is_causal", False),
-            return_aux=kwargs.pop("return_aux", None),
+            **kwargs,
         )
