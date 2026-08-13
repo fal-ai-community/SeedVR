@@ -46,7 +46,6 @@ classifiers = [
 
 # Core dependencies
 dependencies = [
-    "apex",
     "einops",
     "omegaconf",
     "opencv-python",
